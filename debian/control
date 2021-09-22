@@ -7,6 +7,7 @@ Build-Depends: debhelper-compat (= 13), ruby, bison
 Standards-Version: 4.6.0
 Vcs-Git: https://github.com/mruby-debian/mruby.git
 Vcs-Browser: https://github.com/mruby-debian/mruby
+Rules-Requires-Root: no
 
 Package: mruby
 Architecture: any
