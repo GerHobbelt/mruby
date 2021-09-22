@@ -3,7 +3,32 @@ Upstream-Name: mruby
 Source: https://github.com/mruby/mruby
 
 Files: *
-Copyright: Copyright (c) 2010-2013 mruby developers
+Copyright: Copyright (c) 2010-2021, mruby developers
+License: Expat
+
+Files: ./mrbgems/mruby-io/README.md
+ ./mrbgems/mruby-pack/README.md
+ ./mrbgems/mruby-socket/README.md
+Copyright: 2012, Internet Initiative Japan Inc.
+  2013, Internet Initiative Japan Inc.
+  2017, mruby developers
+License: Expat
+
+Files: ./src/fmt_fp.c
+Copyright: 2005-2014, Rich Felker, et al.
+License: Expat
+
+Files: ./mrbgems/mruby-sleep/src/mrb_sleep.c
+Copyright: mod_mruby developers 2012
+  mruby developers 2018
+License: Expat
+
+Files: ./mrbgems/mruby-compiler/core/y.tab.c
+Copyright: 1984, 1989-1990, 2000-2015, 2018-2020, Free Software Foundation,
+License: GPL-3+ with Bison-2.2 exception
+
+Files: ./doc/guides/debugger.md
+Copyright: 2014, Specified Non-Profit Corporation mruby Forum
 License: Expat
 
 Files: debian/*
@@ -28,3 +53,33 @@ License: Expat
  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  DEALINGS IN THE SOFTWARE.
+
+License: GPL-3+ with Bison-2.2 exception
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ .
+ This package is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ .
+ You should have received a copy of the GNU General Public License
+ along with this program. If not, see <https://www.gnu.org/licenses/>.
+ .
+ On Debian systems, the complete text of the GNU General
+ Public License version 3 can be found in "/usr/share/common-licenses/GPL-3".
+ .
+ As a special exception, you may create a larger work that contains
+ part or all of the Bison parser skeleton and distribute that work
+ under terms of your choice, so long as that work isn't itself a
+ parser generator using the skeleton or a modified version thereof
+ as a parser skeleton.  Alternatively, if you modify or redistribute
+ the parser skeleton itself, you may (at your option) remove this
+ special exception, which will cause the skeleton and the resulting
+ Bison output files to be licensed under the GNU General Public
+ License without this special exception.
+ .
+ This special exception was added by the Free Software Foundation in
+ version 2.2 of Bison.
