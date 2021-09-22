@@ -1,8 +1,21 @@
-mruby (3.0.0-1) UNRELEASED; urgency=medium
+mruby (3.0.0-1) unstable; urgency=medium
 
   * New upstream release.
+  * Update d/control
+    - Bump Standards-Version to 4.6.0.
+    - Add "Rules-Requires-Root: no".
+    - Add Homepage field.
+  * Update d/gbp.conf
+    - Set debian-branch to debian/sid for DEP-14 conformance.
+  * Update d/patches
+    - add_fpic_amd64.patch: Update to latest version.
+    - Drop unnecessary patches.
+    - Add Fix-typo.patch.
+  * Update d/rules
+    - Remove whitespace
+  * Update d/copyright.
 
- -- Nobuhiro Iwamatsu <iwamatsu@debian.org>  Thu, 23 Sep 2021 06:31:51 +0900
+ -- Nobuhiro Iwamatsu <iwamatsu@debian.org>  Thu, 23 Sep 2021 07:12:02 +0900
 
 mruby (2.1.2-3) unstable; urgency=medium
 
