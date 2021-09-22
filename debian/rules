@@ -7,4 +7,3 @@ RAKE="rake --verbose"
 
 override_dh_auto_build:
 	dh_auto_build -- RAKE=$(RAKE)
-
