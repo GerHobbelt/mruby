@@ -1,12 +1,12 @@
 diff --git a/tasks/toolchains/gcc.rake b/tasks/toolchains/gcc.rake
-index 810f23b7..05707ac4 100644
+index 51bda6517..fc20fef2f 100644
 --- a/tasks/toolchains/gcc.rake
 +++ b/tasks/toolchains/gcc.rake
-@@ -12,6 +12,7 @@ MRuby::Toolchain.new(:gcc) do |conf, params|
+@@ -13,6 +13,7 @@ MRuby::Toolchain.new(:gcc) do |conf, params|
        compiler.command = ENV['CC'] || default_command
        compiler.flags = [c_mandatory_flags, ENV['CFLAGS'] || [compiler_flags, cxx_invalid_flags, %w(-Wwrite-strings)]]
      end
 +    compiler.flags += %w(-fPIC) if ENV['DEB_TARGET_ARCH'] == 'amd64'
      compiler.option_include_path = %q[-I"%s"]
      compiler.option_define = '-D%s'
-     compiler.compile_options = %q[%{flags} -MMD -o "%{outfile}" -c "%{infile}"]
+     compiler.compile_options = "-MMD -c #{compile_opt}"
