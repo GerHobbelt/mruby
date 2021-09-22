@@ -1,3 +1,4 @@
 Change-optimize-O2-on-build-system-of-Debian.patch
 add_fpic_amd64.patch
 Skip-mruby-tty-test-in-io.patch
+Fix-typo.patch

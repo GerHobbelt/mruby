@@ -1,0 +1,28 @@
+From 33940d9e90645174c62b102181d7a0bcc9e86883 Mon Sep 17 00:00:00 2001
+From: Nobuhiro Iwamatsu <iwamatsu@debian.org>
+Date: Thu, 23 Sep 2021 06:47:56 +0900
+Subject: [PATCH] Fix typo
+
+Fix from parenthesed to parenthesized.
+
+Signed-off-by: Nobuhiro Iwamatsu <iwamatsu@debian.org>
+---
+ test/t/syntax.rb | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/test/t/syntax.rb b/test/t/syntax.rb
+index 3b6de6c18..24f52fef0 100644
+--- a/test/t/syntax.rb
++++ b/test/t/syntax.rb
+@@ -416,7 +416,7 @@ assert('External command execution.') do
+   true
+ end
+ 
+-assert('parenthesed do-block in cmdarg') do
++assert('parenthesized do-block in cmdarg') do
+   class ParenDoBlockCmdArg
+     def test(block)
+       block.call
+-- 
+2.33.0
+
