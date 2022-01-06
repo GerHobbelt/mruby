@@ -2,6 +2,8 @@ mruby (3.0.0-2) unstable; urgency=medium
 
   * Fix vulnerable to NULL Pointer Dereference (Fix CVE-2021-4110).
     Add d/patches/CVE-2021-4110.patch. (Closes: #1001768)
+  * Update d/copyright
+    - Get rid of lintian 'superfluous-file-pattern'.
 
  -- Nobuhiro Iwamatsu <iwamatsu@debian.org>  Thu, 06 Jan 2022 10:46:45 +0900
 

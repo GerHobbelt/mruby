@@ -6,33 +6,33 @@ Files: *
 Copyright: Copyright (c) 2010-2021, mruby developers
 License: Expat
 
-Files: ./mrbgems/mruby-io/README.md
- ./mrbgems/mruby-pack/README.md
- ./mrbgems/mruby-socket/README.md
+Files: mrbgems/mruby-io/README.md
+ mrbgems/mruby-pack/README.md
+ mrbgems/mruby-socket/README.md
 Copyright: 2012, Internet Initiative Japan Inc.
   2013, Internet Initiative Japan Inc.
   2017, mruby developers
 License: Expat
 
-Files: ./src/fmt_fp.c
+Files: src/fmt_fp.c
 Copyright: 2005-2014, Rich Felker, et al.
 License: Expat
 
-Files: ./mrbgems/mruby-sleep/src/mrb_sleep.c
+Files: mrbgems/mruby-sleep/src/mrb_sleep.c
 Copyright: mod_mruby developers 2012
   mruby developers 2018
 License: Expat
 
-Files: ./mrbgems/mruby-compiler/core/y.tab.c
+Files: mrbgems/mruby-compiler/core/y.tab.c
 Copyright: 1984, 1989-1990, 2000-2015, 2018-2020, Free Software Foundation,
 License: GPL-3+ with Bison-2.2 exception
 
-Files: ./doc/guides/debugger.md
+Files: doc/guides/debugger.md
 Copyright: 2014, Specified Non-Profit Corporation mruby Forum
 License: Expat
 
 Files: debian/*
-Copyright: 2013 Nobuhiro Iwamatsu <iwamatsu@debian.org>
+Copyright: 2013, 2022 Nobuhiro Iwamatsu <iwamatsu@debian.org>
 License: Expat
 
 License: Expat
