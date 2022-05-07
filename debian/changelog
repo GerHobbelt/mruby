@@ -2,6 +2,8 @@ mruby (3.0.0-4) UNRELEASED; urgency=medium
 
   * Fix CVE-2022-1212. (Closes: #1009044)
     Add d/patches/CVE-2022-1212.patch. Fix Use-After-Free in str_escape.
+  * Fix CVE-2022-1286.
+    Add d/patches/CVE-2022-1286.patch. Fix heap-buffer-overflow in mrb_vm_exe.
 
  -- Nobuhiro Iwamatsu <iwamatsu@debian.org>  Sat, 07 May 2022 17:09:06 +0900
 
