@@ -4,3 +4,4 @@ Skip-mruby-tty-test-in-io.patch
 Fix-typo.patch
 CVE-2021-4110.patch
 CVE-2022-0080.patch
+CVE-2022-1212.patch
