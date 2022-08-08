@@ -18,7 +18,7 @@ Files: src/fmt_fp.c
 Copyright: 2005-2014, Rich Felker, et al.
 License: Expat
 
-Files: mrbgems/mruby-sleep/src/mrb_sleep.c
+Files: mrbgems/mruby-sleep/src/sleep.c
 Copyright: mod_mruby developers 2012
   mruby developers 2018
 License: Expat
