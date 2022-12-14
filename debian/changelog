@@ -1,6 +1,8 @@
 mruby (3.1.0-1) UNRELEASED; urgency=medium
 
   * New upstream release.
+  * Fix CVE-2021-46020, CVE-2022-0240, CVE-2022-0481, CVE-2022-0890,
+    CVE-2022-1071, CVE-2022-1427, CVE-2022-1201. (Closes: #1014968)
 
  -- Nobuhiro Iwamatsu <iwamatsu@debian.org>  Mon, 08 Aug 2022 11:39:09 +0900
 
