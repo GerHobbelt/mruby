@@ -1,4 +1,4 @@
-mruby (3.1.0-1) UNRELEASED; urgency=medium
+mruby (3.1.0-1) unstable; urgency=medium
 
   * New upstream release.
   * Fix CVE-2021-46020, CVE-2022-0240, CVE-2022-0481, CVE-2022-0890,
