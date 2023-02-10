@@ -1,7 +1,11 @@
 #!/usr/bin/make -f
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
+ifeq ($(DEB_TARGET_ARCH), i386)
+RAKE="rake --verbose MRUBY_CONFIG=build_config/host-m32.rb"
+else
 RAKE="rake --verbose"
+endif
 
 %:
 	dh $@
