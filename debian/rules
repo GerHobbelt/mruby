@@ -1,6 +1,10 @@
 #!/usr/bin/make -f
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
+ifneq (,$(filter $(DEB_HOST_ARCH_CPU),i386 m68k))
+  export DEB_CFLAGS_MAINT_APPEND += -ffloat-store
+endif
+
 RAKE="rake --verbose"
 
 %:
