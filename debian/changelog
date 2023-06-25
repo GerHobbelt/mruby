@@ -1,8 +1,10 @@
-mruby (3.2.0-1) UNRELEASED; urgency=medium
+mruby (3.2.0-1) unstable; urgency=medium
 
   * New upstream release.
+  * d/copyright: Update copyright year
+  * d/control: Bump Standards-Version to 4.6.2
 
- -- Nobuhiro Iwamatsu <iwamatsu@debian.org>  Sun, 25 Jun 2023 13:05:38 +0900
+ -- Nobuhiro Iwamatsu <iwamatsu@debian.org>  Sun, 25 Jun 2023 14:39:17 +0900
 
 mruby (3.1.0-3) unstable; urgency=medium
 
