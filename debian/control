@@ -4,7 +4,7 @@ Priority: optional
 Maintainer: Nobuhiro Iwamatsu <iwamatsu@debian.org>
 Uploaders: Akira Mitsui <murase.syuka@gmail.com>
 Build-Depends: debhelper-compat (= 13), ruby, bison
-Standards-Version: 4.6.0
+Standards-Version: 4.6.2
 Homepage: https://mruby.org/
 Vcs-Git: https://github.com/mruby-debian/mruby.git
 Vcs-Browser: https://github.com/mruby-debian/mruby
