@@ -1,3 +1,9 @@
+mruby (3.2.0-1) UNRELEASED; urgency=medium
+
+  * New upstream release.
+
+ -- Nobuhiro Iwamatsu <iwamatsu@debian.org>  Sun, 25 Jun 2023 13:05:38 +0900
+
 mruby (3.1.0-3) unstable; urgency=medium
 
   * Revert "d/rules: Build using host-m32.rb when architecture is i386"
