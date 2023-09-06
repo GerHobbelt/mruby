@@ -1,3 +1,9 @@
+mruby (3.2.0-2) unstable; urgency=medium
+
+  * d/clean: Add build_config/default.rb.lock. (Closes: #1046416)
+
+ -- Nobuhiro Iwamatsu <iwamatsu@debian.org>  Wed, 06 Sep 2023 14:23:11 +0900
+
 mruby (3.2.0-1) unstable; urgency=medium
 
   * New upstream release.
