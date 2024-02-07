@@ -1,26 +1,26 @@
-From 0ec9603b9891e00c5de9aeed1aceb123b0338cc5 Mon Sep 17 00:00:00 2001
-From: Nobuhiro Iwamatsu <iwamatsu@nigauri.org>
-Date: Thu, 10 May 2018 08:17:17 +0900
+From a60e73484000ba107b3f7d50c622244cd9ac4c55 Mon Sep 17 00:00:00 2001
+From: Nobuhiro Iwamatsu <iwamatsu@debian.org>
+Date: Wed, 7 Feb 2024 16:32:52 +0900
 Subject: [PATCH] Change optimize O2 on build system of Debian
 
-Signed-off-by: Nobuhiro Iwamatsu <iwamatsu@nigauri.org>
+Signed-off-by: Nobuhiro Iwamatsu <iwamatsu@debian.org>
 ---
- lib/mruby/build.rb | 2 +-
+ tasks/toolchains/gcc.rake | 2 +-
  1 file changed, 1 insertion(+), 1 deletion(-)
 
-diff --git a/lib/mruby/build.rb b/lib/mruby/build.rb
-index 57bd9c51..f1bc160d 100644
---- a/lib/mruby/build.rb
-+++ b/lib/mruby/build.rb
-@@ -104,7 +104,7 @@ module MRuby
-       compilers.each do |c|
-         c.defines += %w(MRB_DEBUG)
-         if toolchains.any? { |toolchain| toolchain == "gcc" }
--          c.flags += %w(-g3 -O0)
-+          c.flags += %w(-g3 -O2)
-         end
-       end
-       @mrbc.compile_options += ' -g'
+diff --git a/tasks/toolchains/gcc.rake b/tasks/toolchains/gcc.rake
+index 675c26880..81d0302d5 100644
+--- a/tasks/toolchains/gcc.rake
++++ b/tasks/toolchains/gcc.rake
+@@ -22,7 +22,7 @@ MRuby::Toolchain.new(:gcc) do |conf, params|
+     compiler.cxx_invalid_flags = c_mandatory_flags + cxx_invalid_flags
+ 
+     def compiler.setup_debug(conf)
+-      self.flags << %w(-g3 -O0)
++      self.flags << %w(-g3 -O2)
+     end
+   end
+ 
 -- 
-2.17.0
+2.43.0
 
