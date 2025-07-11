@@ -1,3 +1,12 @@
+mruby (3.4.0-1~exp1) experimental; urgency=medium
+
+  * New upstream release.
+  * d/control: Bumped Standards-Version to 4.7.2.
+  * d/copyright: Update copyright year.
+  * d/copyright: Drop license for mrbgems/mruby-compiler/core/y.tab.c.
+
+ -- Nobuhiro Iwamatsu <iwamatsu@debian.org>  Fri, 11 Jul 2025 13:22:37 +0900
+
 mruby (3.3.0-1) unstable; urgency=medium
 
   * New upstream release.
