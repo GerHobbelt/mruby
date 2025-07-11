@@ -9,32 +9,26 @@ class BasicObject
 end
 
 class Module
-  # 15.2.2.4.12
-  def attr_accessor(*names)
-    attr_reader(*names)
-    attr_writer(*names)
-  end
   # 15.2.2.4.11
   alias attr attr_reader
-  #def attr(name)
-  #  attr_reader(name)
-  #end
 
   # 15.2.2.4.27
   def include(*args)
     args.reverse!
+    mod = self
     args.each do |m|
-      m.append_features(self)
-      m.included(self)
+      m.__send__(:append_features, mod)
+      m.__send__(:included, mod)
     end
     self
   end
 
   def prepend(*args)
     args.reverse!
+    mod = self
     args.each do |m|
-      m.prepend_features(self)
-      m.prepended(self)
+      m.__send__(:prepend_features, mod)
+      m.__send__(:prepended, mod)
     end
     self
   end

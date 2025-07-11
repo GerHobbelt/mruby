@@ -161,6 +161,9 @@ mrb_irep_free(mrb_state *mrb, mrb_irep *irep)
   }
   mrb_free(mrb, (void*)irep->lv);
   mrb_debug_info_free(mrb, irep->debug_info);
+#ifdef MRB_DEBUG
+  memset(irep, -1, sizeof(*irep));
+#endif
   mrb_free(mrb, irep);
 }
 
@@ -182,9 +185,9 @@ mrb_close(mrb_state *mrb)
   mrb_protect_atexit(mrb);
 
   /* free */
+  mrb_gc_free_gv(mrb);
   mrb_gc_destroy(mrb, &mrb->gc);
   mrb_free_context(mrb, mrb->root_c);
-  mrb_gc_free_gv(mrb);
   mrb_free_symtbl(mrb);
   mrb_free(mrb, mrb);
 }

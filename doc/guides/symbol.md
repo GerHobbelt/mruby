@@ -1,3 +1,5 @@
+<!-- summary: About the Symbols -->
+
 # Symbols
 
 Symbols in `mruby` C source code is represented by `mrb_sym` which is alias of
@@ -61,6 +63,7 @@ header.
 - `MRB_SYM_B(xor)` //=> xor! (Method with Bang)
 - `MRB_SYM_Q(xor)` //=> xor? (Method with Question mark)
 - `MRB_SYM_E(xor)` //=> xor= (Method with Equal)
+- `MRB_GVSYM(xor)` //=> $xor (Global Variable)
 - `MRB_CVSYM(xor)` //=> @@xor (Class Variable)
 - `MRB_IVSYM(xor)` //=> @xor (Instance Variable)
 - `MRB_OPSYM(xor)` //=> ^ (Operator)
