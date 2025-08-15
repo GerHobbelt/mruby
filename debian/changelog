@@ -1,3 +1,11 @@
+mruby (3.4.0-1) unstable; urgency=medium
+
+  * Upload to unstable.
+  * Fix CVE-2025-7207 (Closes: #1109338)
+    Add d/patches/CVE-2025-7207.patch.
+
+ -- Nobuhiro Iwamatsu <iwamatsu@debian.org>  Sat, 16 Aug 2025 07:14:20 +0900
+
 mruby (3.4.0-1~exp2) experimental; urgency=medium
 
   * d/patches: Add fix-bigint-on-raspberry-pi.patch.
