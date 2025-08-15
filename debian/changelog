@@ -1,3 +1,10 @@
+mruby (3.4.0-1~exp2) experimental; urgency=medium
+
+  * d/patches: Add fix-bigint-on-raspberry-pi.patch.
+    Fix test on arm64 and others.
+
+ -- Nobuhiro Iwamatsu <iwamatsu@debian.org>  Fri, 15 Aug 2025 12:08:48 +0900
+
 mruby (3.4.0-1~exp1) experimental; urgency=medium
 
   * New upstream release.
