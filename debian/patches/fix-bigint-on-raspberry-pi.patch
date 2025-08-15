@@ -1,0 +1,26 @@
+From d7edd3dbc1529f3334ba1da01e59c93056fb263d Mon Sep 17 00:00:00 2001
+From: Hendrik <Asmod4n@users.noreply.github.com>
+Date: Sun, 10 Aug 2025 09:21:38 +0200
+Subject: [PATCH] fix bigint on raspberry pi
+
+this fixes an issue where base can be out of range on a raspberry pi.
+---
+ src/vm.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/vm.c b/src/vm.c
+index 95eec8041..2772b09b7 100644
+--- a/src/vm.c
++++ b/src/vm.c
+@@ -1718,7 +1718,7 @@ RETRY_TRY_BLOCK:
+ #ifdef MRB_USE_BIGINT
+         {
+           const char *s = irep->pool[b].u.str;
+-          regs[a] = mrb_bint_new_str(mrb, s+2, (uint8_t)s[0], s[1]);
++          regs[a] = mrb_bint_new_str(mrb, s+2, (uint8_t)s[0], (int8_t)s[1]);
+         }
+         break;
+ #else
+-- 
+2.50.1
+
