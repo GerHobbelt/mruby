@@ -1,3 +1,10 @@
+mruby (3.4.0-2) unstable; urgency=medium
+
+  * Fix CVE-2025-7207 (Closes: #1109338)
+    Add CVE-2025-7207.patch to d/patches/series.
+
+ -- Nobuhiro Iwamatsu <iwamatsu@debian.org>  Sat, 16 Aug 2025 09:18:10 +0900
+
 mruby (3.4.0-1) unstable; urgency=medium
 
   * Upload to unstable.
