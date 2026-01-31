@@ -31,6 +31,7 @@ def setup(conf)
   conf.gem :github => 'ixday/mruby-polarssl'
   conf.gem :github => 'ixday/mruby-rake'
   conf.gem :github => 'ixday/mruby-simplehttp'
+  conf.gem :github => 'ixday/mruby-clap'
 
   # https://stackoverflow.com/questions/72030595/which-gcc-optimization-flags-affect-binary-size-the-most#answer-72037241
   conf.cc.flags << '-Os'

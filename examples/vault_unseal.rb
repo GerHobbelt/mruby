@@ -37,49 +37,50 @@ def main(namespace:, context:, path:)
 end
 
 def options()
-  # Default options of our CLI
-  options = {
-    :namespace => "vault",
-    :context => nil,
-    :path => "vault/",
-  }
+  program_name = File.basename __FILE__
 
-  OptionParser.new do |opts|
-    program_name = File.basename __FILE__
-    # Banner has been heavily inspired by the jq --help output
-    opts.banner = <<~EOF
-      #{program_name} - unseal vault hosted on a given kubernetes cluster
-
-      Usage: #{program_name} [options]
-
+  matches = Clap.parse(program_name) do |cmd|
+    cmd.about "Unseal vault hosted on a given kubernetes cluster"
+    cmd.long_about <<~EOF
       This command will unseal a vault cluster and store the keys in a pass store
 
       Example:
 
         $ #{program_name} --namespace=vault-test --context=staging
-
-      Command options:
     EOF
-    opts.on_tail("-H", "-h", "--help", "Display this help message.") do
-      puts opts
-      exit
+
+    cmd.arg "namespace" do |a|
+      a.short "N"
+      a.long "namespace"
+      a.help "A kubernetes namespace where vault can be found"
+      a.default "vault"
+      a.value_name "NAME"
     end
-    [
-      ["--namespace <name>", "-N",
-        "A kubernetes namespace where vault can be found (defaults to: #{options[:namespace]}).",
-        lambda { |v| options[:namespace] = v }
-      ],
-      ["--context <name>", "-C",
-        "A kubernetes context to switch to in case you don't want to use the default one.",
-        lambda { |v| options[:context] = v }
-      ],
-      ["--path <path>", "-P",
-        "A pass path to prepend to the keys inserted (defaults to : #{options[:path]}).",
-        lambda { |v| options[:context] = v + "/" if v[-1] != "/" }
-      ],
-    ].each { |args| opts.on(*args) }
-  end.parse!(ARGV)
-  options
+
+    cmd.arg "context" do |a|
+      a.short "C"
+      a.long "context"
+      a.help "A kubernetes context to switch to (uses default if not provided)"
+      a.value_name "NAME"
+    end
+
+    cmd.arg "path" do |a|
+      a.short "P"
+      a.long "path"
+      a.help "A pass path to prepend to the keys inserted"
+      a.default "vault/"
+      a.value_name "PATH"
+    end
+  end
+
+  path = matches.get_one("path")
+  path = path + "/" if path && path[-1] != "/"
+
+  {
+    namespace: matches.get_one("namespace"),
+    context: matches.get_one("context"),
+    path: path,
+  }
 end
 
 def fork(cmd)

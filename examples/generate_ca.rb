@@ -2,48 +2,46 @@
 # This script can be run directly thanks to the shebang capability
 
 def options()
-  # Default options of our CLI
-  options = {
-    :domain => "example.com",
-    :days => 3650,
-    :clean => false,
-  }
+  program_name = File.basename __FILE__
 
-  OptionParser.new do |opts|
-    program_name = File.basename __FILE__
-    # Banner has been heavily inspired by the jq --help output
-    opts.banner = <<~EOF
-      #{program_name} - generate a root CA for your KPI
-
-      Usage: #{program_name} [options] [DOMAIN]
-
-      This command will generate a self signed certificate with a name constraint on DOMAIN (default to: #{options[:domain]}). It is inspired by the work from:https://systemoverlord.com/2020/06/14/private-ca-with-x-509-name-constraints.html
+  matches = Clap.parse(program_name) do |cmd|
+    cmd.about "Generate a root CA for your PKI"
+    cmd.long_about <<~EOF
+      This command will generate a self signed certificate with a name constraint on DOMAIN (default to: example.com). It is inspired by the work from: https://systemoverlord.com/2020/06/14/private-ca-with-x-509-name-constraints.html
 
       Example:
 
         $ #{program_name} --days 365 --clean foo.bar
-
-      Command options:
     EOF
-    opts.on_tail("-h", "--help", "-H", "Display this help message.") do
-      puts opts
-      exit
+
+    cmd.arg "days" do |a|
+      a.short "D"
+      a.long "days"
+      a.help "Set validity period of root CA"
+      a.default "3650"
+      a.int
+      a.value_name "N"
     end
-    [
-      ["--days N", "-D",
-        "Set validity period of root CA (defaults to: #{options[:days]}).",
-        lambda { |v| options[:days] = Integer(v) }
-      ],
-      ["--clean",
-        "Clean intermediate files, calling with this option will re-generate " +
-          "your certificate each time.",
-        lambda { |v| options[:clean] = true }
-      ],
-    ].each { |args| opts.on(*args) }
-  end.parse!(ARGV)
-  # we take the first remaining argument to override domain if present
-  options[:domain] = ARGV.pop || options[:domain]
-  options
+
+    cmd.arg "clean" do |a|
+      a.long "clean"
+      a.help "Clean intermediate files, will re-generate certificate each time"
+      a.flag
+    end
+
+    cmd.arg "domain" do |a|
+      a.positional
+      a.help "Domain name for the certificate"
+      a.default "example.com"
+      a.value_name "DOMAIN"
+    end
+  end
+
+  {
+    domain: matches.get_one("domain"),
+    days: matches.get_one("days", :int),
+    clean: matches.flag?("clean"),
+  }
 end
 
 # Certificate extends the Rake DSL, enabling the use and invocation of its functions

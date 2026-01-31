@@ -30,11 +30,11 @@ jobs:
     steps:
       - run: brew install --force automake autoconf libtool mingw-w64 zig
       - uses: actions/checkout@v4
-        name: "Checkout ${{ github.ref_name }} MRuby"
+        name: "Checkout MRuby 3.2.0"
         with:
           repository: mruby/mruby
           path: mruby
-          ref: ${{ github.ref_name }}
+          ref: 3.2.0
       - uses: actions/checkout@v4
         name: "Checkout ${{ github.ref_name }} ( ${{ github.sha }} )"
         with:
