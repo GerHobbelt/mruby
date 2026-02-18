@@ -100,20 +100,6 @@
 # define mrb_fstat(fd, sb)  _fstat64(fd, sb)
 #endif
 
-#ifdef _WIN32
-static int
-flock(int fd, int operation)
-{
-  HANDLE h = (HANDLE)_get_osfhandle(fd);
-  DWORD flags;
-  flags = ((operation & LOCK_NB) ? LOCKFILE_FAIL_IMMEDIATELY : 0)
-          | ((operation & LOCK_SH) ? LOCKFILE_EXCLUSIVE_LOCK : 0);
-  static const OVERLAPPED zero_ov = {0};
-  OVERLAPPED ov = zero_ov;
-  return LockFileEx(h, flags, 0, 0xffffffff, 0xffffffff, &ov) ? 0 : -1;
-}
-#endif
-
 /*
  * call-seq:
  *   File.umask([mask]) -> integer
@@ -899,32 +885,30 @@ mrb_file_s_chmod(mrb_state *mrb, mrb_value klass)
  *   File.symlink("testfile", "link-to-test") #=> 0
  *   File.readlink("link-to-test")          #=> "testfile"
  */
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
 static mrb_value
 mrb_file_s_readlink(mrb_state *mrb, mrb_value klass)
 {
   const char *path;
-  size_t bufsize = 100;
 
   mrb_get_args(mrb, "z", &path);
 
   char *tmp = mrb_locale_from_utf8(path, -1);
-  char *buf = (char*)mrb_malloc(mrb, bufsize);
+  /* Use mrb_temp_alloc for exception safety - GC will clean up on exception */
+  char *buf = (char*)mrb_temp_alloc(mrb, PATH_MAX);
 
-  int64_t rc;
-  while ((rc = mrb_hal_io_readlink(mrb, tmp, buf, bufsize)) == (int64_t)bufsize) {
-    bufsize += 100;
-    buf = (char*)mrb_realloc(mrb, buf, bufsize);
-  }
+  int64_t rc = mrb_hal_io_readlink(mrb, tmp, buf, PATH_MAX);
   mrb_locale_free(tmp);
   if (rc == -1) {
-    mrb_free(mrb, buf);
     mrb_sys_fail(mrb, path);
   }
   tmp = mrb_utf8_from_locale(buf, -1);
 
   mrb_value ret = mrb_str_new(mrb, tmp, rc);
   mrb_utf8_free(tmp);
-  mrb_free(mrb, buf);
 
   return ret;
 }

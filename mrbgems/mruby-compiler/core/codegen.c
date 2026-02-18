@@ -1242,8 +1242,11 @@ static void
 realloc_pool_str(codegen_scope *s, mrb_irep_pool *p, mrb_int len)
 {
   char *str;
+  mrb_int olen = p->tt >> 2;  /* original length */
   if ((p->tt & 3) == IREP_TT_SSTR) { /* Check if it's a shared/static string */
+    const char *old = p->u.str;
     str = (char*)mrbc_malloc(len+1); /* Allocate new memory if it was shared */
+    memcpy(str, old, olen);  /* Copy original content */
   }
   else { /* It's already a heap-allocated string */
     str = (char*)p->u.str;
@@ -6655,7 +6658,7 @@ codegen(codegen_scope *s, node *tree, int val)
           genop_3(s, OP_SEND, exc_reg, sym_idx(s, MRB_SYM_2(s->mrb, new)), 1);
           /* Raise the exception */
           genop_1(s, OP_RAISEIF, exc_reg);
-          if (val) push();
+          /* No push here: RAISEIF never returns, control transfers to rescue handler */
         }
         else {
           /* expr in pattern: return false */
@@ -6667,6 +6670,9 @@ codegen(codegen_scope *s, node *tree, int val)
 
         /* End of pattern matching */
         dispatch(s, match_pos);
+        /* Restore sp to match success path value */
+        s->sp = saved_sp - 1;
+        if (val) push();
       }
       else {
         /* Pattern always matches - pop value and push result if needed */

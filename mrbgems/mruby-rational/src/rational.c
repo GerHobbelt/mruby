@@ -342,8 +342,8 @@ rational_new_f(mrb_state *mrb, mrb_float f)
 
   if (exp > 0) {
     mrb_int temp;
-    /* Check exp < MRB_INT_BIT to avoid undefined behavior from shifting */
-    if (exp >= MRB_INT_BIT || mrb_int_mul_overflow(nume, ((mrb_int)1)<<exp, &temp)) {
+    /* Check exp < MRB_INT_BIT-1 to avoid undefined behavior from shifting into sign bit */
+    if (exp >= MRB_INT_BIT - 1 || mrb_int_mul_overflow(nume, ((mrb_int)1)<<exp, &temp)) {
 #ifndef RAT_BIGINT
       rat_overflow(mrb);
 #else
@@ -356,12 +356,12 @@ rational_new_f(mrb_state *mrb, mrb_float f)
   else if (exp < 0) {
     /* exp is negative, so we need to multiply denominator by 2^(-exp) */
     int neg_exp = -exp;
-    if (neg_exp >= MRB_INT_BIT || mrb_int_mul_overflow(deno, ((mrb_int)1)<<neg_exp, &deno)) {
+    if (neg_exp >= MRB_INT_BIT - 1 || mrb_int_mul_overflow(deno, ((mrb_int)1)<<neg_exp, &deno)) {
 #ifndef RAT_BIGINT
       rat_overflow(mrb);
 #else
       mrb_value d = mrb_bint_lshift(mrb, mrb_bint_new_int(mrb, deno), neg_exp);
-      return rational_new_b(mrb, mrb_int_value(mrb, nume), d);
+      return rational_new_b(mrb, mrb_bint_new_int(mrb, nume), d);
 #endif
     }
   }
@@ -588,32 +588,44 @@ rational_eq_b(mrb_state *mrb, mrb_value x, mrb_value y)
 
   switch (mrb_type(y)) {
   case MRB_TT_INTEGER:
-    if (p1->denominator != 1) return mrb_false_value();
-    result = p1->numerator == mrb_integer(y);
-    break;
+    {
+      /* For bigint-backed rationals, check if denominator is 1 */
+      mrb_value den = mrb_obj_value(p1->b.den);
+      mrb_int den_cmp = mrb_bint_cmp(mrb, den, mrb_int_value(mrb, 1));
+      if (den_cmp != 0) return mrb_false_value();
+      mrb_value num = mrb_obj_value(p1->b.num);
+      result = mrb_bint_cmp(mrb, num, y) == 0;
+      break;
+    }
+#ifdef MRB_USE_BIGINT
+  case MRB_TT_BIGINT:
+    {
+      /* For bigint-backed rationals comparing with bigint */
+      mrb_value den = mrb_obj_value(p1->b.den);
+      mrb_int den_cmp = mrb_bint_cmp(mrb, den, mrb_int_value(mrb, 1));
+      if (den_cmp != 0) return mrb_false_value();
+      mrb_value num = mrb_obj_value(p1->b.num);
+      result = mrb_bint_cmp(mrb, num, y) == 0;
+      break;
+    }
+#endif
 #ifndef MRB_NO_FLOAT
   case MRB_TT_FLOAT:
-    result = ((double)p1->numerator/p1->denominator) == mrb_float(y);
-    break;
+    {
+      /* For bigint-backed rationals, convert to float and compare */
+      mrb_float num_f = mrb_bint_as_float(mrb, mrb_obj_value(p1->b.num));
+      mrb_float den_f = mrb_bint_as_float(mrb, mrb_obj_value(p1->b.den));
+      result = (num_f / den_f) == mrb_float(y);
+      break;
+    }
 #endif
   case MRB_TT_RATIONAL:
     {
-      struct mrb_rational *p2 = rat_ptr(mrb, y);
-      mrb_int a, b;
-
-      if (p1->numerator == p2->numerator && p1->denominator == p2->denominator) {
-        return mrb_true_value();
-      }
-      if (mrb_int_mul_overflow(p1->numerator, p2->denominator, &a) ||
-          mrb_int_mul_overflow(p2->numerator, p1->denominator, &b)) {
-#ifdef MRB_NO_FLOAT
-        rat_overflow(mrb);
-#else
-        result = (double)p1->numerator*p2->denominator == (double)p2->numerator*p2->denominator;
-        break;
-#endif
-      }
-      result = a == b;
+      /* Compare by converting to float - less precise but safe */
+      mrb_float v1 = mrb_bint_as_float(mrb, mrb_obj_value(p1->b.num)) /
+                     mrb_bint_as_float(mrb, mrb_obj_value(p1->b.den));
+      mrb_float v2 = rat_float(mrb, y);
+      result = v1 == v2;
       break;
     }
 
@@ -657,6 +669,13 @@ rational_eq(mrb_state *mrb, mrb_value x)
     if (p1->denominator != 1) return mrb_false_value();
     result = p1->numerator == mrb_integer(y);
     break;
+#ifdef MRB_USE_BIGINT
+  case MRB_TT_BIGINT:
+    /* Non-bigint rational comparing with bigint */
+    if (p1->denominator != 1) return mrb_false_value();
+    result = mrb_bint_cmp(mrb, y, mrb_int_value(mrb, p1->numerator)) == 0;
+    break;
+#endif
 #ifndef MRB_NO_FLOAT
   case MRB_TT_FLOAT:
     result = ((double)p1->numerator/p1->denominator) == mrb_float(y);
