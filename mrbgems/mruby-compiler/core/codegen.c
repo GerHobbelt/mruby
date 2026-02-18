@@ -154,10 +154,15 @@ static int catch_handler_new(codegen_scope *s);
 static void catch_handler_set(codegen_scope *s, int ent, enum mrb_catch_type type, uint32_t begin, uint32_t end, uint32_t target);
 
 static void gen_massignment(codegen_scope *s, node *tree, int sp, int val);
-static void gen_masgn_var(codegen_scope *s, node *varnode, node *rhs, int sp, int val);
+static void codegen_masgn(codegen_scope *s, node *varnode, node *rhs, int sp, int val);
+static void codegen_call_assign(codegen_scope *s, node *varnode, node *rhs, int sp, int val);
 
 static void codegen(codegen_scope *s, node *tree, int val);
 static void raise_error(codegen_scope *s, const char *msg);
+
+/* Forward declarations for helper functions */
+static enum node_type get_node_type(node *n);
+static struct mrb_ast_var_header* get_var_header(node *n);
 
 /*
  * Reports a compilation error encountered during code generation.
@@ -1207,7 +1212,7 @@ get_int_operand(codegen_scope *s, struct mrb_insn_data *data, mrb_int *n)
 
 static int new_lit_str2(codegen_scope *s, const char *str1, mrb_int len1, const char *str2, mrb_int len2);
 static int find_pool_str(codegen_scope *s, const char *str1, mrb_int len1, const char *str2, mrb_int len2);
-static void codegen_cons_list_string(codegen_scope *s, node *list, int val);
+static void gen_string(codegen_scope *s, node *list, int val);
 
 /*
  * Reallocates or allocates memory for a string literal in the IREP's literal pool.
@@ -2197,6 +2202,11 @@ node_len(node *tree)
 {
   int n = 0;
 
+  /* Validate pointer before using it */
+  if (!tree || ((uintptr_t)tree < 0x1000)) {
+    return 0;
+  }
+
   while (tree) {
     n++;
     tree = tree->cdr;
@@ -2305,7 +2315,7 @@ search_upvar(codegen_scope *s, mrb_sym id, int *idx)
  * @return The index of the newly created `mrb_irep` in the parent scope's `reps` array.
  */
 static int
-lambda_body(codegen_scope *s, node *locals, node *args, node *body, int blk)
+lambda_body(codegen_scope *s, node *locals, struct mrb_ast_args *args, node *body, int blk)
 {
   codegen_scope *parent = s;
   /* Create a new scope for the lambda/block body. */
@@ -2331,31 +2341,25 @@ lambda_body(codegen_scope *s, node *locals, node *args, node *body, int blk)
     uint32_t pos;
     node *opt;
     node *margs, *pargs;
-    node *tail;
+
+    /* args is already struct mrb_ast_args * */
 
     /* mandatory arguments */
-    ma = node_len(args->car);
-    margs = args->car;
-    tail = args->cdr->cdr->cdr->cdr;
+    ma = node_len(args->mandatory_args);
+    margs = args->mandatory_args;
 
     /* optional arguments */
-    oa = node_len(args->cdr->car);
+    oa = node_len(args->optional_args);
     /* rest argument? */
-    ra = args->cdr->cdr->car ? 1 : 0;
+    ra = args->rest_arg ? 1 : 0;
     /* mandatory arguments after rest argument */
-    pa = node_len(args->cdr->cdr->cdr->car);
-    pargs = args->cdr->cdr->cdr->car;
+    pa = node_len(args->post_mandatory_args);
+    pargs = args->post_mandatory_args;
+
     /* keyword arguments */
-    if (tail) {
-      /* Handle variable-sized NODE_ARGS_TAIL */
-      struct mrb_ast_args_tail_node *tail_node = args_tail_node(tail->cdr);
-      ka = tail_node->keywords ? node_len(tail_node->keywords) : 0;
-      kd = tail_node->kwrest ? 1 : 0;
-      ba = tail_node->block ? 1 : 0;
-    }
-    else {
-      ka = kd = ba = 0;
-    }
+    ka = args->keyword_args ? node_len(args->keyword_args) : 0;
+    kd = args->kwrest_arg ? 1 : 0;
+    ba = args->block_arg ? 1 : 0;
 
     if (ma > 0x1f || oa > 0x1f || pa > 0x1f || ka > 0x1f) {
       codegen_error(s, "too many formal arguments");
@@ -2383,7 +2387,7 @@ lambda_body(codegen_scope *s, node *locals, node *args, node *body, int blk)
     if (oa > 0) {
       genjmp_0(s, OP_JMP); /* Jump to skip all default assignments if all optional args are provided. */
     }
-    opt = args->cdr->car; /* AST node for optional arguments. */
+    opt = args->optional_args; /* AST node for optional arguments. */
     i = 0;
     while (opt) { /* Iterate through optional arguments. */
       int idx;
@@ -2407,23 +2411,17 @@ lambda_body(codegen_scope *s, node *locals, node *args, node *body, int blk)
     }
 
     /* Keyword argument processing */
-    if (tail) { /* `tail` contains keyword arguments and block argument */
+    if (ka > 0 || kd > 0) { /* Has keyword arguments or keyword rest */
       node *kwds;
-      int kwrest = 0; /* Flag for keyword rest argument (e.g., **kwargs) */
+      int kwrest = kd; /* Flag for keyword rest argument (e.g., **kwargs) */
 
-      /* Handle variable-sized NODE_ARGS_TAIL */
-      struct mrb_ast_args_tail_node *tail_node = args_tail_node(tail->cdr);
-      kwds = tail_node->keywords;
-      if (tail_node->kwrest) {
-        kwrest = 1;
-      }
+      kwds = args->keyword_args;
 
       while (kwds) {
         int jmpif_key_p, jmp_def_set = -1;
-        node *kwd = kwds->car, *def_arg = kwd->cdr->cdr->car;
-        mrb_sym kwd_sym = node_to_sym(kwd->cdr->car);
-
-        mrb_assert(node_to_int(kwd->car) == NODE_KW_ARG);
+        node *kwd = kwds->car;
+        mrb_sym kwd_sym = node_to_sym(kwd->car);   /* Direct access to key */
+        node *def_arg = kwd->cdr;                  /* Direct access to value */
 
         if (def_arg) {
           int idx;
@@ -2450,20 +2448,20 @@ lambda_body(codegen_scope *s, node *locals, node *args, node *body, int blk)
         kwds = kwds->cdr;
       }
       /* Check if there are keyword args but no keyword rest */
-      int has_keywords = args_tail_node(tail->cdr)->keywords != NULL;
+      int has_keywords = args->keyword_args != NULL;
 
       if (has_keywords && !kwrest) { /* If there are keyword args but no keyword rest. */
         genop_0(s, OP_KEYEND); /* Signal end of keyword arguments. */
       }
-      /* Block argument processing */
-      if (ba) { /* If a block argument (e.g., &blk) is present. */
-        /* Handle variable-sized NODE_ARGS_TAIL */
-        mrb_sym bparam = args_tail_node(tail->cdr)->block;
-        pos = ma+oa+ra+pa+(ka||kd); /* Calculate register offset for the block parameter. */
-        if (bparam) { /* If it's a named block parameter. */
-          int idx = lv_idx(s, bparam);
-          genop_2(s, OP_MOVE, idx, pos+1); /* Move the block from its argument slot to the local variable. */
-        }
+    }
+
+    /* Block argument processing */
+    if (ba) { /* If a block argument (e.g., &blk) is present. */
+      mrb_sym bparam = args->block_arg;
+      pos = ma+oa+ra+pa+(ka||kd); /* Calculate register offset for the block parameter. */
+      if (bparam) { /* If it's a named block parameter. */
+        int idx = lv_idx(s, bparam);
+        genop_2(s, OP_MOVE, idx, pos+1); /* Move the block from its argument slot to the local variable. */
       }
     }
 
@@ -2472,11 +2470,9 @@ lambda_body(codegen_scope *s, node *locals, node *args, node *body, int blk)
       node *n = margs;
       pos = 1; /* Start from register 1 (after self). */
       while (n) {
-        if (node_to_int(n->car->car) == NODE_VARIABLE) {
-          if (VAR_NODE_TYPE(n->car->cdr) == NODE_MASGN) { /* If the argument is a mass assignment (e.g., |(a,b)| ). */
-            struct mrb_ast_masgn_node *masgn_n = (struct mrb_ast_masgn_node*)n->car->cdr;
-            gen_massignment(s, masgn_n->lhs, pos, NOVAL);
-          }
+        if (get_node_type(n->car) == NODE_MASGN) { /* If the argument is a mass assignment (e.g., |(a,b)| ). */
+          struct mrb_ast_masgn_node *masgn_n = (struct mrb_ast_masgn_node*)n->car;
+          gen_massignment(s, masgn_n->lhs, pos, NOVAL);
         }
         pos++;
         n = n->cdr;
@@ -2486,11 +2482,9 @@ lambda_body(codegen_scope *s, node *locals, node *args, node *body, int blk)
       node *n = pargs;
       pos = ma+oa+ra+1; /* Calculate starting register for post-mandatory args. */
       while (n) {
-        if (node_to_int(n->car->car) == NODE_VARIABLE) {
-          if (VAR_NODE_TYPE(n->car->cdr) == NODE_MASGN) { /* If argument is a mass assignment. */
-            struct mrb_ast_masgn_node *masgn_n = (struct mrb_ast_masgn_node*)n->car->cdr;
-            gen_massignment(s, masgn_n->lhs, pos, NOVAL);
-          }
+        if (get_node_type(n->car) == NODE_MASGN) { /* If argument is a mass assignment. */
+          struct mrb_ast_masgn_node *masgn_n = (struct mrb_ast_masgn_node*)n->car;
+          gen_massignment(s, masgn_n->lhs, pos, NOVAL);
         }
         pos++;
         n = n->cdr;
@@ -2558,12 +2552,32 @@ scope_body(codegen_scope *s, node *locals, node *body, int val)
   return s->irep->rlen - 1;
 }
 
+/* Helper functions for node type checking - works with variable-sized nodes */
+static enum node_type
+get_node_type(node *n)
+{
+  if (!n) return (enum node_type)0;
+
+  /* Try to interpret as variable-sized node first */
+  struct mrb_ast_var_header *header = (struct mrb_ast_var_header*)n;
+  return (enum node_type)header->node_type;
+}
+
+static struct mrb_ast_var_header*
+get_var_header(node *n)
+{
+  if (!n) return NULL;
+
+  /* Try to interpret as variable-sized node */
+  struct mrb_ast_var_header *header = (struct mrb_ast_var_header*)n;
+  return header;
+}
+
 /* Helper to detect splat nodes in variable-sized format */
 static mrb_bool
 is_splat_node(node *n)
 {
-  return (node_to_int(n->car) == NODE_VARIABLE &&
-          VAR_NODE_TYPE(n->cdr) == NODE_SPLAT);
+  return (get_node_type(n) == NODE_SPLAT);
 }
 
 static mrb_bool
@@ -2626,6 +2640,43 @@ gen_values(codegen_scope *s, node *t, int val, int limit)
   while (t) {
     int is_splat = is_splat_node(t->car);
 
+    /* Optimization: skip or inline literal splat arrays
+     * - Empty splat (`*[]`/`*zarray`): contributes nothing; skip.
+     * - Non-empty literal array with no inner splat (`*[a,b]`): inline
+     *   as normal positional args to avoid building/concatenating arrays.
+     */
+    if (is_splat) {
+      node *sv = SPLAT_NODE_VALUE(t->car);
+      if (sv) {
+        enum node_type nt = get_node_type(sv);
+        if (nt == NODE_ARRAY) {
+          struct mrb_ast_array_node *an = array_node(sv);
+          if (ARRAY_NODE_ELEMENTS(an) == NULL) {
+            /* empty splat; contributes nothing */
+            t = t->cdr;
+            continue;
+          }
+          else if (nosplat(ARRAY_NODE_ELEMENTS(an))) {
+            /* Inline non-empty literal array elements as regular args */
+            node *e = ARRAY_NODE_ELEMENTS(an);
+            while (e) {
+              /* Honor evaluation order */
+              codegen(s, e->car, val);
+              n++;
+              e = e->cdr;
+            }
+            t = t->cdr;
+            continue;
+          }
+        }
+        else if (nt == NODE_ZARRAY) {
+          /* explicit empty array literal */
+          t = t->cdr;
+          continue;
+        }
+      }
+    }
+
     if (is_splat || cursp() >= slimit) { /* flush stack */
       pop_n(n);
       if (first) {
@@ -2683,7 +2734,7 @@ gen_hash(codegen_scope *s, node *tree, int val, int limit)
   mrb_bool first = TRUE;
 
   while (tree) {
-    if (node_to_int(tree->car->car->car) == NODE_KW_REST_ARGS) {
+    if (node_to_sym(tree->car->car) == MRB_OPSYM_2(s->mrb, pow)) {
       if (val && first) {
         genop_2(s, OP_HASH, cursp(), 0);
         push();
@@ -2747,112 +2798,6 @@ gen_hash(codegen_scope *s, node *tree, int val, int limit)
   return len;
 }
 
-static void
-gen_call(codegen_scope *s, node *tree, int val, int safe)
-{
-  mrb_sym sym = node_to_sym(tree->cdr->car);
-  int skip = 0, n = 0, nk = 0, noop = no_optimize(s), noself = 0, blk = 0, sp_save = cursp();
-  enum mrb_insn opt_op = OP_NOP;
-
-  if (!noop) {
-    if (sym == MRB_OPSYM_2(s->mrb, add)) opt_op = OP_ADD;
-    else if (sym == MRB_OPSYM_2(s->mrb, sub)) opt_op = OP_SUB;
-    else if (sym == MRB_OPSYM_2(s->mrb, mul)) opt_op = OP_MUL;
-    else if (sym == MRB_OPSYM_2(s->mrb, div)) opt_op = OP_DIV;
-    else if (sym == MRB_OPSYM_2(s->mrb, lt)) opt_op = OP_LT;
-    else if (sym == MRB_OPSYM_2(s->mrb, le)) opt_op = OP_LE;
-    else if (sym == MRB_OPSYM_2(s->mrb, gt)) opt_op = OP_GT;
-    else if (sym == MRB_OPSYM_2(s->mrb, ge)) opt_op = OP_GE;
-    else if (sym == MRB_OPSYM_2(s->mrb, eq)) opt_op = OP_EQ;
-    else if (sym == MRB_OPSYM_2(s->mrb, aref)) opt_op = OP_GETIDX;
-    else if (sym == MRB_OPSYM_2(s->mrb, aset)) opt_op = OP_SETIDX;
-  }
-  if (!tree->car || (opt_op == OP_NOP &&
-      node_to_int(tree->car->car) == NODE_VARIABLE &&
-      VAR_NODE_TYPE(tree->car->cdr) == NODE_SELF)) {
-    noself = 1;
-    push();
-  }
-  else {
-    codegen(s, tree->car, VAL); /* receiver */
-  }
-  if (safe) {
-    int recv = cursp()-1;
-    gen_move(s, cursp(), recv, 1);
-    skip = genjmp2_0(s, OP_JMPNIL, cursp(), val);
-  }
-  tree = tree->cdr->cdr->car;
-  if (tree) {
-    if (tree->car) {            /* positional arguments */
-      n = gen_values(s, tree->car, VAL, 14);
-      if (n < 0) {              /* variable length */
-        noop = 1;               /* not operator */
-        n = 15;
-        push();
-      }
-    }
-    if (tree->cdr->car) {       /* keyword arguments */
-      noop = 1;
-      nk = gen_hash(s, tree->cdr->car->cdr, VAL, 14);
-      if (nk < 0) nk = 15;
-    }
-  }
-  if (tree && tree->cdr && tree->cdr->cdr) {
-    codegen(s, tree->cdr->cdr, VAL);
-    pop();
-    noop = 1;
-    blk = 1;
-  }
-  push();
-  s->sp = sp_save;
-  if (opt_op == OP_ADD && n == 1) {
-    gen_addsub(s, OP_ADD, cursp());
-  }
-  else if (opt_op == OP_SUB && n == 1) {
-    gen_addsub(s, OP_SUB, cursp());
-  }
-  else if (opt_op == OP_MUL && n == 1) {
-    gen_muldiv(s, OP_MUL, cursp());
-  }
-  else if (opt_op == OP_DIV && n == 1) {
-    gen_muldiv(s, OP_DIV, cursp());
-  }
-  else if (opt_op == OP_LT && n == 1) {
-    genop_1(s, OP_LT, cursp());
-  }
-  else if (opt_op == OP_LE && n == 1) {
-    genop_1(s, OP_LE, cursp());
-  }
-  else if (opt_op == OP_GT && n == 1) {
-    genop_1(s, OP_GT, cursp());
-  }
-  else if (opt_op == OP_GE && n == 1) {
-    genop_1(s, OP_GE, cursp());
-  }
-  else if (opt_op == OP_EQ && n == 1) {
-    genop_1(s, OP_EQ, cursp());
-  }
-  else if (opt_op == OP_SETIDX && n == 2) {
-    genop_1(s, OP_SETIDX, cursp());
-  }
-  else if (!noop && n == 0 && gen_uniop(s, sym, cursp())) {
-    /* constant folding succeeded */
-  }
-  else if (!noop && n == 1 && gen_binop(s, sym, cursp())) {
-    /* constant folding succeeded */
-  }
-  else if (noself) {
-    genop_3(s, blk ? OP_SSENDB : OP_SSEND, cursp(), new_sym(s, sym), n|(nk<<4));
-  }
-  else {
-    genop_3(s, blk ? OP_SENDB : OP_SEND, cursp(), new_sym(s, sym), n|(nk<<4));
-  }
-  if (safe) {
-    dispatch(s, skip);
-  }
-  if (!val) return;
-  push();
-}
 
 static void
 gen_colon_assign_common(codegen_scope *s, node *rhs, int sp, int val, int idx, int final_op)
@@ -2903,7 +2848,7 @@ gen_colon3_assign(codegen_scope *s, node *varnode, node *rhs, int sp, int val)
 static void
 gen_xvar_assignment(codegen_scope *s, node *tree, node *rhs, int sp, int val, uint8_t op)
 {
-  struct mrb_ast_var_node *var = var_node(tree->cdr);
+  struct mrb_ast_var_node *var = (struct mrb_ast_var_node*)tree;
   if (rhs) {
     codegen(s, rhs, VAL);
     pop();
@@ -2926,193 +2871,68 @@ static void
 gen_assignment(codegen_scope *s, node *tree, node *rhs, int sp, int val)
 {
   int idx;
-  int type = node_to_int(tree->car);
 
-  switch (type) {
+  /* Check if this is a variable-sized node first */
+  enum node_type var_type = get_node_type(tree);
+  switch (var_type) {
   case NODE_NIL:
     if (rhs) {
       codegen(s, rhs, VAL);
       pop();
       sp = cursp();
     }
+    /* NODE_NIL assignment is complete - just break (splat without assignment) */
     break;
-
-  case NODE_CALL:
-  case NODE_SCALL:
-    /* keep evaluation order */
+  case NODE_COLON2:
+    gen_colon2_assign(s, tree, rhs, sp, val);
+    return;
+  case NODE_COLON3:
+    gen_colon3_assign(s, tree, rhs, sp, val);
+    return;
+  case NODE_GVAR:
+    gen_xvar_assignment(s, tree, rhs, sp, val, OP_SETGV);
     break;
-
-  case NODE_VARIABLE:
-    /* Handle variable-sized nodes completely here */
+  case NODE_IVAR:
+    gen_xvar_assignment(s, tree, rhs, sp, val, OP_SETIV);
+    break;
+  case NODE_CVAR:
+    gen_xvar_assignment(s, tree, rhs, sp, val, OP_SETCV);
+    break;
+  case NODE_CONST:
+    gen_xvar_assignment(s, tree, rhs, sp, val, OP_SETCONST);
+    break;
+  case NODE_MASGN:
+    codegen_masgn(s, tree, rhs, sp, val);
+    return;
+  case NODE_LVAR:
     {
-      enum node_type var_type = VAR_NODE_TYPE(tree->cdr);
-      switch (var_type) {
-      case NODE_NIL:
-        if (rhs) {
-          codegen(s, rhs, VAL);
-          pop();
-          sp = cursp();
-        }
-        /* NODE_NIL assignment is complete - just break (splat without assignment) */
-        break;
-      case NODE_COLON2:
-        gen_colon2_assign(s, tree->cdr, rhs, sp, val);
-        return;
-      case NODE_COLON3:
-        gen_colon3_assign(s, tree->cdr, rhs, sp, val);
-        return;
-      case NODE_GVAR:
-        gen_xvar_assignment(s, tree, rhs, sp, val, OP_SETGV);
-        break;
-      case NODE_IVAR:
-        gen_xvar_assignment(s, tree, rhs, sp, val, OP_SETIV);
-        break;
-      case NODE_CVAR:
-        gen_xvar_assignment(s, tree, rhs, sp, val, OP_SETCV);
-        break;
-      case NODE_CONST:
-        gen_xvar_assignment(s, tree, rhs, sp, val, OP_SETCONST);
-        break;
-      case NODE_MASGN:
-        gen_masgn_var(s, tree->cdr, rhs, sp, val);
-        return;
-      case NODE_LVAR:
-      case NODE_ARG:
-        {
-          mrb_sym sym = VAR_NODE_SYMBOL(tree->cdr);
-          if (rhs) {
-            codegen(s, rhs, VAL);
-            pop();
-            sp = cursp();
-          }
-          idx = lv_idx(s, sym);
-          if (idx > 0) {
-            if (idx != sp) {
-              gen_move(s, idx, sp, val);
-            }
-            break;
-          }
-          else {
-            gen_setupvar(s, sp, sym);
-          }
-        }
-        break;
-      default:
-        codegen_error(s, "unsupported variable-sized lhs");
-        break;
-      }
-      /* Variable-sized node handling is complete - skip second switch */
-      if (val) push();
-      return;
-    }
-
-  default:
-    codegen_error(s, "unknown lhs");
-    break;
-  }
-
-  tree = tree->cdr;
-  switch (type) {
-  case NODE_CALL:
-  case NODE_SCALL:
-    {
-      int noself = 0, safe = (type == NODE_SCALL), skip = 0, top, call, n = 0;
-      mrb_sym mid = node_to_sym(tree->cdr->car);
-
-      top = cursp();
-      if (val || sp == cursp()) {
-        push();                   /* room for retval */
-      }
-      call = cursp();
-      if (!tree->car) {
-        noself = 1;
-        push();
-      }
-      else {
-        codegen(s, tree->car, VAL); /* receiver */
-      }
-      if (safe) {
-        int recv = cursp()-1;
-        gen_move(s, cursp(), recv, 1);
-        skip = genjmp2_0(s, OP_JMPNIL, cursp(), val);
-      }
-      tree = tree->cdr->cdr->car;
-      if (tree) {
-        if (tree->car) {            /* positional arguments */
-          n = gen_values(s, tree->car, VAL, (tree->cdr->car)?13:14);
-          if (n < 0) {              /* variable length */
-            n = 15;
-            push();
-          }
-        }
-        if (tree->cdr->car) {       /* keyword arguments */
-          if (n == 13 || n == 14) {
-            pop_n(n);
-            genop_2(s, OP_ARRAY, cursp(), n);
-            push();
-            n = 15;
-          }
-          gen_hash(s, tree->cdr->car->cdr, VAL, 0);
-          if (n < 14) {
-            n++;
-          }
-          else {
-            pop_n(2);
-            genop_2(s, OP_ARYPUSH, cursp(), 1);
-          }
-          push();
-        }
-      }
+      mrb_sym sym = VAR_NODE_SYMBOL(tree);
       if (rhs) {
         codegen(s, rhs, VAL);
         pop();
+        sp = cursp();
       }
-      else {
-        gen_move(s, cursp(), sp, 0);
-      }
-      if (val) {
-        gen_move(s, top, cursp(), 1);
-      }
-      if (n < 15) {
-        n++;
-        if (n == 15) {
-          pop_n(14);
-          genop_2(s, OP_ARRAY, cursp(), 15);
+      idx = lv_idx(s, sym);
+      if (idx > 0) {
+        if (idx != sp) {
+          gen_move(s, idx, sp, val);
         }
+        break;
       }
       else {
-        pop();
-        genop_2(s, OP_ARYPUSH, cursp(), 1);
+        gen_setupvar(s, sp, sym);
       }
-      push(); pop();
-      s->sp = call;
-      if (mid == MRB_OPSYM_2(s->mrb, aref) && n == 2) {
-        push_n(4); pop_n(4); /* self + idx + value + (invisible block for OP_SEND) */
-        genop_1(s, OP_SETIDX, cursp());
-      }
-      else {
-        int st = 2 /* self + block */ +
-                 (((n >> 0) & 0x0f) < 15 ? ((n >> 0) & 0x0f)     : 1) +
-                 (((n >> 4) & 0x0f) < 15 ? ((n >> 4) & 0x0f) * 2 : 1);
-        push_n(st); pop_n(st);
-        genop_3(s, noself ? OP_SSEND : OP_SEND, cursp(), new_sym(s, attrsym(s, mid)), n);
-      }
-      if (safe) {
-        dispatch(s, skip);
-      }
-      s->sp = top;
     }
     break;
-
-  /* splat without assignment */
-  case NODE_NIL:
-    break;
-
+  case NODE_CALL:
+    codegen_call_assign(s, tree, rhs, sp, val);
+    return;
   default:
-    codegen_error(s, "unknown lhs");
+    codegen_error(s, "unsupported variable-sized lhs");
     break;
   }
   if (val) push();
+  return;
 }
 
 static void
@@ -3234,8 +3054,8 @@ gen_literal_array(codegen_scope *s, node *tree, mrb_bool sym, int val)
 
         /* Only process non-empty segments */
         if (!is_empty_segment) {
-          /* Use codegen_cons_list_string for this segment */
-          codegen_cons_list_string(s, segment, VAL);
+          /* Use gen_string for this segment */
+          gen_string(s, segment, VAL);
 
           /* Apply symbol conversion if needed */
           if (sym) {
@@ -3322,21 +3142,14 @@ gen_retval(codegen_scope *s, node *tree)
 static mrb_bool
 true_always(node *tree)
 {
-  switch (node_to_int(tree->car)) {
+  /* Check if this is a variable-sized node first */
+  enum node_type var_type = get_node_type(tree);
+  switch (var_type) {
   case NODE_INT:
-  case NODE_SYM:
+  case NODE_BIGINT:
+  case NODE_FLOAT:
+  case NODE_TRUE:
     return TRUE;
-  case NODE_VARIABLE:
-    /* Check variable-sized nodes that are always true */
-    switch (VAR_NODE_TYPE(tree->cdr)) {
-    case NODE_INT:
-    case NODE_BIGINT:
-    case NODE_FLOAT:
-    case NODE_TRUE:
-      return TRUE;
-    default:
-      return FALSE;
-    }
   default:
     return FALSE;
   }
@@ -3345,17 +3158,14 @@ true_always(node *tree)
 static mrb_bool
 false_always(node *tree)
 {
-  if (node_to_int(tree->car) == NODE_VARIABLE) {
-    /* Check variable-sized nodes that are always false */
-    switch (VAR_NODE_TYPE(tree->cdr)) {
-    case NODE_FALSE:
-    case NODE_NIL:
-      return TRUE;
-    default:
-      return FALSE;
-    }
+  /* Check variable-sized nodes that are always false */
+  switch (get_node_type(tree)) {
+  case NODE_FALSE:
+  case NODE_NIL:
+    return TRUE;
+  default:
+    return FALSE;
   }
-  return FALSE;
 }
 
 static void
@@ -3391,31 +3201,32 @@ gen_lvar(codegen_scope *s, mrb_sym sym, int val)
 }
 
 static void
-gen_hash_var(codegen_scope *s, node *varnode, int val)
+codegen_hash(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_hash_node *hash = hash_node(varnode);
-  int len = hash->len;
-  struct mrb_ast_node **pairs = hash->pairs;
-  int i;
+  node *pairs = HASH_NODE_PAIRS(hash);
   int regular_pairs = 0;
   mrb_bool update = FALSE;
   mrb_bool first = TRUE;
 
   if (!val) return;
 
-  if (len == 0) {
+  if (!pairs) {
     genop_2(s, OP_HASH, cursp(), 0);
     push();
     return;
   }
 
-  /* Process each key-value pair, handling double-splat (**) cases */
-  for (i = 0; i < len; i++) {
-    struct mrb_ast_node *key = pairs[i * 2];
-    struct mrb_ast_node *value = pairs[i * 2 + 1];
+  /* Process each key-value pair using cons-list iteration, handling double-splat (**) cases */
+  node *current = pairs;
+  while (current) {
+    /* Each current->car is a cons (key . value) */
+    node *pair = current->car;
+    struct mrb_ast_node *key = pair->car;
+    struct mrb_ast_node *value = pair->cdr;
 
     /* Check if this is a double-splat (**kwargs) */
-    if (node_to_int(key->car) == NODE_KW_REST_ARGS) {
+    if (node_to_sym(key) == MRB_OPSYM_2(s->mrb, pow)) {
       /* Flush any accumulated regular pairs first */
       if (val && first && regular_pairs == 0) {
         /* First element is splat - create empty hash */
@@ -3456,6 +3267,8 @@ gen_hash_var(codegen_scope *s, node *varnode, int val)
       regular_pairs++;
     }
     first = FALSE;
+
+    current = current->cdr;
   }
 
   /* Handle any remaining regular pairs */
@@ -3475,17 +3288,7 @@ gen_hash_var(codegen_scope *s, node *varnode, int val)
   }
 }
 
-static void
-codegen_call_fcall(codegen_scope *s, node *tree, int val)
-{
-  gen_call(s, tree, val, 0);
-}
 
-static void
-codegen_scall(codegen_scope *s, node *tree, int val)
-{
-  gen_call(s, tree, val, 1);
-}
 
 /* Common function to generate bytecode for cons list string representation
  * Handles list of elements where each element is either:
@@ -3508,80 +3311,48 @@ codegen_scall(codegen_scope *s, node *tree, int val)
  * - (-1 . node) for expressions that need evaluation
  */
 static void
-codegen_cons_list_string(codegen_scope *s, node *list, int val)
+gen_string(codegen_scope *s, node *list, int val)
 {
-  if (!list) {
-    if (val) {
-      gen_load_nil(s, 1);
-    }
-    return;
-  }
-
   if (val) {
     /* Handle as cons list of string parts with safety checks */
     node *n = list;
+    mrb_bool first = TRUE;
 
-    /* Generate first element */
-    node *elem = n->car;
-    if (!elem) {
-      gen_load_nil(s, 1);
-      return;
-    }
-
-    mrb_int len = node_to_int(elem->car);
-
-    if (len >= 0) {
-      /* String literal: (len . str) */
-      char *str = (char*)elem->cdr;
-      if (str) {
-        int off = new_lit_str(s, str, len);
-        genop_2(s, OP_STRING, cursp(), off);
-        push();
-      }
-      else {
-        /* Handle null string */
-        int off = new_lit_str(s, "", 0);
-        genop_2(s, OP_STRING, cursp(), off);
-        push();
-      }
-    }
-    else {
-      /* Expression: (-1 . node) */
-      codegen(s, (node*)elem->cdr, VAL);
-    }
-
-    /* Concatenate remaining elements */
-    n = n->cdr;
     while (n) {
-      elem = n->car;
+      node *elem = n->car;
       if (!elem) break;
 
-      len = node_to_int(elem->car);
+      mrb_int len = node_to_int(elem->car);
 
       if (len >= 0) {
         /* String literal: (len . str) */
-        char *str = (char*)elem->cdr;
-        if (str) {
-          int off = new_lit_str(s, str, len);
-          genop_2(s, OP_STRING, cursp(), off);
-          push();
-        }
-        else {
-          /* Handle null string */
-          int off = new_lit_str(s, "", 0);
-          genop_2(s, OP_STRING, cursp(), off);
-          push();
-        }
+        const char *str = (char*)elem->cdr;
+        if (!str) {str = ""; len = 0;}
+        int off = new_lit_str(s, str, len);
+        genop_2(s, OP_STRING, cursp(), off);
+        push();
       }
       else {
         /* Expression: (-1 . node) */
         codegen(s, (node*)elem->cdr, VAL);
       }
 
-      pop(); pop();
-      genop_1(s, OP_STRCAT, cursp());
-      push();
+      /* Concatenate with previous parts (except for first element) */
+      if (!first) {
+        pop(); pop();
+        genop_1(s, OP_STRCAT, cursp());
+        push();
+      }
+      else {
+        first = FALSE;
+      }
+
       n = n->cdr;
+    }
+
+    /* Handle empty list case */
+    if (first) {
+      gen_load_nil(s, 1);
     }
   }
   else {
@@ -3590,10 +3361,7 @@ codegen_cons_list_string(codegen_scope *s, node *list, int val)
     while (n) {
       node *elem = n->car;
       if (!elem) break;
-
-      mrb_int len = node_to_int(elem->car);
-
-      if (len < 0) {
+      if (node_to_int(elem->car) < 0) {
         /* Expression: (-1 . node) - evaluate for side effects */
         codegen(s, (node*)elem->cdr, NOVAL);
       }
@@ -3603,57 +3371,17 @@ codegen_cons_list_string(codegen_scope *s, node *list, int val)
   }
 }
 
-static void
-codegen_regx(codegen_scope *s, node *tree, int val)
-{
-  if (val) {
-    char *p1 = (char*)tree->car;
-    char *p2 = (char*)tree->cdr->car;
-    char *p3 = (char*)tree->cdr->cdr;
-    int sym = new_sym(s, mrb_intern_lit(s->mrb, REGEXP_CLASS));
-    int off = new_lit_cstr(s, p1);
-    int argc = 1;
-
-    genop_1(s, OP_OCLASS, cursp());
-    genop_2(s, OP_GETMCNST, cursp(), sym);
-    push();
-    genop_2(s, OP_STRING, cursp(), off);
-    push();
-    if (p2 || p3) {
-      if (p2) { /* opt */
-        off = new_lit_cstr(s, p2);
-        genop_2(s, OP_STRING, cursp(), off);
-      }
-      else {
-        genop_1(s, OP_LOADNIL, cursp());
-      }
-      push();
-      argc++;
-      if (p3) { /* enc */
-        off = new_lit_str(s, p3, 1);
-        genop_2(s, OP_STRING, cursp(), off);
-        push();
-        argc++;
-      }
-    }
-    push(); /* space for a block */
-    pop_n(argc+2);
-    sym = new_sym(s, MRB_SYM_2(s->mrb, compile));
-    genop_3(s, OP_SEND, cursp(), sym, argc);
-    push();
-  }
-}
 
 /* Handle variable-sized node types */
 static void
-gen_call_var(codegen_scope *s, node *varnode, int val)
+codegen_call(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_call_node *call = call_node(varnode);
   mrb_sym sym = CALL_NODE_METHOD(call);
   int skip = 0, n = 0, nk = 0, noop = no_optimize(s), noself = 0, blk = 0, sp_save = cursp();
   enum mrb_insn opt_op = OP_NOP;
-  int argc = CALL_NODE_ARGC(call);
   int safe = CALL_NODE_SAFE(call);
+  node *args = call->args;
 
   if (!noop) {
     if (sym == MRB_OPSYM_2(s->mrb, add)) opt_op = OP_ADD;
@@ -3669,12 +3397,12 @@ gen_call_var(codegen_scope *s, node *varnode, int val)
     else if (sym == MRB_OPSYM_2(s->mrb, aset)) opt_op = OP_SETIDX;
   }
 
-  if (!CALL_NODE_RECEIVER(call)) {
+  if (!call->receiver || (opt_op == OP_NOP && get_node_type(call->receiver) == NODE_SELF)) {
     noself = 1;
     push();
   }
   else {
-    codegen(s, CALL_NODE_RECEIVER(call), VAL); /* receiver */
+    codegen(s, call->receiver, VAL); /* receiver */
   }
 
   if (safe) {
@@ -3683,31 +3411,34 @@ gen_call_var(codegen_scope *s, node *varnode, int val)
     skip = genjmp2_0(s, OP_JMPNIL, cursp(), val);
   }
 
-  /* Generate arguments */
-  n = argc;
-  if (argc > 0) {
-    struct mrb_ast_node **args = CALL_NODE_ARGS(call);
-    int i;
-    for (i = 0; i < argc; i++) {
-      codegen(s, args[i], VAL);
+  /* Generate arguments - use gen_values to properly handle splat */
+  if (args) {
+    struct mrb_ast_callargs *callargs = (struct mrb_ast_callargs*)args;
+    if (callargs->regular_args) {
+      n = gen_values(s, callargs->regular_args, VAL, 14);
+      if (n < 0) {              /* variable length (contains splat) */
+        n = 15;
+        push();
+        noop = 1;
+      }
     }
-    if (n > 14) {
+
+    /* Handle keyword arguments if present */
+    if (callargs->keyword_args) {
+      nk = gen_hash(s, callargs->keyword_args, VAL, 14);
+      if (nk < 0) {
+        nk = 15;
+      }
       noop = 1;
-      n = 15;
-      push();
     }
-  }
 
-  /* Handle keyword arguments if present */
-  if (CALL_NODE_HAS_KWARGS(call)) {
-    noop = 1;
-    nk = 1; /* Simplified - would need proper kwarg handling */
-  }
-
-  /* Handle block if present */
-  if (CALL_NODE_HAS_BLOCK(call)) {
-    noop = 1;
-    blk = 1;
+    /* Handle block if present */
+    if (callargs->block_arg) {
+      codegen(s, callargs->block_arg, VAL);
+      pop();
+      blk = 1;
+      noop = 1;
+    }
   }
 
   push();
@@ -3765,19 +3496,164 @@ gen_call_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_array_var(codegen_scope *s, node *varnode, int val)
+codegen_call_assign(codegen_scope *s, node *varnode, node *rhs, int sp, int val)
+{
+  enum node_type var_type = VAR_NODE_TYPE(varnode);
+  int noself = 0, safe = 0, skip = 0, top, callsp, n = 0, nk = 0;
+  mrb_sym mid = 0;
+  node *args = NULL;
+  node *receiver = NULL;
+  enum mrb_insn opt_op = OP_NOP;
+  int noop = no_optimize(s);
+
+  /* Extract information based on node type */
+  if (var_type == NODE_CALL) {
+    struct mrb_ast_call_node *call = call_node(varnode);
+    mid = call->method_name;
+    args = call->args;
+    receiver = call->receiver;
+    safe = call->safe_call;
+  }
+  else {
+    codegen_error(s, "unsupported call type in assignment");
+    return;
+  }
+
+  /* Convert method name to assignment form (e.g., [] -> []=) */
+  mrb_sym assign_mid = attrsym(s, mid);
+
+  /* Check for optimizable operations */
+  if (!noop) {
+    if (mid == MRB_OPSYM_2(s->mrb, aref)) opt_op = OP_SETIDX;
+  }
+
+  top = cursp();
+  if (val || sp == cursp()) {
+    push();                   /* room for retval */
+  }
+  callsp = cursp();
+
+  /* Generate receiver */
+  if (!receiver) {
+    noself = 1;
+    push();
+  }
+  else {
+    codegen(s, receiver, VAL); /* receiver */
+  }
+
+  /* Handle safe navigation */
+  if (safe) {
+    int recv = cursp()-1;
+    gen_move(s, cursp(), recv, 1);
+    skip = genjmp2_0(s, OP_JMPNIL, cursp(), val);
+  }
+
+  /* Generate arguments from original call */
+  if (args) {
+    struct mrb_ast_callargs *callargs = (struct mrb_ast_callargs*)args;
+    if (callargs->regular_args) {
+      node *regular_args = callargs->regular_args;
+      node *arg_iter = regular_args;
+      while (arg_iter) {
+        codegen(s, arg_iter->car, VAL);
+        n++;
+        arg_iter = arg_iter->cdr;
+      }
+      if (n > 13) {  /* leave room for rhs */
+        pop_n(n);
+        genop_2(s, OP_ARRAY, cursp(), n);
+        push();
+        n = 15;
+        noop = 1;
+      }
+    }
+
+    /* Handle keyword arguments if present */
+    if (callargs->keyword_args) {
+      node *kwargs = callargs->keyword_args;
+      if (n == 13 || n == 14) {
+        pop_n(n);
+        genop_2(s, OP_ARRAY, cursp(), n);
+        push();
+        n = 15;
+      }
+      gen_hash(s, kwargs->cdr, VAL, 0);
+      if (n < 14) {
+        n++;
+      }
+      else {
+        pop_n(2);
+        genop_2(s, OP_ARYPUSH, cursp(), 1);
+      }
+      push();
+      noop = 1;
+    }
+  }
+
+  /* Generate rhs (the assigned value) */
+  if (rhs) {
+    codegen(s, rhs, VAL);
+    pop();
+  }
+  else {
+    /* For compound assignments, move the computed value from sp to cursp() */
+    gen_move(s, cursp(), sp, 0);
+  }
+  if (val) {
+    gen_move(s, top, cursp(), 1);
+  }
+  /* Account for the value being assigned (either from rhs or already on stack) */
+  if (n < 14) {
+    n++;
+  }
+  else {
+    if (rhs) {
+      pop_n(2);
+      genop_2(s, OP_ARYPUSH, cursp(), 1);
+      push();
+    }
+  }
+
+  /* Generate the optimized instruction or method call */
+  push(); push();
+  s->sp = callsp;
+
+  if (opt_op == OP_SETIDX && n == 2) {
+    /* Always preserve return value for SETIDX - assignments return the assigned value */
+    genop_1(s, OP_SETIDX, cursp());
+  }
+  else if (noself) {
+    genop_3(s, OP_SSEND, cursp(), new_sym(s, assign_mid), n|(nk<<4));
+  }
+  else {
+    genop_3(s, OP_SEND, cursp(), new_sym(s, assign_mid), n|(nk<<4));
+  }
+
+  if (safe) {
+    dispatch(s, skip);
+  }
+
+  /* Restore stack pointer like legacy code */
+  s->sp = top;
+
+  if (val) {
+    push();
+  }
+}
+
+static void
+codegen_array(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_array_node *array = array_node(varnode);
-  int len = ARRAY_NODE_LEN(array);
-  struct mrb_ast_node **elements = ARRAY_NODE_ELEMENTS(array);
-  int i;
+  node *elements = ARRAY_NODE_ELEMENTS(array);
   int regular_elements = 0;
   int first = 1;
   int slimit = GEN_VAL_STACK_MAX;
 
   if (!val) return;
 
-  if (len == 0) {
+  if (!elements) {
     genop_2(s, OP_ARRAY, cursp(), 0);
     push();
     return;
@@ -3785,10 +3661,30 @@ gen_array_var(codegen_scope *s, node *varnode, int val)
 
   if (cursp() >= GEN_LIT_ARY_MAX) slimit = INT16_MAX;
 
-  /* Process each element, handling splats */
-  for (i = 0; i < len; i++) {
-    struct mrb_ast_node *element = elements[i];
+  /* Process each element using cons-list iteration, handling splats */
+  node *current = elements;
+  while (current) {
+    struct mrb_ast_node *element = current->car;
     int is_splat = is_splat_node(element);
+
+    /* Skip splat of an empty literal array: [*[]] => [] without ARYCAT noise */
+    if (is_splat) {
+      node *sv = SPLAT_NODE_VALUE(element);
+      if (sv) {
+        enum node_type nt = get_node_type(sv);
+        if (nt == NODE_ARRAY) {
+          struct mrb_ast_array_node *an = array_node(sv);
+          if (ARRAY_NODE_ELEMENTS(an) == NULL) {
+            current = current->cdr;
+            continue;
+          }
+        }
+        else if (nt == NODE_ZARRAY) {
+          current = current->cdr;
+          continue;
+        }
+      }
+    }
 
     if (is_splat || cursp() >= slimit) { /* flush accumulated elements */
       if (regular_elements > 0) {
@@ -3825,6 +3721,8 @@ gen_array_var(codegen_scope *s, node *varnode, int val)
     else {
       regular_elements++;
     }
+
+    current = current->cdr;
   }
 
   /* Handle any remaining regular elements */
@@ -3845,9 +3743,15 @@ gen_array_var(codegen_scope *s, node *varnode, int val)
 }
 
 /* Phase 3 Variable Node Codegen Functions */
+static mrb_bool
+callargs_empty(node *n)
+{
+  if (!n) return TRUE;
+  return (CALLARGS_NODE_REGULAR(n) == 0 && CALLARGS_NODE_KEYWORDS(n) == 0 && CALLARGS_NODE_BLOCK(n) == 0);
+}
 
 static void
-gen_if_var(codegen_scope *s, node *varnode, int val)
+codegen_if(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_if_node *if_n = if_node(varnode);
   node *condition = if_n->condition;
@@ -3869,22 +3773,12 @@ gen_if_var(codegen_scope *s, node *varnode, int val)
     return;
   }
 
-  /* Check for nil? optimization - handle both traditional and variable-sized nodes */
-  if (NODE_TYPE(condition) == NODE_CALL) {
-    /* Traditional cons-list NODE_CALL */
-    node *n = condition->cdr;
-    mrb_sym mid = node_to_sym(n->cdr->car);
+  /* Check for nil? optimization */
+  if (get_node_type(condition) == NODE_CALL) {
+    /* Variable-sized NODE_CALL */
+    struct mrb_ast_call_node *call_n = (struct mrb_ast_call_node*)condition;
     mrb_sym sym_nil_p = MRB_SYM_Q_2(s->mrb, nil);
-    if (mid == sym_nil_p && n->cdr->cdr->car == NULL) {
-      nil_p = TRUE;
-      codegen(s, n->car, VAL);
-    }
-  }
-  else if (NODE_TYPE(condition) == NODE_VARIABLE && VAR_NODE_TYPE(condition->cdr) == NODE_CALL) {
-    /* Variable-sized NODE_CALL wrapped in NODE_VARIABLE */
-    struct mrb_ast_call_node *call_n = (struct mrb_ast_call_node*)condition->cdr;
-    mrb_sym sym_nil_p = MRB_SYM_Q_2(s->mrb, nil);
-    if (call_n->method_name == sym_nil_p && call_n->argc == 0) {
+    if (call_n->method_name == sym_nil_p && callargs_empty(call_n->args)) {
       nil_p = TRUE;
       codegen(s, call_n->receiver, VAL);
     }
@@ -3935,7 +3829,7 @@ gen_if_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_while_var(codegen_scope *s, node *varnode, int val)
+codegen_while(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_while_node *while_n = while_node(varnode);
   node *condition = while_n->condition;
@@ -3979,7 +3873,7 @@ gen_while_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_until_var(codegen_scope *s, node *varnode, int val)
+codegen_until(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_until_node *until_n = until_node(varnode);
   node *condition = until_n->condition;
@@ -4023,7 +3917,7 @@ gen_until_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_while_mod_var(codegen_scope *s, node *varnode, int val)
+codegen_while_mod(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_while_node *while_n = while_node(varnode);
   node *condition = while_n->condition;
@@ -4071,7 +3965,7 @@ gen_while_mod_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_until_mod_var(codegen_scope *s, node *varnode, int val)
+codegen_until_mod(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_until_node *until_n = until_node(varnode);
   node *condition = until_n->condition;
@@ -4119,7 +4013,7 @@ gen_until_mod_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_for_var(codegen_scope *s, node *varnode, int val)
+codegen_for(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_for_node *for_n = for_node(varnode);
   node *var = FOR_NODE_VAR(for_n);
@@ -4166,20 +4060,18 @@ gen_for_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_case_var(codegen_scope *s, node *varnode, int val)
+codegen_case(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_case_node *case_n = case_node(varnode);
-  node *value = CASE_NODE_VALUE(case_n);
-  node *else_body = CASE_NODE_ELSE(case_n);
-  uint16_t when_count = CASE_NODE_WHEN_COUNT(case_n);
-  struct mrb_ast_node **when_clauses = CASE_NODE_WHENS(case_n);
+  node *value = case_n->value;
+  node *body = case_n->body;
 
   int head = 0;
-  uint32_t pos3, tmp;
+  uint32_t case_end_jumps, tmp;
   uint32_t next_when_pos = JMPLINK_START;
   node *n;
 
-  pos3 = JMPLINK_START;
+  case_end_jumps = JMPLINK_START;
 
   /* Handle case value exactly like original */
   if (value) {
@@ -4187,10 +4079,10 @@ gen_case_var(codegen_scope *s, node *varnode, int val)
     codegen(s, value, VAL);
   }
 
-  /* Iterate through when clauses array with JMPNOT optimization */
-  for (int i = 0; i < when_count; i++) {
-    node *when_clause = (node*)when_clauses[i];
-    if (!when_clause) continue;
+  /* Iterate through when clauses list with JMPNOT optimization */
+  node *current_when = body;
+  while (current_when) {
+    node *when_clause = current_when->car;
 
     /* Dispatch previous when's "next" jump to this location */
     if (next_when_pos != JMPLINK_START) {
@@ -4200,7 +4092,7 @@ gen_case_var(codegen_scope *s, node *varnode, int val)
 
     /* when_clause is (condition . body) cons node */
     node *args = when_clause->car;  /* when conditions */
-    node *body = when_clause->cdr;  /* when body */
+    node *when_body = when_clause->cdr;  /* when body */
 
     /* Process when conditions with JMPNOT optimization */
     n = args;
@@ -4240,39 +4132,36 @@ gen_case_var(codegen_scope *s, node *varnode, int val)
       dispatch_linked(s, condition_success_pos);
     }
 
-    /* Generate when body inline - no extra JMP needed! */
-    codegen(s, body, val);
+    /* Generate when body */
+    codegen(s, when_body, val);
     if (val) pop();
-    tmp = genjmp(s, OP_JMP, pos3);
-    pos3 = tmp;
+
+    /* Check if this is the last when clause before else, or if there's no else clause */
+    node *next_node = current_when->cdr;
+
+    tmp = genjmp(s, OP_JMP, case_end_jumps);
+    case_end_jumps = tmp;
+
+    current_when = next_node;
   }
 
-  /* Dispatch final "next when" jump to else clause or nil handling */
+  /* Handle case where no else clause was found */
   if (next_when_pos != JMPLINK_START) {
     dispatch_linked(s, next_when_pos);
-  }
-
-  /* Handle else clause - DON'T generate unnecessary JMP */
-  if (else_body) {
-    codegen(s, else_body, val);
-    if (val) pop();
-    /* Only generate JMP if there will be more code after this (i.e., LOADNIL case) */
-    if (!val || !else_body) {
-      tmp = genjmp(s, OP_JMP, pos3);
-      pos3 = tmp;
-    }
-  }
-
-  /* Apply original's "nil-first, align-last" strategy for VAL case */
-  if (val) {
-    if (!else_body) {
-      /* Only generate LOADNIL if there's no else clause */
+    /* No else clause, generate LOADNIL for VAL case */
+    if (val) {
       genop_1(s, OP_LOADNIL, cursp());
     }
-    /* Always dispatch pos3 jumps */
-    if (pos3 != JMPLINK_START) dispatch_linked(s, pos3);
+  }
+
+  /* Apply stack management strategy for cases without else clause */
+  if (val) {
+    /* Dispatch remaining case_end_jumps */
+    if (case_end_jumps != JMPLINK_START) {
+      dispatch_linked(s, case_end_jumps);
+    }
     if (head) {
-      /* This is the crucial MOVE instruction! Move result to original case value position */
+      /* Move result to original case value position */
       gen_move(s, head, cursp(), 0);
       pop();
     }
@@ -4280,9 +4169,9 @@ gen_case_var(codegen_scope *s, node *varnode, int val)
     push();
   }
   else {
-    /* NOVAL case - original logic unchanged */
-    if (pos3 != JMPLINK_START) {
-      dispatch_linked(s, pos3);
+    /* NOVAL case */
+    if (case_end_jumps != JMPLINK_START) {
+      dispatch_linked(s, case_end_jumps);
     }
     if (head) {
       pop();
@@ -4293,7 +4182,7 @@ gen_case_var(codegen_scope *s, node *varnode, int val)
 /* Definition node codegen functions */
 
 static void
-gen_def_var(codegen_scope *s, node *varnode, int val)
+codegen_def(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_def_node *def_n = def_node(varnode);
   int sym = new_sym(s, def_n->name);
@@ -4359,7 +4248,7 @@ gen_namespace(codegen_scope *s, node *name)
 }
 
 static void
-gen_class_var(codegen_scope *s, node *varnode, int val)
+codegen_class(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_class_node *class_n = class_node(varnode);
   node *name = CLASS_NODE_NAME(class_n);
@@ -4394,7 +4283,7 @@ gen_class_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_module_var(codegen_scope *s, node *varnode, int val)
+codegen_module(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_module_node *module_n = module_node(varnode);
   node *name = MODULE_NODE_NAME(module_n);
@@ -4418,7 +4307,7 @@ gen_module_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_sclass_var(codegen_scope *s, node *varnode, int val)
+codegen_sclass(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_sclass_node *sclass_n = sclass_node(varnode);
   node *obj = SCLASS_NODE_OBJ(sclass_n);
@@ -4441,7 +4330,7 @@ gen_sclass_var(codegen_scope *s, node *varnode, int val)
 
 /* Variable-sized assignment codegen functions */
 static void
-gen_asgn_var(codegen_scope *s, node *varnode, int val)
+codegen_asgn(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_asgn_node *asgn_n = asgn_node(varnode);
   node *lhs = asgn_n->lhs;
@@ -4451,7 +4340,7 @@ gen_asgn_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_masgn_var(codegen_scope *s, node *varnode, node *rhs, int sp, int val)
+codegen_masgn(codegen_scope *s, node *varnode, node *rhs, int sp, int val)
 {
   struct mrb_ast_masgn_node *masgn_n = (struct mrb_ast_masgn_node*)varnode;
 
@@ -4599,12 +4488,12 @@ gen_masgn_var(codegen_scope *s, node *varnode, node *rhs, int sp, int val)
 }
 
 static void
-gen_op_asgn_var(codegen_scope *s, node *varnode, int val)
+codegen_op_asgn(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_op_asgn_node *op_asgn_n = op_asgn_node(varnode);
   node *lhs = op_asgn_n->lhs;
   node *rhs = op_asgn_n->rhs;
-  mrb_sym sym = op_asgn_n->operator;
+  mrb_sym sym = op_asgn_n->op;
   mrb_int len;
   const char *name = mrb_sym_name_len(s->mrb, sym, &len);
   int vsp = -1;
@@ -4679,7 +4568,7 @@ gen_op_asgn_var(codegen_scope *s, node *varnode, int val)
 
 /* Variable-sized expression codegen functions */
 static void
-gen_and_var(codegen_scope *s, node *varnode, int val)
+codegen_and(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_and_node *and_n = (struct mrb_ast_and_node*)varnode;
   node *left = and_n->left;
@@ -4702,7 +4591,7 @@ gen_and_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_or_var(codegen_scope *s, node *varnode, int val)
+codegen_or(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_or_node *or_n = (struct mrb_ast_or_node*)varnode;
   node *left = or_n->left;
@@ -4725,7 +4614,7 @@ gen_or_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_return_var(codegen_scope *s, node *varnode, int val)
+codegen_return(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_return_node *return_n = return_node(varnode);
   node *args = RETURN_NODE_ARGS(return_n);
@@ -4747,7 +4636,7 @@ gen_return_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_yield_var(codegen_scope *s, node *varnode, int val)
+codegen_yield(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_yield_node *yield_n = yield_node(varnode);
   node *args = YIELD_NODE_ARGS(yield_n);
@@ -4767,15 +4656,16 @@ gen_yield_var(codegen_scope *s, node *varnode, int val)
   if (lv > 0xf) codegen_error(s, "too deep nesting");
   push();
   if (args) {
-    if (args->car) {
-      n = gen_values(s, args->car, VAL, 14);
+    struct mrb_ast_callargs *callargs = (struct mrb_ast_callargs*)args;
+    if (callargs->regular_args) {
+      n = gen_values(s, callargs->regular_args, VAL, 14);
       if (n < 0) {
         n = sendv = 1;
         push();
       }
     }
-    if (args->cdr->car) {
-      nk = gen_hash(s, args->cdr->car->cdr, VAL, 14);
+    if (callargs->keyword_args) {
+      nk = gen_hash(s, callargs->keyword_args->cdr, VAL, 14);
       if (nk < 0) {
         nk = 15;
       }
@@ -4790,10 +4680,10 @@ gen_yield_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_super_var(codegen_scope *s, node *varnode, int val)
+codegen_super(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_super_node *super_n = super_node(varnode);
-  node *tree = SUPER_NODE_ARGS(super_n);
+  node *tree = super_n->args;
 
   codegen_scope *s2 = s;
   int lv = 0;
@@ -4806,31 +4696,36 @@ gen_super_var(codegen_scope *s, node *varnode, int val)
     if (!s2) break;
   }
   if (tree) {
-    node *args = tree->car;
-    if (args) {
-      st = n = gen_values(s, args, VAL, 14);
-      if (n < 0) {
-        st = 1; n = 15;
+    /* Handle callargs structure - direct casting like new_args() */
+    struct mrb_ast_callargs *callargs = (struct mrb_ast_callargs*)tree;
+
+      /* Regular arguments */
+      if (callargs->regular_args) {
+        st = n = gen_values(s, callargs->regular_args, VAL, 14);
+        if (n < 0) {
+          st = 1; n = 15;
+          push();
+        }
+      }
+
+      /* Keyword arguments */
+      if (callargs->keyword_args) {
+        nk = gen_hash(s, callargs->keyword_args->cdr, VAL, 14);
+        if (nk < 0) {st++; nk = 15;}
+        else st += nk*2;
+        n |= nk<<4;
+      }
+
+      /* Block arguments */
+      if (callargs->block_arg) {
+        codegen(s, callargs->block_arg, VAL);
+      }
+      else if (s2) gen_blkmove(s, s2->ainfo, lv);
+      else {
+        genop_1(s, OP_LOADNIL, cursp());
         push();
       }
     }
-    /* keyword arguments */
-    if (tree->cdr->car) {
-      nk = gen_hash(s, tree->cdr->car->cdr, VAL, 14);
-      if (nk < 0) {st++; nk = 15;}
-      else st += nk*2;
-      n |= nk<<4;
-    }
-    /* block arguments */
-    if (tree->cdr->cdr) {
-      codegen(s, tree->cdr->cdr, VAL);
-    }
-    else if (s2) gen_blkmove(s, s2->ainfo, lv);
-    else {
-      genop_1(s, OP_LOADNIL, cursp());
-      push();
-    }
-  }
   else {
     if (s2) gen_blkmove(s, s2->ainfo, lv);
     else {
@@ -4846,36 +4741,17 @@ gen_super_var(codegen_scope *s, node *varnode, int val)
 
 /* Variable-sized literal node generation functions */
 static void
-gen_str_var(codegen_scope *s, node *varnode, int val)
+codegen_str(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_str_node *str_n = str_node(varnode);
   node *list = str_n->list;
 
   /* Use common cons list string codegen */
-  codegen_cons_list_string(s, list, val);
+  gen_string(s, list, val);
 }
 
 static void
-gen_regx_var(codegen_scope *s, node *varnode, int val)
-{
-  struct mrb_ast_regx_node *regx_n = regx_node(varnode->car);
-  const char *pattern = REGX_NODE_PATTERN(regx_n);
-  const char *flags = REGX_NODE_FLAGS(regx_n);
-  const char *encoding = REGX_NODE_ENCODING(regx_n);
-
-  /* Create simple list structure like traditional node */
-  node list_node;
-  node flags_node;
-  list_node.car = (node*)pattern;
-  list_node.cdr = &flags_node;
-  flags_node.car = (node*)flags;
-  flags_node.cdr = (node*)encoding;
-
-  codegen_regx(s, &list_node, val);
-}
-
-static void
-gen_dot2_var(codegen_scope *s, node *varnode, int val)
+codegen_dot2(codegen_scope *s, node *varnode, int val)
 {
   node *left = DOT2_NODE_LEFT(varnode);
   node *right = DOT2_NODE_RIGHT(varnode);
@@ -4889,7 +4765,7 @@ gen_dot2_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_dot3_var(codegen_scope *s, node *varnode, int val)
+codegen_dot3(codegen_scope *s, node *varnode, int val)
 {
   node *left = DOT3_NODE_LEFT(varnode);
   node *right = DOT3_NODE_RIGHT(varnode);
@@ -4903,7 +4779,7 @@ gen_dot3_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_float_var(codegen_scope *s, node *varnode, int val)
+codegen_float(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_float_node *float_n = (struct mrb_ast_float_node*)varnode;
   const char *value = float_n->value;
@@ -4917,35 +4793,35 @@ gen_float_var(codegen_scope *s, node *varnode, int val)
 
 /* Variable-sized simple node generation functions */
 static void
-gen_self_var(codegen_scope *s, node *varnode, int val)
+codegen_self(codegen_scope *s, node *varnode, int val)
 {
   /* Use traditional self codegen logic */
   gen_load_op1(s, OP_LOADSELF, val);
 }
 
 static void
-gen_nil_var(codegen_scope *s, node *varnode, int val)
+codegen_nil(codegen_scope *s, node *varnode, int val)
 {
   /* Use traditional nil codegen logic */
   gen_load_op1(s, OP_LOADNIL, val);
 }
 
 static void
-gen_true_var(codegen_scope *s, node *varnode, int val)
+codegen_true(codegen_scope *s, node *varnode, int val)
 {
   /* Generate OP_LOADT instruction for true literal */
   gen_load_op1(s, OP_LOADT, val);
 }
 
 static void
-gen_false_var(codegen_scope *s, node *varnode, int val)
+codegen_false(codegen_scope *s, node *varnode, int val)
 {
   /* Generate OP_LOADF instruction for false literal */
   gen_load_op1(s, OP_LOADF, val);
 }
 
 static void
-gen_const_var(codegen_scope *s, node *varnode, int val)
+codegen_const(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_const_node *const_n = const_node(varnode);
   mrb_sym symbol = const_n->symbol;
@@ -4956,7 +4832,7 @@ gen_const_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_rescue_var(codegen_scope *s, node *varnode, int val)
+codegen_rescue(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_rescue_node *rescue = rescue_node(varnode);
   node *body = rescue->body;
@@ -5052,7 +4928,7 @@ gen_rescue_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_block_var(codegen_scope *s, node *varnode, int val)
+codegen_block(codegen_scope *s, node *varnode, int val)
 {
   if (!val) return;
 
@@ -5065,7 +4941,7 @@ gen_block_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_break_var(codegen_scope *s, node *varnode, int val)
+codegen_break(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_break_node *n = (struct mrb_ast_break_node*)varnode;
   loop_break(s, n->value);
@@ -5074,7 +4950,7 @@ gen_break_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_next_var(codegen_scope *s, node *varnode, int val)
+codegen_next(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_next_node *n = (struct mrb_ast_next_node*)varnode;
   if (!s->loop) {
@@ -5099,7 +4975,7 @@ gen_next_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_redo_var(codegen_scope *s, node *varnode, int val)
+codegen_redo(codegen_scope *s, node *varnode, int val)
 {
   for (const struct loopinfo *lp = s->loop; ; lp = lp->prev) {
     if (!lp) {
@@ -5116,7 +4992,7 @@ gen_redo_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_retry_var(codegen_scope *s, node *varnode, int val)
+codegen_retry(codegen_scope *s, node *varnode, int val)
 {
   const struct loopinfo *lp = s->loop;
 
@@ -5134,7 +5010,7 @@ gen_retry_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_xstr_var(codegen_scope *s, node *varnode, int val)
+codegen_xstr(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_xstr_node *n = xstr_node(varnode);
   node *list = n->list;
@@ -5143,7 +5019,7 @@ gen_xstr_var(codegen_scope *s, node *varnode, int val)
   /* Always execute backtick command for side effects, even in NOVAL mode */
   push();
   /* Generate string using common function */
-  codegen_cons_list_string(s, list, VAL);
+  gen_string(s, list, VAL);
 
   push();                   /* for block */
   pop_n(3);
@@ -5157,9 +5033,9 @@ gen_xstr_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_dregx_var(codegen_scope *s, node *varnode, int val)
+codegen_regx(codegen_scope *s, node *varnode, int val)
 {
-  struct mrb_ast_dregx_node *n = dregx_node(varnode);
+  struct mrb_ast_regx_node *n = regx_node(varnode);
 
   if (val) {
     int sym = new_sym(s, mrb_intern_lit(s->mrb, REGEXP_CLASS));
@@ -5171,7 +5047,7 @@ gen_dregx_var(codegen_scope *s, node *varnode, int val)
     push();
 
     /* Generate regex pattern using common cons list function */
-    codegen_cons_list_string(s, n->list, VAL);
+    gen_string(s, n->list, VAL);
 
     /* Add flags if present */
     if (n->flags && *n->flags) {
@@ -5197,20 +5073,20 @@ gen_dregx_var(codegen_scope *s, node *varnode, int val)
   }
   else {
     /* NOVAL case: still need to evaluate expressions for side effects */
-    codegen_cons_list_string(s, n->list, NOVAL);
+    gen_string(s, n->list, NOVAL);
   }
 }
 
 static void
-gen_heredoc_var(codegen_scope *s, node *varnode, int val)
+codegen_heredoc(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_heredoc_node *n = heredoc_node(varnode);
   // Process heredoc doc field as cons list string
-  codegen_cons_list_string(s, n->info.doc, val);
+  gen_string(s, n->info.doc, val);
 }
 
 static void
-gen_dsym_var(codegen_scope *s, node *varnode, int val)
+codegen_dsym(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_dsym_node *n = dsym_node(varnode);
   // Generate the list content, then intern to symbol
@@ -5221,7 +5097,7 @@ gen_dsym_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_nth_ref_var(codegen_scope *s, node *varnode, int val)
+codegen_nth_ref(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_nth_ref_node *n = (struct mrb_ast_nth_ref_node*)varnode;
   mrb_state *mrb = s->mrb;
@@ -5234,7 +5110,7 @@ gen_nth_ref_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_back_ref_var(codegen_scope *s, node *varnode, int val)
+codegen_back_ref(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_back_ref_node *n = (struct mrb_ast_back_ref_node*)varnode;
   char buf[] = {'$', (char)n->type};
@@ -5243,7 +5119,7 @@ gen_back_ref_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_nvar_var(codegen_scope *s, node *varnode, int val)
+codegen_nvar(codegen_scope *s, node *varnode, int val)
 {
   if (!val) return;
   struct mrb_ast_nvar_node *n = (struct mrb_ast_nvar_node*)varnode;
@@ -5253,7 +5129,7 @@ gen_nvar_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_dvar_var(codegen_scope *s, node *varnode, int val)
+codegen_dvar(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_dvar_node *n = (struct mrb_ast_dvar_node*)varnode;
   // DVAR nodes are not currently used in mruby, but provide basic implementation
@@ -5262,19 +5138,9 @@ gen_dvar_var(codegen_scope *s, node *varnode, int val)
   }
 }
 
-static void
-gen_match_var(codegen_scope *s, node *varnode, int val)
-{
-  struct mrb_ast_match_node *n = (struct mrb_ast_match_node*)varnode;
-  // MATCH nodes are not currently used in mruby, but provide basic implementation
-  if (val) {
-    codegen(s, n->pattern, val);
-  }
-}
-
 // Group 11: Operators and Expressions
 static void
-gen_not_var(codegen_scope *s, node *varnode, int val)
+codegen_not(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_not_node *n = (struct mrb_ast_not_node*)varnode;
   // NOT nodes are rarely used - generate method call to !
@@ -5288,19 +5154,22 @@ gen_not_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_negate_var(codegen_scope *s, node *varnode, int val)
+codegen_negate(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_negate_node *n = (struct mrb_ast_negate_node*)varnode;
   node *tree = n->operand;
-  int nt = node_to_int(tree->car);
 
-  switch (nt) {
+  /* Check if the operand is a variable-sized node */
+  enum node_type vnt = get_node_type(tree);
+  switch (vnt) {
 #ifndef MRB_NO_FLOAT
   case NODE_FLOAT:
     if (val) {
-      char *p = (char*)tree->cdr;
+      struct mrb_ast_float_node *float_n = (struct mrb_ast_float_node*)tree;
+      const char *value = float_n->value;
       double f;
-      mrb_read_float(p, NULL, &f);
+
+      mrb_read_float(value, NULL, &f);
       int off = new_lit_float(s, (mrb_float)-f);
 
       gen_load_lit(s, off);
@@ -5309,63 +5178,32 @@ gen_negate_var(codegen_scope *s, node *varnode, int val)
 #endif
 
   case NODE_INT:
-    /* This case should not occur since NODE_INT is now always variable-sized */
+    if (val) {
+      int32_t value = INT_NODE_VALUE(tree);
+      if (value == INT32_MIN) {
+        /* -INT32_MIN overflows, use bigint */
+        int off = new_litbint(s, "2147483648", -10);
+        genop_2(s, OP_LOADL, cursp(), off);
+      }
+      else {
+        gen_int(s, cursp(), -value);
+      }
+      push();
+    }
     break;
 
-  case NODE_VARIABLE:
-    {
-      enum node_type vnt = VAR_NODE_TYPE(tree->cdr);
-      switch (vnt) {
-#ifndef MRB_NO_FLOAT
-      case NODE_FLOAT:
-        if (val) {
-          struct mrb_ast_float_node *float_n = (struct mrb_ast_float_node*)tree->cdr;
-          const char *value = float_n->value;
-          double f;
-
-          mrb_read_float(value, NULL, &f);
-          int off = new_lit_float(s, (mrb_float)-f);
-
-          gen_load_lit(s, off);
-        }
-        break;
-#endif
-
-      case NODE_INT:
-        if (val) {
-          int32_t value = INT_NODE_VALUE(tree->cdr);
-          if (value == INT32_MIN) {
-            /* -INT32_MIN overflows, use bigint */
-            int off = new_litbint(s, "2147483648", -10);
-            genop_2(s, OP_LOADL, cursp(), off);
-          }
-          else {
-            gen_int(s, cursp(), -value);
-          }
-          push();
-        }
-        break;
-
-      case NODE_BIGINT:
-        if (val) {
-          char *str = BIGINT_NODE_STRING(tree->cdr);
-          int base = BIGINT_NODE_BASE(tree->cdr);
-          /* Negate base to indicate negative number */
-          int off = new_litbint(s, str, -base);
-          genop_2(s, OP_LOADL, cursp(), off);
-          push();
-        }
-        break;
-
-      default:
-        /* Fall through to default case */
-        goto default_negate;
-      }
-      break;
+  case NODE_BIGINT:
+    if (val) {
+      char *str = BIGINT_NODE_STRING(tree);
+      int base = BIGINT_NODE_BASE(tree);
+      /* Negate base to indicate negative number */
+      int off = new_litbint(s, str, -base);
+      genop_2(s, OP_LOADL, cursp(), off);
+      push();
     }
+    break;
 
   default:
-  default_negate:
     codegen(s, tree, VAL);
     pop();
     push_n(2);pop_n(2); /* space for receiver&block */
@@ -5379,7 +5217,7 @@ gen_negate_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_colon2_var(codegen_scope *s, node *varnode, int val)
+codegen_colon2(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_colon2_node *n = (struct mrb_ast_colon2_node*)varnode;
   // Generate COLON2 (::) access manually
@@ -5391,7 +5229,7 @@ gen_colon2_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_colon3_var(codegen_scope *s, node *varnode, int val)
+codegen_colon3(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_colon3_node *n = (struct mrb_ast_colon3_node*)varnode;
   // Generate COLON3 (::Name) access manually
@@ -5401,7 +5239,7 @@ gen_colon3_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_defined_var(codegen_scope *s, node *varnode, int val)
+codegen_defined(codegen_scope *s, node *varnode, int val)
 {
   // DEFINED nodes are rarely used - generate basic implementation
   (void)varnode; // suppress unused warning
@@ -5412,24 +5250,8 @@ gen_defined_var(codegen_scope *s, node *varnode, int val)
   }
 }
 
-// Group 12: Function Calls and Special Forms
 static void
-gen_fcall_var(codegen_scope *s, node *varnode, int val)
-{
-  struct mrb_ast_fcall_node *n = fcall_node(varnode);
-  // Create a stack-allocated node structure for traditional codegen
-  struct mrb_ast_node stack_nodes[3];
-  stack_nodes[0].car = NULL; // no receiver (self)
-  stack_nodes[0].cdr = &stack_nodes[1];
-  stack_nodes[1].car = (node*)(intptr_t)n->method_name; // method name as int
-  stack_nodes[1].cdr = &stack_nodes[2];
-  stack_nodes[2].car = n->args;
-  stack_nodes[2].cdr = NULL;
-  gen_call(s, &stack_nodes[0], val, 0);
-}
-
-static void
-gen_zsuper_var(codegen_scope *s, node *varnode, int val)
+codegen_zsuper(codegen_scope *s, node *varnode, int val)
 {
   /* NODE_ZSUPER now uses mrb_ast_super_node, which may have args */
   struct mrb_ast_super_node *zsuper_n = super_node(varnode);
@@ -5460,16 +5282,22 @@ gen_zsuper_var(codegen_scope *s, node *varnode, int val)
       n |= CALL_MAXARGS<<4;
       push();
     }
-    /* block argument - tree here is args, so check tree->cdr->cdr */
-    if (tree && tree->cdr && tree->cdr->cdr) {
-      push();
-      codegen(s, tree->cdr->cdr, VAL);
+    /* block argument - tree here is args, so check for block */
+    if (tree) {
+      struct mrb_ast_callargs *callargs = (struct mrb_ast_callargs*)tree;
+      if (callargs->block_arg) {
+        push();
+        codegen(s, callargs->block_arg, VAL);
+      }
     }
   }
   else {
     /* block argument */
-    if (tree && tree->cdr && tree->cdr->cdr) {
-      codegen(s, tree->cdr->cdr, VAL);
+    if (tree) {
+      struct mrb_ast_callargs *callargs = (struct mrb_ast_callargs*)tree;
+      if (callargs->block_arg) {
+        codegen(s, callargs->block_arg, VAL);
+      }
     }
     else if (s2) {
       gen_blkmove(s, 0, lv);
@@ -5485,7 +5313,7 @@ gen_zsuper_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_lambda_var(codegen_scope *s, node *varnode, int val)
+codegen_lambda(codegen_scope *s, node *varnode, int val)
 {
   if (!val) return;
 
@@ -5498,34 +5326,21 @@ gen_lambda_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_kw_hash_var(codegen_scope *s, node *varnode, int val)
-{
-  struct mrb_ast_kw_hash_node *n = kw_hash_node(varnode);
-
-  int nk = gen_hash(s, n->args, val, GEN_LIT_ARY_MAX);
-  if (val && nk >= 0) {
-    pop_n(nk*2);
-    genop_2(s, OP_HASH, cursp(), nk);
-    push();
-  }
-}
-
-static void
-gen_words_var(codegen_scope *s, node *varnode, int val)
+codegen_words(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_words_node *n = words_node(varnode);
   gen_literal_array(s, n->args, FALSE, val);
 }
 
 static void
-gen_symbols_var(codegen_scope *s, node *varnode, int val)
+codegen_symbols(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_symbols_node *n = symbols_node(varnode);
   gen_literal_array(s, n->args, TRUE, val);
 }
 
 static void
-gen_splat_var(codegen_scope *s, node *varnode, int val)
+codegen_splat(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_splat_node *n = splat_node(varnode);
   // Generate code for the splat value directly
@@ -5533,7 +5348,7 @@ gen_splat_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_block_arg_var(codegen_scope *s, node *varnode, int val)
+codegen_block_arg(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_block_arg_node *n = block_arg_node(varnode);
 
@@ -5554,7 +5369,7 @@ gen_block_arg_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_scope_var(codegen_scope *s, const node *varnode, int val)
+codegen_scope_node(codegen_scope *s, const node *varnode, int val)
 {
   struct mrb_ast_scope_node *scope = scope_node(varnode);
 
@@ -5563,7 +5378,7 @@ gen_scope_var(codegen_scope *s, const node *varnode, int val)
 }
 
 static void
-gen_begin_var(codegen_scope *s, node *varnode, int val)
+codegen_begin(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_begin_node *begin = begin_node(varnode);
   node *body = begin->body;
@@ -5572,7 +5387,7 @@ gen_begin_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_ensure_var(codegen_scope *s, node *varnode, int val)
+codegen_ensure(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_ensure_node *ensure = ensure_node(varnode);
   node *body = ensure->body;
@@ -5602,7 +5417,7 @@ gen_ensure_var(codegen_scope *s, node *varnode, int val)
 }
 
 static void
-gen_stmts_var(codegen_scope *s, node *varnode, int val)
+codegen_stmts(codegen_scope *s, node *varnode, int val)
 {
   struct mrb_ast_stmts_node *stmts = stmts_node(varnode);
   node *tree = STMTS_NODE_STMTS(stmts);
@@ -5621,16 +5436,10 @@ is_empty_stmts(node *stmt_node)
 {
   if (!stmt_node) return TRUE;
 
-  if (node_to_int(stmt_node->car) == NODE_VARIABLE) {
+  if (get_node_type(stmt_node) == NODE_STMTS) {
     /* Variable-sized NODE_STMTS with internal cons-list */
-    if (NODE_TYPE(stmt_node) == NODE_STMTS) {
-      struct mrb_ast_stmts_node *stmts = stmts_node(NODE_VAR_NODE_PTR(stmt_node));
-      return STMTS_NODE_STMTS(stmts) == NULL;
-    }
-  }
-  else if (node_to_int(stmt_node->car) == NODE_STMTS) {
-    /* Traditional cons-list NODE_STMTS */
-    return stmt_node->cdr == NULL;
+    struct mrb_ast_stmts_node *stmts = (struct mrb_ast_stmts_node*)stmt_node;
+    return stmts->stmts == NULL;
   }
 
   return FALSE;
@@ -5639,7 +5448,7 @@ is_empty_stmts(node *stmt_node)
 // Group 16: Declarations and Definitions
 
 static void
-gen_alias_var(codegen_scope *s, const node *varnode, int val)
+codegen_alias(codegen_scope *s, const node *varnode, int val)
 {
   struct mrb_ast_alias_node *alias = alias_node(varnode);
 
@@ -5651,7 +5460,7 @@ gen_alias_var(codegen_scope *s, const node *varnode, int val)
 }
 
 static void
-gen_undef_var(codegen_scope *s, const node *varnode, int val)
+codegen_undef(codegen_scope *s, const node *varnode, int val)
 {
   struct mrb_ast_undef_node *undef = undef_node(varnode);
   node *t = undef->syms;
@@ -5665,7 +5474,7 @@ gen_undef_var(codegen_scope *s, const node *varnode, int val)
 }
 
 static void
-gen_sdef_var(codegen_scope *s, const node *varnode, int val)
+codegen_sdef(codegen_scope *s, const node *varnode, int val)
 {
   struct mrb_ast_sdef_node *sdef = sdef_node(varnode);
   node *recv = sdef->obj;
@@ -5686,338 +5495,11 @@ gen_sdef_var(codegen_scope *s, const node *varnode, int val)
   if (val) push();
 }
 
-static mrb_bool
-codegen_variable_node(codegen_scope *s, node *varnode, int val)
-{
-  enum node_type nt = VAR_NODE_TYPE(varnode);
-
-  switch (nt) {
-  case NODE_INT:
-    if (val) {
-      gen_int(s, cursp(), INT_NODE_VALUE(varnode));
-      push();
-    }
-    return TRUE;
-
-  case NODE_BIGINT:
-    if (val) {
-      char *str = BIGINT_NODE_STRING(varnode);
-      int base = BIGINT_NODE_BASE(varnode);
-      int off = new_litbint(s, str, base);
-      genop_2(s, OP_LOADL, cursp(), off);
-      push();
-    }
-    return TRUE;
-
-  case NODE_SYM:
-    {
-      int i = new_sym(s, SYM_NODE_VALUE(varnode));
-      gen_load_op2(s, OP_LOADSYM, i, val);
-    }
-    return TRUE;
-
-  case NODE_LVAR:
-    gen_lvar(s, VAR_NODE_SYMBOL(varnode), val);
-    return TRUE;
-
-  case NODE_GVAR:
-    gen_xvar(s, VAR_NODE_SYMBOL(varnode), val, OP_GETGV);
-    return TRUE;
-
-  case NODE_IVAR:
-    gen_xvar(s, VAR_NODE_SYMBOL(varnode), val, OP_GETIV);
-    return TRUE;
-
-  case NODE_CVAR:
-    gen_xvar(s, VAR_NODE_SYMBOL(varnode), val, OP_GETCV);
-    return TRUE;
-
-  case NODE_CALL:
-    gen_call_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_ARRAY:
-    gen_array_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_HASH:
-    gen_hash_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_IF:
-    gen_if_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_WHILE:
-    gen_while_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_UNTIL:
-    gen_until_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_FOR:
-    gen_for_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_CASE:
-    gen_case_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_DEF:
-    gen_def_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_CLASS:
-    gen_class_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_MODULE:
-    gen_module_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_SCLASS:
-    gen_sclass_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_ASGN:
-    gen_asgn_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_MASGN:
-    gen_masgn_var(s, varnode, NULL, 0, val);
-    return TRUE;
-
-  case NODE_OP_ASGN:
-    gen_op_asgn_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_AND:
-    gen_and_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_OR:
-    gen_or_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_RETURN:
-    gen_return_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_YIELD:
-    gen_yield_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_SUPER:
-    gen_super_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_STR:
-    gen_str_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_REGX:
-    gen_regx_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_DOT2:
-    gen_dot2_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_DOT3:
-    gen_dot3_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_FLOAT:
-    gen_float_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_SELF:
-    gen_self_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_NIL:
-    gen_nil_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_TRUE:
-    gen_true_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_FALSE:
-    gen_false_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_CONST:
-    gen_const_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_RESCUE:
-    gen_rescue_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_BLOCK:
-    gen_block_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_BREAK:
-    gen_break_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_NEXT:
-    gen_next_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_REDO:
-    gen_redo_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_RETRY:
-    gen_retry_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_WHILE_MOD:
-    gen_while_mod_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_UNTIL_MOD:
-    gen_until_mod_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_XSTR:
-    gen_xstr_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_DREGX:
-    gen_dregx_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_HEREDOC:
-    gen_heredoc_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_DSYM:
-    gen_dsym_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_NTH_REF:
-    gen_nth_ref_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_BACK_REF:
-    gen_back_ref_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_NVAR:
-    gen_nvar_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_DVAR:
-    gen_dvar_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_MATCH:
-    gen_match_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_NOT:
-    gen_not_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_NEGATE:
-    gen_negate_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_COLON2:
-    gen_colon2_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_COLON3:
-    gen_colon3_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_DEFINED:
-    gen_defined_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_FCALL:
-    gen_fcall_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_ZSUPER:
-    gen_zsuper_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_LAMBDA:
-    gen_lambda_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_KW_HASH:
-    gen_kw_hash_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_WORDS:
-    gen_words_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_SYMBOLS:
-    gen_symbols_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_SPLAT:
-    gen_splat_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_BLOCK_ARG:
-    gen_block_arg_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_SCOPE:
-    gen_scope_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_BEGIN:
-    gen_begin_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_ENSURE:
-    gen_ensure_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_STMTS:
-    gen_stmts_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_ALIAS:
-    gen_alias_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_UNDEF:
-    gen_undef_var(s, varnode, val);
-    return TRUE;
-
-  case NODE_POSTEXE:
-    {
-      struct mrb_ast_postexe_node *postexe = postexe_node(varnode);
-      codegen(s, postexe->body, NOVAL);
-    }
-    return TRUE;
-
-  case NODE_SDEF:
-    gen_sdef_var(s, varnode, val);
-    return TRUE;
-
-  default:
-    return FALSE; /* Not handled, fall through to main codegen */
-  }
-}
 
 static void
 codegen(codegen_scope *s, node *tree, int val)
 {
-  int nt;
   int rlev = s->rlev;
-  struct mrb_ast_head_node *head;
 
   if (!tree) {
     if (val) {
@@ -6027,14 +5509,16 @@ codegen(codegen_scope *s, node *tree, int val)
     return;
   }
 
-  head = (struct mrb_ast_head_node*)tree;
-  nt = node_to_int(tree->car);
-
   s->rlev++;
   if (s->rlev > MRB_CODEGEN_LEVEL_MAX) {
     codegen_error(s, "too complex expression");
   }
-  if (s->irep && s->filename_index != head->filename_index) {
+
+  /* Check if this is a variable-sized node */
+  /* For variable-sized nodes, get filename/lineno from the variable node header */
+  struct mrb_ast_var_header *var_head = get_var_header(tree);
+
+  if (s->irep && s->filename_index != var_head->filename_index) {
     mrb_sym fname = mrb_parser_get_filename(s->parser, s->filename_index);
     const char *filename = mrb_sym_name_len(s->mrb, fname, NULL);
 
@@ -6043,27 +5527,316 @@ codegen(codegen_scope *s, node *tree, int val)
                                  filename, s->lines, s->debug_start_pos, s->pc);
     }
     s->debug_start_pos = s->pc;
-    s->filename_index = head->filename_index;
-    s->filename_sym = mrb_parser_get_filename(s->parser, head->filename_index);
+    s->filename_index = var_head->filename_index;
+    s->filename_sym = mrb_parser_get_filename(s->parser, var_head->filename_index);
   }
+  s->lineno = var_head->lineno;
 
-  s->lineno = head->lineno;
-  tree = tree->cdr;
-  switch (nt) {
+  /* Process variable-sized node directly */
+  enum node_type var_type = var_head->node_type;
+
+  switch (var_type) {
+  case NODE_INT:
+    if (val) {
+      gen_int(s, cursp(), INT_NODE_VALUE(tree));
+      push();
+    }
+    break;
+
+  case NODE_BIGINT:
+    if (val) {
+      char *str = BIGINT_NODE_STRING(tree);
+      int base = BIGINT_NODE_BASE(tree);
+      int off = new_litbint(s, str, base);
+      genop_2(s, OP_LOADL, cursp(), off);
+      push();
+    }
+    break;
+
+  case NODE_SYM:
+    {
+      int i = new_sym(s, SYM_NODE_VALUE(tree));
+      gen_load_op2(s, OP_LOADSYM, i, val);
+    }
+    break;
+
+  case NODE_LVAR:
+    gen_lvar(s, VAR_NODE_SYMBOL(tree), val);
+    break;
+
+  case NODE_GVAR:
+    gen_xvar(s, VAR_NODE_SYMBOL(tree), val, OP_GETGV);
+    break;
+
+  case NODE_IVAR:
+    gen_xvar(s, VAR_NODE_SYMBOL(tree), val, OP_GETIV);
+    break;
+
+  case NODE_CVAR:
+    gen_xvar(s, VAR_NODE_SYMBOL(tree), val, OP_GETCV);
+    break;
 
   case NODE_CALL:
-  case NODE_FCALL:
-    codegen_call_fcall(s, tree, val);
-    break;
-  case NODE_SCALL:
-    codegen_scall(s, tree, val);
+    codegen_call(s, tree, val);
     break;
 
-  case NODE_VARIABLE:
-    codegen_variable_node(s, tree, val);
+  case NODE_ARRAY:
+    codegen_array(s, tree, val);
+    break;
+
+  case NODE_HASH:
+    codegen_hash(s, tree, val);
+    break;
+
+  case NODE_IF:
+    codegen_if(s, tree, val);
+    break;
+
+  case NODE_WHILE:
+    codegen_while(s, tree, val);
+    break;
+
+  case NODE_UNTIL:
+    codegen_until(s, tree, val);
+    break;
+
+  case NODE_FOR:
+    codegen_for(s, tree, val);
+    break;
+
+  case NODE_CASE:
+    codegen_case(s, tree, val);
+    break;
+
+  case NODE_DEF:
+    codegen_def(s, tree, val);
+    break;
+
+  case NODE_CLASS:
+    codegen_class(s, tree, val);
+    break;
+
+  case NODE_MODULE:
+    codegen_module(s, tree, val);
+    break;
+
+  case NODE_SCLASS:
+    codegen_sclass(s, tree, val);
+    break;
+
+  case NODE_ASGN:
+    codegen_asgn(s, tree, val);
+    break;
+
+  case NODE_MASGN:
+    codegen_masgn(s, tree, NULL, 0, val);
+    break;
+
+  case NODE_OP_ASGN:
+    codegen_op_asgn(s, tree, val);
+    break;
+
+  case NODE_AND:
+    codegen_and(s, tree, val);
+    break;
+
+  case NODE_OR:
+    codegen_or(s, tree, val);
+    break;
+
+  case NODE_RETURN:
+    codegen_return(s, tree, val);
+    break;
+
+  case NODE_YIELD:
+    codegen_yield(s, tree, val);
+    break;
+
+  case NODE_SUPER:
+    codegen_super(s, tree, val);
+    break;
+
+  case NODE_STR:
+    codegen_str(s, tree, val);
+    break;
+
+  case NODE_DOT2:
+    codegen_dot2(s, tree, val);
+    break;
+
+  case NODE_DOT3:
+    codegen_dot3(s, tree, val);
+    break;
+
+  case NODE_FLOAT:
+    codegen_float(s, tree, val);
+    break;
+
+  case NODE_SELF:
+    codegen_self(s, tree, val);
+    break;
+
+  case NODE_NIL:
+    codegen_nil(s, tree, val);
+    break;
+
+  case NODE_TRUE:
+    codegen_true(s, tree, val);
+    break;
+
+  case NODE_FALSE:
+    codegen_false(s, tree, val);
+    break;
+
+  case NODE_CONST:
+    codegen_const(s, tree, val);
+    break;
+
+  case NODE_RESCUE:
+    codegen_rescue(s, tree, val);
+    break;
+
+  case NODE_BLOCK:
+    codegen_block(s, tree, val);
+    break;
+
+  case NODE_BREAK:
+    codegen_break(s, tree, val);
+    break;
+
+  case NODE_NEXT:
+    codegen_next(s, tree, val);
+    break;
+
+  case NODE_REDO:
+    codegen_redo(s, tree, val);
+    break;
+
+  case NODE_RETRY:
+    codegen_retry(s, tree, val);
+    break;
+
+  case NODE_WHILE_MOD:
+    codegen_while_mod(s, tree, val);
+    break;
+
+  case NODE_UNTIL_MOD:
+    codegen_until_mod(s, tree, val);
+    break;
+
+  case NODE_XSTR:
+    codegen_xstr(s, tree, val);
+    break;
+
+  case NODE_REGX:
+    codegen_regx(s, tree, val);
+    break;
+
+  case NODE_HEREDOC:
+    codegen_heredoc(s, tree, val);
+    break;
+
+  case NODE_DSYM:
+    codegen_dsym(s, tree, val);
+    break;
+
+  case NODE_NTH_REF:
+    codegen_nth_ref(s, tree, val);
+    break;
+
+  case NODE_BACK_REF:
+    codegen_back_ref(s, tree, val);
+    break;
+
+  case NODE_NVAR:
+    codegen_nvar(s, tree, val);
+    break;
+
+  case NODE_DVAR:
+    codegen_dvar(s, tree, val);
+    break;
+
+  case NODE_NOT:
+    codegen_not(s, tree, val);
+    break;
+
+  case NODE_NEGATE:
+    codegen_negate(s, tree, val);
+    break;
+
+  case NODE_COLON2:
+    codegen_colon2(s, tree, val);
+    break;
+
+  case NODE_COLON3:
+    codegen_colon3(s, tree, val);
+    break;
+
+  case NODE_DEFINED:
+    codegen_defined(s, tree, val);
+    break;
+
+  case NODE_ZSUPER:
+    codegen_zsuper(s, tree, val);
+    break;
+
+  case NODE_LAMBDA:
+    codegen_lambda(s, tree, val);
+    break;
+
+  case NODE_WORDS:
+    codegen_words(s, tree, val);
+    break;
+
+  case NODE_SYMBOLS:
+    codegen_symbols(s, tree, val);
+    break;
+
+  case NODE_SPLAT:
+    codegen_splat(s, tree, val);
+    break;
+
+  case NODE_BLOCK_ARG:
+    codegen_block_arg(s, tree, val);
+    break;
+
+  case NODE_SCOPE:
+    codegen_scope_node(s, tree, val);
+    break;
+
+  case NODE_BEGIN:
+    codegen_begin(s, tree, val);
+    break;
+
+  case NODE_ENSURE:
+    codegen_ensure(s, tree, val);
+    break;
+
+  case NODE_STMTS:
+    codegen_stmts(s, tree, val);
+    break;
+
+  case NODE_ALIAS:
+    codegen_alias(s, tree, val);
+    break;
+
+  case NODE_UNDEF:
+    codegen_undef(s, tree, val);
+    break;
+
+  case NODE_POSTEXE:
+    {
+      struct mrb_ast_postexe_node *postexe = postexe_node(tree);
+      codegen(s, postexe->body, NOVAL);
+    }
+    break;
+
+  case NODE_SDEF:
+    codegen_sdef(s, tree, val);
     break;
 
   default:
+    /* Unhandled variable-sized node type - should not occur with current AST */
     break;
   }
   s->rlev = rlev;
@@ -6129,7 +5902,7 @@ scope_new(mrb_state *mrb, codegen_scope *prev, node *nlv)
   s->syms = (mrb_sym*)mrbc_malloc(sizeof(mrb_sym)*s->scapa);
 
   s->lv = nlv;
-  s->sp += node_len(nlv)+1;        /* add self */
+  s->sp += (nlv ? node_len(nlv) : 0) + 1;        /* add self */
   s->nlocals = s->nregs = s->sp;
   if (nlv) {
     mrb_sym *lv;

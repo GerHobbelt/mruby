@@ -72,7 +72,7 @@ typedef unsigned int stack_type;
 #define CMDARG_LEXPOP() BITSTACK_LEXPOP(p->cmdarg_stack)
 #define CMDARG_P()      BITSTACK_SET_P(p->cmdarg_stack)
 
-#define SET_LINENO(c,n) (head(c)->lineno = (n))
+#define SET_LINENO(c,n) (((struct mrb_ast_var_header*)(c))->lineno = (n))
 
 #define NUM_SUFFIX_R   (1<<0)
 #define NUM_SUFFIX_I   (1<<1)
@@ -142,91 +142,15 @@ cons_gen(parser_state *p, node *car, node *cdr)
   return (node*)c;
 }
 
-static node*
-cons_head_gen(parser_state *p, node *car, node *cdr)
-{
-  struct mrb_ast_head_node *c;
-
-  /* Always allocate new nodes for head nodes - they're 24 bytes */
-  c = (struct mrb_ast_head_node*)parser_palloc(p, sizeof(struct mrb_ast_head_node));
-
-  c->car = car;
-  c->cdr = cdr;
-  c->lineno = p->lineno;
-  c->filename_index = p->current_filename_index;
-  /* beginning of next partial file; need to point the previous file */
-  if (p->lineno == 0 && p->current_filename_index > 0) {
-    c->filename_index--;
-  }
-  return (node*)c;
-}
 /* Head-only location optimization: separate functions for head vs structure nodes */
 #define cons(a,b) cons_gen(p,(a),(b))           /* Structure nodes - no location */
-#define cons_head(a,b) cons_head_gen(p,(a),(b)) /* Head nodes - with location */
-
-/* Variable-sized node infrastructure - Phase 1 */
-
-/* Calculate size class for given byte size */
-static inline enum mrb_ast_size_class
-size_to_class(size_t size)
-{
-  static const size_t limits[] = SIZE_CLASS_LIMITS;
-  for (int i = 0; i < SIZE_CLASS_COUNT; i++) {
-    if (size <= limits[i]) return (enum mrb_ast_size_class)i;
-  }
-  return SIZE_CLASS_XLARGE;
-}
-
-/* Get maximum size for a size class */
-static inline size_t
-size_class_limit(enum mrb_ast_size_class class)
-{
-  static const size_t limits[] = SIZE_CLASS_LIMITS;
-  return (class < SIZE_CLASS_COUNT) ? limits[class] : 512;
-}
-
-/* Allocate variable-sized node with size class management */
-static void*
-parser_alloc_var(parser_state *p, size_t size, enum mrb_ast_size_class class)
-{
-  /* Try to reuse from appropriate size class free list */
-  if (p->var_free_lists[class] && size <= size_class_limit(class)) {
-    struct mrb_ast_node *ptr = p->var_free_lists[class];
-    p->var_free_lists[class] = ptr->cdr;
-    p->var_alloc_counts[class]++;
-    return ptr;
-  }
-
-  /* Allocate new memory */
-  void *ptr = parser_palloc(p, size);
-  p->var_total_allocated += size;
-  p->var_alloc_counts[class]++;
-  return ptr;
-}
-
-/* Free variable-sized node to appropriate size class list */
-/*
-static void
-parser_free_var(parser_state *p, void *ptr, enum mrb_ast_size_class class)
-{
-  if (!ptr) return;
-
-  struct mrb_ast_node *node = (struct mrb_ast_node*)ptr;
-  node->cdr = p->var_free_lists[class];
-  p->var_free_lists[class] = node;
-}
-*/
-
 /* Initialize variable node header */
 static void
-init_var_header(struct mrb_ast_var_header *header, parser_state *p,
-                enum node_type type, enum mrb_ast_size_class class)
+init_var_header(struct mrb_ast_var_header *header, parser_state *p, enum node_type type)
 {
   header->lineno = p->lineno;
   header->filename_index = p->current_filename_index;
   header->node_type = (uint8_t)type;
-  header->size_class = (uint8_t)class;
-  header->flags = 0;
 
   /* Handle file boundary edge case */
   if (p->lineno == 0 && p->current_filename_index > 0) {
@@ -237,30 +161,23 @@ init_var_header(struct mrb_ast_var_header *header, parser_state *p,
 static node*
 list1_gen(parser_state *p, node *a)
 {
-  return cons_head(a, 0);
+  return cons(a, 0);
 }
 #define list1(a) list1_gen(p, (a))
 
 static node*
 list2_gen(parser_state *p, node *a, node *b)
 {
-  return cons_head(a, cons(b, 0));
+  return cons(a, cons(b, 0));
 }
 #define list2(a,b) list2_gen(p, (a),(b))
 
 static node*
 list3_gen(parser_state *p, node *a, node *b, node *c)
 {
-  return cons_head(a, cons(b, cons(c, 0)));
+  return cons(a, cons(b, cons(c, 0)));
 }
 #define list3(a,b,c) list3_gen(p, (a),(b),(c))
-
-static node*
-list4_gen(parser_state *p, node *a, node *b, node *c, node *d)
-{
-  return cons_head(a, cons(b, cons(c, cons(d, 0))));
-}
-#define list4(a,b,c,d) list4_gen(p, (a),(b),(c),(d))
 
 static node*
 append_gen(parser_state *p, node *a, node *b)
@@ -431,13 +348,29 @@ node_type_p(node *n, enum node_type type)
 {
   if (!n) return FALSE;
 
-  /* Check traditional cons-list nodes */
-  if (node_to_int(n->car) == type) return TRUE;
+  /* Check if this is a variable-sized node */
+  struct mrb_ast_var_header *header = (struct mrb_ast_var_header*)n;
+  return ((enum node_type)header->node_type == type);
+}
 
-  /* Check variable-sized nodes */
-  if (n->car == (node*)NODE_VARIABLE && VAR_NODE_TYPE(n->cdr) == type) return TRUE;
+/* Helper functions for variable-sized node detection */
+static enum node_type
+get_node_type(node *n)
+{
+  if (!n) return (enum node_type)0;
 
-  return FALSE;
+  /* Try to interpret as variable-sized node */
+  struct mrb_ast_var_header *header = (struct mrb_ast_var_header*)n;
+  enum node_type type = (enum node_type)header->node_type;
+
+  /* Validate that the node type is within valid range for variable-sized nodes */
+  if (type >= NODE_SCOPE && type < NODE_LAST) {
+    return type;
+  }
+
+  /* If node type is invalid, this is likely a cons-list node */
+  /* Return a special sentinel value to indicate cons-list fallback */
+  return NODE_LAST; /* Use NODE_LAST as sentinel for cons-list nodes */
 }
 
 static void
@@ -462,40 +395,33 @@ nvars_unnest(parser_state *p)
 static node*
 new_scope(parser_state *p, node *body)
 {
-  size_t total_size = sizeof(struct mrb_ast_scope_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_scope_node *scope_node = (struct mrb_ast_scope_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&scope_node->hdr, p, NODE_SCOPE, class);
+  struct mrb_ast_scope_node *scope_node = (struct mrb_ast_scope_node*)parser_palloc(p, sizeof(struct mrb_ast_scope_node));
+  init_var_header(&scope_node->header, p, NODE_SCOPE);
   scope_node->locals = locals_node(p);
   scope_node->body = body;
-  return cons_head((node*)NODE_VARIABLE, (node*)scope_node);
+  return (node*)scope_node;
 }
 
 /* (:begin prog...) */
 static node*
 new_stmts(parser_state *p, node *body)
 {
-  size_t total_size = sizeof(struct mrb_ast_stmts_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
+  struct mrb_ast_stmts_node *n = (struct mrb_ast_stmts_node*)parser_palloc(p, sizeof(struct mrb_ast_stmts_node));
 
-  struct mrb_ast_stmts_node *n = (struct mrb_ast_stmts_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_STMTS, class);
+  init_var_header(&n->header, p, NODE_STMTS);
   n->stmts = body ? list1(body) : 0;  /* Wrap single statement in cons-list */
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:begin body) - Always use variable-sized nodes */
 static node*
 new_begin(parser_state *p, node *body)
 {
-  size_t total_size = sizeof(struct mrb_ast_begin_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_begin_node *begin_node = (struct mrb_ast_begin_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&begin_node->hdr, p, NODE_BEGIN, class);
+  struct mrb_ast_begin_node *begin_node = (struct mrb_ast_begin_node*)parser_palloc(p, sizeof(struct mrb_ast_begin_node));
+  init_var_header(&begin_node->header, p, NODE_BEGIN);
   begin_node->body = body;
-  return cons_head((node*)NODE_VARIABLE, (node*)begin_node);
+  return (node*)begin_node;
 }
 
 #define newline_node(n) (n)
@@ -504,17 +430,13 @@ new_begin(parser_state *p, node *body)
 static node*
 new_rescue(parser_state *p, node *body, node *resq, node *els)
 {
-  size_t total_size = sizeof(struct mrb_ast_rescue_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_rescue_node *n = (struct mrb_ast_rescue_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_RESCUE, class);
+  struct mrb_ast_rescue_node *n = (struct mrb_ast_rescue_node*)parser_palloc(p, sizeof(struct mrb_ast_rescue_node));
+  init_var_header(&n->header, p, NODE_RESCUE);
   n->body = body;
   n->rescue_clauses = resq;
   n->else_clause = els;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 static node*
@@ -527,68 +449,52 @@ new_mod_rescue(parser_state *p, node *body, node *resq)
 static node*
 new_ensure(parser_state *p, node *a, node *b)
 {
-  size_t total_size = sizeof(struct mrb_ast_ensure_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_ensure_node *ensure_node = (struct mrb_ast_ensure_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&ensure_node->hdr, p, NODE_ENSURE, class);
+  struct mrb_ast_ensure_node *ensure_node = (struct mrb_ast_ensure_node*)parser_palloc(p, sizeof(struct mrb_ast_ensure_node));
+  init_var_header(&ensure_node->header, p, NODE_ENSURE);
   ensure_node->body = a;
   ensure_node->ensure_clause = b;
-  return cons_head((node*)NODE_VARIABLE, (node*)ensure_node);
+  return (node*)ensure_node;
 }
 
 /* (:nil) */
 static node*
 new_nil(parser_state *p)
 {
-  size_t total_size = sizeof(struct mrb_ast_nil_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
+  struct mrb_ast_nil_node *n = (struct mrb_ast_nil_node*)parser_palloc(p, sizeof(struct mrb_ast_nil_node));
+  init_var_header(&n->header, p, NODE_NIL);
 
-  struct mrb_ast_nil_node *n = (struct mrb_ast_nil_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_NIL, class);
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:true) */
 static node*
 new_true(parser_state *p)
 {
-  size_t total_size = sizeof(struct mrb_ast_true_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
+  struct mrb_ast_true_node *n = (struct mrb_ast_true_node*)parser_palloc(p, sizeof(struct mrb_ast_true_node));
+  init_var_header(&n->header, p, NODE_TRUE);
 
-  struct mrb_ast_true_node *n = (struct mrb_ast_true_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_TRUE, class);
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:false) */
 static node*
 new_false(parser_state *p)
 {
-  size_t total_size = sizeof(struct mrb_ast_false_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
+  struct mrb_ast_false_node *n = (struct mrb_ast_false_node*)parser_palloc(p, sizeof(struct mrb_ast_false_node));
+  init_var_header(&n->header, p, NODE_FALSE);
 
-  struct mrb_ast_false_node *n = (struct mrb_ast_false_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_FALSE, class);
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:alias new old) */
 static node*
 new_alias(parser_state *p, mrb_sym a, mrb_sym b)
 {
-  size_t total_size = sizeof(struct mrb_ast_alias_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_alias_node *alias_node = (struct mrb_ast_alias_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&alias_node->hdr, p, NODE_ALIAS, class);
+  struct mrb_ast_alias_node *alias_node = (struct mrb_ast_alias_node*)parser_palloc(p, sizeof(struct mrb_ast_alias_node));
+  init_var_header(&alias_node->header, p, NODE_ALIAS);
   alias_node->new_name = a;
   alias_node->old_name = b;
-  return cons_head((node*)NODE_VARIABLE, (node*)alias_node);
+  return (node*)alias_node;
 }
 
 /* (:if cond then else) */
@@ -597,17 +503,15 @@ new_if(parser_state *p, node *condition, node *then_body, node *else_body)
 {
   void_expr_error(p, condition);
 
-  size_t total_size = sizeof(struct mrb_ast_if_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
   struct mrb_ast_if_node *n;
 
-  n = (struct mrb_ast_if_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->header, p, NODE_IF, class);
+  n = (struct mrb_ast_if_node*)parser_palloc(p, sizeof(struct mrb_ast_if_node));
+  init_var_header(&n->header, p, NODE_IF);
   n->condition = condition;
   n->then_body = then_body;
   n->else_body = else_body;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:while cond body) */
@@ -616,16 +520,14 @@ new_while(parser_state *p, node *condition, node *body)
 {
   void_expr_error(p, condition);
 
-  size_t total_size = sizeof(struct mrb_ast_while_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
   struct mrb_ast_while_node *n;
 
-  n = (struct mrb_ast_while_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->header, p, NODE_WHILE, class);
+  n = (struct mrb_ast_while_node*)parser_palloc(p, sizeof(struct mrb_ast_if_node));
+  init_var_header(&n->header, p, NODE_WHILE);
   n->condition = condition;
   n->body = body;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:until cond body) */
@@ -634,16 +536,14 @@ new_until(parser_state *p, node *condition, node *body)
 {
   void_expr_error(p, condition);
 
-  size_t total_size = sizeof(struct mrb_ast_until_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
   struct mrb_ast_until_node *n;
 
-  n = (struct mrb_ast_until_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->header, p, NODE_UNTIL, class);
+  n = (struct mrb_ast_until_node*)parser_palloc(p, sizeof(struct mrb_ast_if_node));
+  init_var_header(&n->header, p, NODE_UNTIL);
   n->condition = condition;
   n->body = body;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:while_mod cond body) */
@@ -651,7 +551,7 @@ static node*
 new_while_mod(parser_state *p, node *condition, node *body)
 {
   node *while_node = new_while(p, condition, body);
-  struct mrb_ast_while_node *n = (struct mrb_ast_while_node*)NODE_VAR_NODE_PTR(while_node);
+  struct mrb_ast_while_node *n = (struct mrb_ast_while_node*)while_node;
   n->header.node_type = NODE_WHILE_MOD;
   return while_node;
 }
@@ -661,7 +561,7 @@ static node*
 new_until_mod(parser_state *p, node *a, node *b)
 {
   node *until_node = new_until(p, a, b);
-  struct mrb_ast_until_node *n = (struct mrb_ast_until_node*)NODE_VAR_NODE_PTR(until_node);
+  struct mrb_ast_until_node *n = (struct mrb_ast_until_node*)until_node;
   n->header.node_type = NODE_UNTIL_MOD;
   return until_node;
 }
@@ -672,332 +572,199 @@ new_for(parser_state *p, node *v, node *o, node *b)
 {
   void_expr_error(p, o);
 
-  size_t total_size = sizeof(struct mrb_ast_for_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_for_node *n = (struct mrb_ast_for_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_FOR, class);
+  struct mrb_ast_for_node *n = (struct mrb_ast_for_node*)parser_palloc(p, sizeof(struct mrb_ast_for_node));
+  init_var_header(&n->header, p, NODE_FOR);
   n->var = v;
   n->iterable = o;
   n->body = b;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:case a ((when ...) body) ((when...) body)) */
 static node*
 new_case(parser_state *p, node *a, node *b)
 {
-  uint16_t when_count = 0;
-  node *else_body = NULL;
-  node *current_when = b;
-
   void_expr_error(p, a);
 
-  // First pass: count when clauses and identify else_body
-  // The when_list is a linked list where each element's car is a (condition . body) cons node.
-  // The last element's car might be 0, and its cdr is the else_body.
-  while (current_when) {
-    node *clause = current_when->car;
-    if (clause && node_to_int(clause->car) == 0) { // This is the else clause
-      else_body = clause->cdr;
-      break; // Else body is always the last
-    }
-    when_count++;
-    current_when = current_when->cdr;
-  }
+  struct mrb_ast_case_node *n = (struct mrb_ast_case_node*)parser_palloc(p, sizeof(struct mrb_ast_case_node));
 
-  size_t base_size = sizeof(struct mrb_ast_case_node);
-  size_t when_clauses_size = when_count * sizeof(struct mrb_ast_node*);
-  size_t total_size = base_size + when_clauses_size;
-
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_case_node *n = (struct mrb_ast_case_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_CASE, class);
+  init_var_header(&n->header, p, NODE_CASE);
   n->value = a;
-  n->when_count = when_count;
-  n->else_body = else_body;
+  n->body = b;
 
-  // Second pass: copy when clauses into flexible array
-  current_when = b;
-  for (int i = 0; i < when_count; i++) {
-    n->when_clauses[i] = current_when->car; // Each car is a (condition . body) cons node
-    current_when = current_when->cdr;
-  }
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:postexe a) */
 static node*
 new_postexe(parser_state *p, node *a)
 {
-  size_t total_size = sizeof(struct mrb_ast_postexe_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_postexe_node *postexe_node = (struct mrb_ast_postexe_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&postexe_node->hdr, p, NODE_POSTEXE, class);
+  struct mrb_ast_postexe_node *postexe_node = (struct mrb_ast_postexe_node*)parser_palloc(p, sizeof(struct mrb_ast_postexe_node));
+  init_var_header(&postexe_node->header, p, NODE_POSTEXE);
   postexe_node->body = a;
-  return cons_head((node*)NODE_VARIABLE, (node*)postexe_node);
+  return (node*)postexe_node;
 }
 
 /* (:self) */
 static node*
 new_self(parser_state *p)
 {
-  size_t total_size = sizeof(struct mrb_ast_self_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
+  struct mrb_ast_self_node *n = (struct mrb_ast_self_node*)parser_palloc(p, sizeof(struct mrb_ast_self_node));
+  init_var_header(&n->header, p, NODE_SELF);
 
-  struct mrb_ast_self_node *n = (struct mrb_ast_self_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_SELF, class);
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:call a b c) */
 static node*
-new_call(parser_state *p, node *a, mrb_sym b, node *c, int pass)
+new_call(parser_state *p, node *receiver, mrb_sym method, node *args, int pass)
 {
-  node *n = list4(int_to_node(pass?NODE_CALL:NODE_SCALL), a, sym_to_node(b), c);
-  void_expr_error(p, a);
-  return n;
-}
-
-#if 0
-/* Variable-sized call node creation */
-static node*
-new_call_var(parser_state *p, node *receiver, mrb_sym method, node *args, int pass)
-{
-  /* Analyze the arguments to determine size needed */
-  uint8_t argc = 0;
-  uint8_t has_kwargs = 0;
-  uint8_t has_block = 0;
-  node *regular_args = NULL, *kwargs = NULL, *block = NULL;
-
-  if (args) {
-    regular_args = args->car;
-    if (args->cdr) {
-      kwargs = args->cdr->car;
-      has_kwargs = (kwargs != NULL);
-      if (args->cdr->cdr) {
-        block = args->cdr->cdr;
-        has_block = (block != NULL);
-      }
-    }
-  }
-
-  /* Count regular arguments */
-  node *arg_iter = regular_args;
-  while (arg_iter) {
-    argc++;
-    arg_iter = arg_iter->cdr;
-  }
-
-  /* Calculate total size needed */
-  size_t base_size = sizeof(struct mrb_ast_call_node);
-  size_t args_size = argc * sizeof(struct mrb_ast_node*);
-  size_t kwargs_size = has_kwargs ? sizeof(struct mrb_ast_node*) : 0;
-  size_t block_size = has_block ? sizeof(struct mrb_ast_node*) : 0;
-  size_t total_size = base_size + args_size + kwargs_size + block_size;
-
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_call_node *n = (struct mrb_ast_call_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, pass ? NODE_CALL : NODE_SCALL, class);
+  /* Calculate size needed (fixed size now) */  struct mrb_ast_call_node *n = (struct mrb_ast_call_node*)parser_palloc(p, sizeof(struct mrb_ast_call_node));
+  init_var_header(&n->header, p, NODE_CALL);
   n->receiver = receiver;
   n->method_name = method;
-  n->argc = argc;
-  n->has_kwargs = has_kwargs;
-  n->has_block = has_block;
-  n->safe_call = (pass == 2); /* Assuming pass == 2 means safe call (&.) */
-  n->reserved = 0;
+  n->safe_call = (pass == 0); /* pass == 0 means safe call (&.) */
 
-  /* Copy regular arguments into flexible array */
-  arg_iter = regular_args;
-  for (int i = 0; i < argc; i++) {
-    n->args[i] = arg_iter->car;
-    arg_iter = arg_iter->cdr;
-  }
-
-  /* Add kwargs and block after regular arguments */
-  if (has_kwargs) {
-    n->args[argc] = kwargs;
-  }
-  if (has_block) {
-    n->args[argc + (has_kwargs ? 1 : 0)] = block;
-  }
+  /* Store args pointer directly - no need to unpack and repack */
+  n->args = args;
 
   void_expr_error(p, receiver);
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
-#endif
 
 /* (:fcall self mid args) */
 static node*
 new_fcall(parser_state *p, mrb_sym b, node *c)
 {
-  if (!p->var_nodes_enabled) {
-    node *n = list4((node*)NODE_FCALL, 0, sym_to_node(b), c);
-    return n;
-  }
-
-  size_t total_size = sizeof(struct mrb_ast_fcall_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_fcall_node *fcall_node = (struct mrb_ast_fcall_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&fcall_node->hdr, p, NODE_FCALL, class);
-  fcall_node->method_name = b;
-  fcall_node->args = c;
-  return cons_head((node*)NODE_VARIABLE, (node*)fcall_node);
+  return new_call(p, NULL, b, c, '.');
 }
 
 /* (a b . c) */
 static node*
 new_callargs(parser_state *p, node *a, node *b, node *c)
 {
-  return cons_head(a, cons(b, c));
+  /* Allocate struct mrb_ast_callargs (fixed size, like new_args) */
+  struct mrb_ast_callargs *callargs = (struct mrb_ast_callargs*)parser_palloc(p, sizeof(struct mrb_ast_callargs));
+
+  /* Initialize members directly */
+  callargs->regular_args = a;   /* Cons list of regular arguments (preserves splat compatibility) */
+  callargs->keyword_args = b;   /* Keyword arguments hash node */
+  callargs->block_arg = c;      /* Block argument node */
+
+  /* Return direct cast to node (like new_args) */
+  return (node*)callargs;
 }
 
 /* (:super . c) */
 static node*
 new_super(parser_state *p, node *c)
 {
-  size_t total_size = sizeof(struct mrb_ast_super_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_super_node *n = (struct mrb_ast_super_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_SUPER, class);
+  struct mrb_ast_super_node *n = (struct mrb_ast_super_node*)parser_palloc(p, sizeof(struct mrb_ast_super_node));
+  init_var_header(&n->header, p, NODE_SUPER);
   n->args = c;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:zsuper) */
 static node*
 new_zsuper(parser_state *p)
 {
-  size_t total_size = sizeof(struct mrb_ast_super_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_super_node *n = (struct mrb_ast_super_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->header, p, NODE_ZSUPER, class);
+  struct mrb_ast_super_node *n = (struct mrb_ast_super_node*)parser_palloc(p, sizeof(struct mrb_ast_super_node));
+  init_var_header(&n->header, p, NODE_ZSUPER);
   n->args = NULL;  /* zsuper initially has no args, but may be added by call_with_block */
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:yield . c) */
 static node*
 new_yield(parser_state *p, node *c)
 {
-  if (c && c->cdr && c->cdr->cdr) {
-        yyerror(NULL, p, "both block arg and actual block given");
-  }
-
-  size_t total_size = sizeof(struct mrb_ast_yield_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_yield_node *n = (struct mrb_ast_yield_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_YIELD, class);
+  /* Handle callargs structure - direct casting like new_args() */
+  if (c) {
+    struct mrb_ast_callargs *callargs = (struct mrb_ast_callargs*)c;
+    if (callargs->block_arg) {
+      yyerror(NULL, p, "both block arg and actual block given");
+    }
+  }  struct mrb_ast_yield_node *n = (struct mrb_ast_yield_node*)parser_palloc(p, sizeof(struct mrb_ast_yield_node));
+  init_var_header(&n->header, p, NODE_YIELD);
   n->args = c;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:return . c) */
 static node*
 new_return(parser_state *p, node *c)
 {
-  size_t total_size = sizeof(struct mrb_ast_return_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_return_node *n = (struct mrb_ast_return_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_RETURN, class);
+  struct mrb_ast_return_node *n = (struct mrb_ast_return_node*)parser_palloc(p, sizeof(struct mrb_ast_return_node));
+  init_var_header(&n->header, p, NODE_RETURN);
   n->args = c;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:break . c) */
 static node*
 new_break(parser_state *p, node *c)
 {
-  size_t total_size = sizeof(struct mrb_ast_break_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_break_node *n = (struct mrb_ast_break_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->hdr, p, NODE_BREAK, class);
+  struct mrb_ast_break_node *n = (struct mrb_ast_break_node*)parser_palloc(p, sizeof(struct mrb_ast_break_node));
+  init_var_header(&n->header, p, NODE_BREAK);
   n->value = c;
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:next . c) */
 static node*
 new_next(parser_state *p, node *c)
 {
-  size_t total_size = sizeof(struct mrb_ast_next_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_next_node *n = (struct mrb_ast_next_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->hdr, p, NODE_NEXT, class);
+  struct mrb_ast_next_node *n = (struct mrb_ast_next_node*)parser_palloc(p, sizeof(struct mrb_ast_next_node));
+  init_var_header(&n->header, p, NODE_NEXT);
   n->value = c;
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:redo) */
 static node*
 new_redo(parser_state *p)
 {
-  size_t total_size = sizeof(struct mrb_ast_redo_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_redo_node *n = (struct mrb_ast_redo_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->hdr, p, NODE_REDO, class);
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  struct mrb_ast_redo_node *n = (struct mrb_ast_redo_node*)parser_palloc(p, sizeof(struct mrb_ast_redo_node));
+  init_var_header(&n->header, p, NODE_REDO);
+  return (node*)n;
 }
 
 /* (:retry) */
 static node*
 new_retry(parser_state *p)
 {
-  size_t total_size = sizeof(struct mrb_ast_retry_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_retry_node *n = (struct mrb_ast_retry_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->hdr, p, NODE_RETRY, class);
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  struct mrb_ast_retry_node *n = (struct mrb_ast_retry_node*)parser_palloc(p, sizeof(struct mrb_ast_retry_node));
+  init_var_header(&n->header, p, NODE_RETRY);
+  return (node*)n;
 }
 
 /* (:dot2 a b) */
 static node*
 new_dot2(parser_state *p, node *a, node *b)
 {
-  size_t total_size = sizeof(struct mrb_ast_dot2_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_dot2_node *n = (struct mrb_ast_dot2_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_DOT2, class);
+  struct mrb_ast_dot2_node *n = (struct mrb_ast_dot2_node*)parser_palloc(p, sizeof(struct mrb_ast_dot2_node));
+  init_var_header(&n->header, p, NODE_DOT2);
   n->left = a;
   n->right = b;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:dot3 a b) */
 static node*
 new_dot3(parser_state *p, node *a, node *b)
 {
-  size_t total_size = sizeof(struct mrb_ast_dot3_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_dot3_node *n = (struct mrb_ast_dot3_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_DOT3, class);
+  struct mrb_ast_dot3_node *n = (struct mrb_ast_dot3_node*)parser_palloc(p, sizeof(struct mrb_ast_dot3_node));
+  init_var_header(&n->header, p, NODE_DOT3);
   n->left = a;
   n->right = b;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:colon2 b c) */
@@ -1006,25 +773,21 @@ new_colon2(parser_state *p, node *b, mrb_sym c)
 {
   void_expr_error(p, b);
 
-  size_t total_size = sizeof(struct mrb_ast_colon2_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_colon2_node *colon2_node = (struct mrb_ast_colon2_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&colon2_node->hdr, p, NODE_COLON2, class);
+  struct mrb_ast_colon2_node *colon2_node = (struct mrb_ast_colon2_node*)parser_palloc(p, sizeof(struct mrb_ast_colon2_node));
+  init_var_header(&colon2_node->header, p, NODE_COLON2);
   colon2_node->base = b;
   colon2_node->name = c;
-  return cons_head((node*)NODE_VARIABLE, (node*)colon2_node);
+  return (node*)colon2_node;
 }
 
 /* (:colon3 . c) */
 static node*
 new_colon3(parser_state *p, mrb_sym c)
 {
-  size_t total_size = sizeof(struct mrb_ast_colon3_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_colon3_node *colon3_node = (struct mrb_ast_colon3_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&colon3_node->hdr, p, NODE_COLON3, class);
+  struct mrb_ast_colon3_node *colon3_node = (struct mrb_ast_colon3_node*)parser_palloc(p, sizeof(struct mrb_ast_colon3_node));
+  init_var_header(&colon3_node->header, p, NODE_COLON3);
   colon3_node->name = c;
-  return cons_head((node*)NODE_VARIABLE, (node*)colon3_node);
+  return (node*)colon3_node;
 }
 
 /* (:and a b) */
@@ -1033,16 +796,12 @@ new_and(parser_state *p, node *a, node *b)
 {
   void_expr_error(p, a);
 
-  size_t total_size = sizeof(struct mrb_ast_and_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_and_node *n = (struct mrb_ast_and_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_AND, class);
+  struct mrb_ast_and_node *n = (struct mrb_ast_and_node*)parser_palloc(p, sizeof(struct mrb_ast_and_node));
+  init_var_header(&n->header, p, NODE_AND);
   n->left = a;
   n->right = b;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:or a b) */
@@ -1051,52 +810,24 @@ new_or(parser_state *p, node *a, node *b)
 {
   void_expr_error(p, a);
 
-  size_t total_size = sizeof(struct mrb_ast_or_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_or_node *n = (struct mrb_ast_or_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_OR, class);
+  struct mrb_ast_or_node *n = (struct mrb_ast_or_node*)parser_palloc(p, sizeof(struct mrb_ast_or_node));
+  init_var_header(&n->header, p, NODE_OR);
   n->left = a;
   n->right = b;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:array a...) */
 static node*
 new_array(parser_state *p, node *a)
 {
-  /* Count array elements */
-  uint16_t len = 0;
-  node *elem_iter = a;
-  while (elem_iter) {
-    len++;
-    elem_iter = elem_iter->cdr;
-  }
+  struct mrb_ast_array_node *n = (struct mrb_ast_array_node*)parser_palloc(p, sizeof(struct mrb_ast_array_node));
 
-  /* Calculate total size needed */
-  size_t base_size = sizeof(struct mrb_ast_array_node);
-  size_t elems_size = len * sizeof(struct mrb_ast_node*);
-  size_t total_size = base_size + elems_size;
+  init_var_header(&n->header, p, NODE_ARRAY);
+  n->elements = a;
 
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_array_node *n = (struct mrb_ast_array_node*)
-    parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_ARRAY, class);
-  n->len = len;
-  n->flags = 0;
-
-  /* Copy elements into flexible array */
-  elem_iter = a;
-  for (int i = 0; i < len; i++) {
-    n->elements[i] = elem_iter->car;
-    elem_iter = elem_iter->cdr;
-  }
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:splat . a) */
@@ -1105,68 +836,22 @@ new_splat(parser_state *p, node *a)
 {
   void_expr_error(p, a);
 
-  size_t total_size = sizeof(struct mrb_ast_splat_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_splat_node *splat_node = (struct mrb_ast_splat_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&splat_node->hdr, p, NODE_SPLAT, class);
+  struct mrb_ast_splat_node *splat_node = (struct mrb_ast_splat_node*)parser_palloc(p, sizeof(struct mrb_ast_splat_node));
+  init_var_header(&splat_node->header, p, NODE_SPLAT);
   splat_node->value = a;
-  return cons_head((node*)NODE_VARIABLE, (node*)splat_node);
+  return (node*)splat_node;
 }
 
 /* (:hash (k . v) (k . v)...) */
 static node*
 new_hash(parser_state *p, node *a)
 {
-  /* Count hash key-value pairs */
-  uint16_t len = 0;
-  node *pair_iter = a;
-  while (pair_iter) {
-    len++;
-    pair_iter = pair_iter->cdr;
-  }
+  struct mrb_ast_hash_node *n = (struct mrb_ast_hash_node*)parser_palloc(p, sizeof(struct mrb_ast_hash_node));
 
-  /* Calculate total size needed */
-  size_t base_size = sizeof(struct mrb_ast_hash_node);
-  size_t pairs_size = len * 2 * sizeof(struct mrb_ast_node*); /* key and value for each pair */
-  size_t total_size = base_size + pairs_size;
+  init_var_header(&n->header, p, NODE_HASH);
+  n->pairs = a;
 
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_hash_node *n = (struct mrb_ast_hash_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_HASH, class);
-  n->len = len;
-  n->flags = 0;
-
-  /* Copy key-value pairs into flexible array */
-  pair_iter = a;
-  for (int i = 0; i < len; i++) {
-    if (pair_iter && pair_iter->car) {
-      /* Each pair is a cons (key . value) */
-      node *pair = pair_iter->car;
-      n->pairs[i * 2] = pair->car;     /* key */
-      n->pairs[i * 2 + 1] = pair->cdr; /* value */
-    }
-    pair_iter = pair_iter->cdr;
-  }
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* (:kw_hash (k . v) (k . v)...) */
-static node*
-new_kw_hash(parser_state *p, node *a)
-{
-  if (!p->var_nodes_enabled) {
-    return cons_head((node*)NODE_KW_HASH, a);
-  }
-
-  size_t total_size = sizeof(struct mrb_ast_kw_hash_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_kw_hash_node *kw_hash_node = (struct mrb_ast_kw_hash_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&kw_hash_node->hdr, p, NODE_KW_HASH, class);
-  kw_hash_node->args = a;
-  return cons_head((node*)NODE_VARIABLE, (node*)kw_hash_node);
+  return (node*)n;
 }
 
 /* (:sym . a) */
@@ -1175,29 +860,32 @@ static node*
 new_sym(parser_state *p, mrb_sym sym)
 {
   size_t size = sizeof(struct mrb_ast_sym_node);
-  enum mrb_ast_size_class class = size_to_class(size);
 
-  struct mrb_ast_sym_node *n = (struct mrb_ast_sym_node*)parser_alloc_var(p, size, class);
+  struct mrb_ast_sym_node *n = (struct mrb_ast_sym_node*)parser_palloc(p, size);
 
-  init_var_header(&n->header, p, NODE_SYM, class);
+  init_var_header(&n->header, p, NODE_SYM);
   n->symbol = sym;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 static node*
 new_xvar(parser_state *p, mrb_sym sym, enum node_type type)
 {
   size_t size = sizeof(struct mrb_ast_var_node);
-  enum mrb_ast_size_class class = size_to_class(size);
 
-  struct mrb_ast_var_node *n = (struct mrb_ast_var_node*)parser_alloc_var(p, size, class);
+  struct mrb_ast_var_node *n = (struct mrb_ast_var_node*)parser_palloc(p, size);
 
-  init_var_header(&n->header, p, type, class);
+  init_var_header(&n->header, p, type);
   n->symbol = sym;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
+
+#define new_lvar(p, sym) new_xvar(p, sym, NODE_LVAR)
+#define new_ivar(p, sym) new_xvar(p, sym, NODE_IVAR)
+#define new_gvar(p, sym) new_xvar(p, sym, NODE_GVAR)
+#define new_cvar(p, sym) new_xvar(p, sym, NODE_CVAR)
 
 static mrb_sym
 new_strsym(parser_state *p, node* str)
@@ -1231,40 +919,31 @@ new_nvar(parser_state *p, int num)
   else {
     p->nvars->car = int_to_node(nvar > num ? nvar : num);
   }
-
-  size_t total_size = sizeof(struct mrb_ast_nvar_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_nvar_node *n = (struct mrb_ast_nvar_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->hdr, p, NODE_NVAR, class);
+  struct mrb_ast_nvar_node *n = (struct mrb_ast_nvar_node*)parser_palloc(p, sizeof(struct mrb_ast_nvar_node));
+  init_var_header(&n->header, p, NODE_NVAR);
   n->num = num;
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:const . a) */
 static node*
 new_const(parser_state *p, mrb_sym sym)
 {
-  size_t total_size = sizeof(struct mrb_ast_const_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_const_node *n = (struct mrb_ast_const_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_CONST, class);
+  struct mrb_ast_const_node *n = (struct mrb_ast_const_node*)parser_palloc(p, sizeof(struct mrb_ast_const_node));
+  init_var_header(&n->header, p, NODE_CONST);
   n->symbol = sym;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:undef a...) */
 static node*
 new_undef(parser_state *p, node *syms)
 {
-  size_t total_size = sizeof(struct mrb_ast_undef_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_undef_node *undef_node = (struct mrb_ast_undef_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&undef_node->hdr, p, NODE_UNDEF, class);
+  struct mrb_ast_undef_node *undef_node = (struct mrb_ast_undef_node*)parser_palloc(p, sizeof(struct mrb_ast_undef_node));
+  init_var_header(&undef_node->header, p, NODE_UNDEF);
   undef_node->syms = syms;
-  return cons_head((node*)NODE_VARIABLE, (node*)undef_node);
+  return (node*)undef_node;
 }
 
 /* (:class class super body) */
@@ -1273,17 +952,13 @@ new_class(parser_state *p, node *c, node *s, node *b)
 {
   void_expr_error(p, s);
 
-  size_t total_size = sizeof(struct mrb_ast_class_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_class_node *n = (struct mrb_ast_class_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_CLASS, class);
+  struct mrb_ast_class_node *n = (struct mrb_ast_class_node*)parser_palloc(p, sizeof(struct mrb_ast_class_node));
+  init_var_header(&n->header, p, NODE_CLASS);
   n->name = c;
   n->superclass = s;
   n->body = cons(locals_node(p), b);
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:sclass obj body) */
@@ -1292,60 +967,49 @@ new_sclass(parser_state *p, node *o, node *b)
 {
   void_expr_error(p, o);
 
-  size_t total_size = sizeof(struct mrb_ast_sclass_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_sclass_node *n = (struct mrb_ast_sclass_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_SCLASS, class);
+  struct mrb_ast_sclass_node *n = (struct mrb_ast_sclass_node*)parser_palloc(p, sizeof(struct mrb_ast_sclass_node));
+  init_var_header(&n->header, p, NODE_SCLASS);
   n->obj = o;
   n->body = cons(locals_node(p), b);
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:module module body) */
 static node*
 new_module(parser_state *p, node *m, node *b)
 {
-  size_t total_size = sizeof(struct mrb_ast_module_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_module_node *n = (struct mrb_ast_module_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_MODULE, class);
+  struct mrb_ast_module_node *n = (struct mrb_ast_module_node*)parser_palloc(p, sizeof(struct mrb_ast_module_node));
+  init_var_header(&n->header, p, NODE_MODULE);
   n->name = m;
   n->body = cons(locals_node(p), b);
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:def m lv (arg . body)) */
 static node*
 new_def(parser_state *p, mrb_sym name)
 {
-  size_t total_size = sizeof(struct mrb_ast_def_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_def_node *n = (struct mrb_ast_def_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_DEF, class);
+  struct mrb_ast_def_node *n = (struct mrb_ast_def_node*)parser_palloc(p, sizeof(struct mrb_ast_def_node));
+  init_var_header(&n->header, p, NODE_DEF);
   n->name = name;
-  n->args = int_to_node(p->cmdarg_stack);
+  n->args = (struct mrb_ast_args *)int_to_node(p->cmdarg_stack);
   n->locals = local_switch(p);
   n->body = NULL;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 static void
 defn_setup(parser_state *p, node *d, node *a, node *b)
 {
-  struct mrb_ast_def_node *n = def_node(d->cdr);
+  struct mrb_ast_def_node *n = def_node(d);
   node *locals = n->locals;
 
   n->locals = locals_node(p);
   p->cmdarg_stack = node_to_int(n->args);
-  n->args = a;
+  n->args = (struct mrb_ast_args *)a;
   n->body = b;
   local_resume(p, locals);
 }
@@ -1356,51 +1020,40 @@ new_sdef(parser_state *p, node *o, mrb_sym name)
 {
   void_expr_error(p, o);
 
-  size_t total_size = sizeof(struct mrb_ast_sdef_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_sdef_node *sdef_node = (struct mrb_ast_sdef_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&sdef_node->header, p, NODE_SDEF, class);
+  struct mrb_ast_sdef_node *sdef_node = (struct mrb_ast_sdef_node*)parser_palloc(p, sizeof(struct mrb_ast_sdef_node));
+  init_var_header(&sdef_node->header, p, NODE_SDEF);
   sdef_node->obj = o;
   sdef_node->name = name;
-  sdef_node->args = int_to_node(p->cmdarg_stack);
+  sdef_node->args = (struct mrb_ast_args *)int_to_node(p->cmdarg_stack);
   sdef_node->locals = local_switch(p);
   sdef_node->body = NULL;
-  return cons_head((node*)NODE_VARIABLE, (node*)sdef_node);
-}
-
-/* (:arg . sym) */
-static node*
-new_arg(parser_state *p, mrb_sym sym)
-{
-  return new_xvar(p, sym, NODE_ARG);
+  return (node*)sdef_node;
 }
 
 static void
 local_add_margs(parser_state *p, node *n)
 {
   while (n) {
-    if (node_to_type(n->car->car) == NODE_VARIABLE) {
-      if (VAR_NODE_TYPE(n->car->cdr) == NODE_MASGN) {
-        struct mrb_ast_masgn_node *masgn_n = (struct mrb_ast_masgn_node*)n->car->cdr;
-        node *lhs = masgn_n->lhs;
-        node *rhs = masgn_n->rhs;
+    if (get_node_type(n->car) == NODE_MASGN) {
+      struct mrb_ast_masgn_node *masgn_n = (struct mrb_ast_masgn_node*)n->car;
+      node *lhs = masgn_n->lhs;
+      node *rhs = masgn_n->rhs;
 
-        /* For parameter destructuring, rhs contains the locals */
-        if (rhs) {
-          node *t = rhs;
-          while (t) {
-            local_add_f(p, node_to_sym(t->car));
-            t = t->cdr;
-          }
+      /* For parameter destructuring, rhs contains the locals */
+      if (rhs) {
+        node *t = rhs;
+        while (t) {
+          local_add_f(p, node_to_sym(t->car));
+          t = t->cdr;
         }
+      }
 
-        /* Process nested destructuring in lhs */
-        if (lhs && lhs->car) {
-          local_add_margs(p, lhs->car);
-        }
-        if (lhs && lhs->cdr && lhs->cdr->cdr && lhs->cdr->cdr->car) {
-          local_add_margs(p, lhs->cdr->cdr->car);
-        }
+      /* Process nested destructuring in lhs */
+      if (lhs && lhs->car) {
+        local_add_margs(p, lhs->car);
+      }
+      if (lhs && lhs->cdr && lhs->cdr->cdr && lhs->cdr->cdr->car) {
+        local_add_margs(p, lhs->cdr->cdr->car);
       }
     }
     n = n->cdr;
@@ -1425,31 +1078,54 @@ local_add_lv(parser_state *p, node *lv)
 static node*
 new_args(parser_state *p, node *m, node *opt, mrb_sym rest, node *m2, node *tail)
 {
-  node *n;
-
   local_add_margs(p, m);
   local_add_margs(p, m2);
 
-  n = cons(m2, tail);
-  n = cons(sym_to_node(rest), n);
-  n = cons(opt, n);
+  /* Save original optional arguments before processing */
+  node *orig_opt = opt;
+
+  /* Process optional arguments (keep original side effects) */
   while (opt) {
     /* opt: (sym . (opt . lv)) -> (sym . opt) */
     local_add_lv(p, opt->car->cdr->cdr);
     opt->car->cdr = opt->car->cdr->car;
     opt = opt->cdr;
   }
-  return cons(m, n);
+
+  /* Allocate struct mrb_ast_args (no hdr) */
+  struct mrb_ast_args *args = (struct mrb_ast_args*)parser_palloc(p, sizeof(struct mrb_ast_args));
+
+  /* Initialize members */
+  args->mandatory_args = m;
+  args->optional_args = orig_opt;
+  args->rest_arg = rest;
+  args->post_mandatory_args = m2;
+
+  /* Deconstruct tail cons list: (kws . (kwrest . blk)) */
+  if (tail) {
+    args->keyword_args = (node*)tail->car;          /* kws */
+    args->kwrest_arg = (mrb_sym)(intptr_t)tail->cdr->car; /* kwrest */
+    args->block_arg = (mrb_sym)(intptr_t)tail->cdr->cdr;  /* blk */
+    cons_free(tail->cdr);
+    cons_free(tail);
+  }
+  else {
+    args->keyword_args = NULL;
+    args->kwrest_arg = 0;
+    args->block_arg = 0;
+  }
+
+  return (node*)args;
 }
 
 /* (:args_tail keywords rest_keywords_sym block_sym) */
 static node*
-new_args_tail(parser_state *p, node *kws, node *kwrest, mrb_sym blk)
+new_args_tail(parser_state *p, node *kws, mrb_sym kwrest, mrb_sym blk)
 {
   node *k;
 
-  if (kws || kwrest) {
-    local_add_kw(p, (kwrest && kwrest->cdr)? node_to_sym(kwrest->cdr) : 0);
+  if (kwrest) {
+    local_add_kw(p, kwrest);
   }
 
   local_add_blk(p);
@@ -1458,44 +1134,35 @@ new_args_tail(parser_state *p, node *kws, node *kwrest, mrb_sym blk)
   /* allocate register for keywords arguments */
   /* order is for Proc#parameters */
   for (k = kws; k; k = k->cdr) {
-    if (!k->car->cdr->cdr->car) { /* allocate required keywords */
-      local_add_f(p, node_to_sym(k->car->cdr->car));
+    if (!k->car->cdr) { /* allocate required keywords - simplified structure: (key . NULL) */
+      local_add_f(p, node_to_sym(k->car->car));
     }
   }
   for (k = kws; k; k = k->cdr) {
-    if (k->car->cdr->cdr->car) { /* allocate keywords with default */
-      local_add_lv(p, k->car->cdr->cdr->car->cdr);
-      k->car->cdr->cdr->car = k->car->cdr->cdr->car->car;
-      local_add_f(p, node_to_sym(k->car->cdr->car));
+    if (k->car->cdr) { /* allocate keywords with default - simplified structure: (key . value) */
+      local_add_lv(p, k->car->cdr->cdr);  /* value->cdr for default args */
+      k->car->cdr = k->car->cdr->car;    /* value->car for default args */
+      local_add_f(p, node_to_sym(k->car->car));
     }
   }
 
-  size_t total_size = sizeof(struct mrb_ast_args_tail_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_args_tail_node *n = (struct mrb_ast_args_tail_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_ARGS_TAIL, class);
-  n->keywords = kws;
-  n->kwrest = kwrest;
-  n->block = blk;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  /* Return cons list: (keyword . (kwrest . blk)) */
+  return cons(kws, cons(sym_to_node(kwrest), sym_to_node(blk)));
 }
 
-/* (:kw_arg kw_sym def_arg) */
+/* (kw_sym . def_arg) - simplified from NODE_KW_ARG wrapper */
 static node*
 new_kw_arg(parser_state *p, mrb_sym kw, node *def_arg)
 {
   mrb_assert(kw);
-  return list3((node*)NODE_KW_ARG, sym_to_node(kw), def_arg);
+  return cons(sym_to_node(kw), def_arg);
 }
 
 /* (:kw_rest_args . a) */
 static node*
 new_kw_rest_args(parser_state *p, mrb_sym sym)
 {
-  return cons_head((node*)NODE_KW_REST_ARGS, sym_to_node(sym));
+  return sym_to_node(intern_op(pow));  /* Use ** symbol as direct marker */
 }
 
 static node*
@@ -1505,20 +1172,17 @@ new_args_dots(parser_state *p, node *m)
   mrb_sym k = intern_op(pow);
   mrb_sym b = intern_op(and);
   local_add_f(p, r);
-  return new_args(p, m, 0, r, 0,
-                  new_args_tail(p, 0, new_kw_rest_args(p, k), b));
+  return new_args(p, m, 0, r, 0, new_args_tail(p, NULL, k, b));
 }
 
 /* (:block_arg . a) */
 static node*
 new_block_arg(parser_state *p, node *a)
 {
-  size_t total_size = sizeof(struct mrb_ast_block_arg_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_block_arg_node *block_arg_node = (struct mrb_ast_block_arg_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&block_arg_node->hdr, p, NODE_BLOCK_ARG, class);
+  struct mrb_ast_block_arg_node *block_arg_node = (struct mrb_ast_block_arg_node*)parser_palloc(p, sizeof(struct mrb_ast_block_arg_node));
+  init_var_header(&block_arg_node->header, p, NODE_BLOCK_ARG);
   block_arg_node->value = a;
-  return cons_head((node*)NODE_VARIABLE, (node*)block_arg_node);
+  return (node*)block_arg_node;
 }
 
 static node*
@@ -1528,8 +1192,10 @@ setup_numparams(parser_state *p, node *a)
   if (nvars > 0) {
     int i;
     mrb_sym sym;
-    // m || opt || rest || tail
-    if (a && (a->car || (a->cdr && a->cdr->car) || (a->cdr->cdr && a->cdr->cdr->car) || (a->cdr->cdr->cdr->cdr && a->cdr->cdr->cdr->cdr->car))) {
+    // Check if any arguments are already defined
+    struct mrb_ast_args *args = (struct mrb_ast_args *)a;
+    if (a && (args->mandatory_args || args->optional_args || args->rest_arg ||
+              args->post_mandatory_args || args->keyword_args || args->kwrest_arg)) {
       yyerror(NULL, p, "ordinary parameter is defined");
     }
     else if (p->locals) {
@@ -1542,7 +1208,7 @@ setup_numparams(parser_state *p, node *a)
         buf[1] = i+'0';
         buf[2] = '\0';
         sym = intern_cstr(buf);
-        args = cons(new_arg(p, sym), args);
+        args = cons(new_lvar(p, sym), args);
         p->locals->car = cons(sym_to_node(sym), p->locals->car);
       }
       a = new_args(p, args, 0, 0, 0, 0);
@@ -1555,35 +1221,25 @@ setup_numparams(parser_state *p, node *a)
 static node*
 new_block(parser_state *p, node *a, node *b)
 {
-  a = setup_numparams(p, a);
-
-  size_t total_size = sizeof(struct mrb_ast_block_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_block_node *n = (struct mrb_ast_block_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_BLOCK, class);
+  a = setup_numparams(p, a);  struct mrb_ast_block_node *n = (struct mrb_ast_block_node*)parser_palloc(p, sizeof(struct mrb_ast_block_node));
+  init_var_header(&n->header, p, NODE_BLOCK);
   n->locals = locals_node(p);
-  n->args = a;
+  n->args = (struct mrb_ast_args *)a;
   n->body = b;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:lambda arg body) */
 static node*
 new_lambda(parser_state *p, node *a, node *b)
 {
-  a = setup_numparams(p, a);
-
-  size_t total_size = sizeof(struct mrb_ast_lambda_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_lambda_node *lambda_node = (struct mrb_ast_lambda_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&lambda_node->hdr, p, NODE_LAMBDA, class);
+  a = setup_numparams(p, a);  struct mrb_ast_lambda_node *lambda_node = (struct mrb_ast_lambda_node*)parser_palloc(p, sizeof(struct mrb_ast_lambda_node));
+  init_var_header(&lambda_node->header, p, NODE_LAMBDA);
   lambda_node->locals = locals_node(p);
-  lambda_node->args = a;
+  lambda_node->args = (struct mrb_ast_args *)a;
   lambda_node->body = b;
-  return cons_head((node*)NODE_VARIABLE, (node*)lambda_node);
+  return (node*)lambda_node;
 }
 
 /* (:asgn lhs rhs) */
@@ -1592,16 +1248,12 @@ new_asgn(parser_state *p, node *a, node *b)
 {
   void_expr_error(p, b);
 
-  size_t total_size = sizeof(struct mrb_ast_asgn_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_asgn_node *n = (struct mrb_ast_asgn_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_ASGN, class);
+  struct mrb_ast_asgn_node *n = (struct mrb_ast_asgn_node*)parser_palloc(p, sizeof(struct mrb_ast_asgn_node));
+  init_var_header(&n->header, p, NODE_ASGN);
   n->lhs = a;
   n->rhs = b;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:masgn mlhs=(pre rest post)  mrhs) */
@@ -1610,32 +1262,24 @@ new_masgn(parser_state *p, node *a, node *b)
 {
   void_expr_error(p, b);
 
-  size_t total_size = sizeof(struct mrb_ast_masgn_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_masgn_node *n = (struct mrb_ast_masgn_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_MASGN, class);
+  struct mrb_ast_masgn_node *n = (struct mrb_ast_masgn_node*)parser_palloc(p, sizeof(struct mrb_ast_masgn_node));
+  init_var_header(&n->header, p, NODE_MASGN);
   n->lhs = a;
   n->rhs = b;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:masgn mlhs mrhs) no check */
 static node*
 new_masgn_param(parser_state *p, node *a, node *b)
 {
-  size_t total_size = sizeof(struct mrb_ast_masgn_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_masgn_node *n = (struct mrb_ast_masgn_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_MASGN, class);
+  struct mrb_ast_masgn_node *n = (struct mrb_ast_masgn_node*)parser_palloc(p, sizeof(struct mrb_ast_masgn_node));
+  init_var_header(&n->header, p, NODE_MASGN);
   n->lhs = a;
   n->rhs = b;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:asgn lhs rhs) */
@@ -1644,27 +1288,24 @@ new_op_asgn(parser_state *p, node *a, mrb_sym op, node *b)
 {
   void_expr_error(p, b);
 
-  size_t total_size = sizeof(struct mrb_ast_op_asgn_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_op_asgn_node *n = (struct mrb_ast_op_asgn_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->header, p, NODE_OP_ASGN, class);
+  struct mrb_ast_op_asgn_node *n = (struct mrb_ast_op_asgn_node*)parser_palloc(p, sizeof(struct mrb_ast_op_asgn_node));
+  init_var_header(&n->header, p, NODE_OP_ASGN);
   n->lhs = a;
-  n->operator = op;
+  n->op = op;
   n->rhs = b;
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 static node*
 new_int_n(parser_state *p, int32_t val)
 {
   size_t size = sizeof(struct mrb_ast_int_node);
-  enum mrb_ast_size_class class = size_to_class(size);
-  struct mrb_ast_int_node *n = (struct mrb_ast_int_node*)parser_alloc_var(p, size, class);
+  struct mrb_ast_int_node *n = (struct mrb_ast_int_node*)parser_palloc(p, size);
 
-  init_var_header(&n->header, p, NODE_INT, class);
+  init_var_header(&n->header, p, NODE_INT);
   n->value = val;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 static node*
@@ -1768,14 +1409,13 @@ new_int(parser_state *p, const char *s, int base, int suffix)
   else {
     /* Big integer - create NODE_BIGINT */
     size_t size = sizeof(struct mrb_ast_bigint_node);
-    enum mrb_ast_size_class class = size_to_class(size);
-    struct mrb_ast_bigint_node *n = (struct mrb_ast_bigint_node*)parser_alloc_var(p, size, class);
+    struct mrb_ast_bigint_node *n = (struct mrb_ast_bigint_node*)parser_palloc(p, size);
 
-    init_var_header(&n->header, p, NODE_BIGINT, class);
+    init_var_header(&n->header, p, NODE_BIGINT);
     n->string = strdup(s);
     n->base = base;
 
-    result = cons_head((node*)NODE_VARIABLE, (node*)n);
+    result = (node*)n;
   }
 
   /* Handle suffix modifiers */
@@ -1794,15 +1434,11 @@ new_int(parser_state *p, const char *s, int base, int suffix)
 static node*
 new_float(parser_state *p, const char *s, int suffix)
 {
-  size_t total_size = sizeof(struct mrb_ast_float_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_float_node *n = (struct mrb_ast_float_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_FLOAT, class);
+  struct mrb_ast_float_node *n = (struct mrb_ast_float_node*)parser_palloc(p, sizeof(struct mrb_ast_float_node));
+  init_var_header(&n->header, p, NODE_FLOAT);
   n->value = strdup(s);
 
-  node* result = cons_head((node*)NODE_VARIABLE, (node*)n);
+  node* result = (node*)n;
 
   if (suffix & NUM_SUFFIX_R) {
     result = new_rational(p, result);
@@ -1819,87 +1455,71 @@ new_float(parser_state *p, const char *s, int suffix)
 static node*
 new_str(parser_state *p, node *a)
 {
-  size_t total_size = sizeof(struct mrb_ast_str_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_str_node *n = (struct mrb_ast_str_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_STR, class);
+  struct mrb_ast_str_node *n = (struct mrb_ast_str_node*)parser_palloc(p, sizeof(struct mrb_ast_str_node));
+  init_var_header(&n->header, p, NODE_STR);
   n->list = a;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:xstr . a) */
 static node*
 new_xstr(parser_state *p, node *a)
 {
-  size_t total_size = sizeof(struct mrb_ast_xstr_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_xstr_node *n = (struct mrb_ast_xstr_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->hdr, p, NODE_XSTR, class);
+  struct mrb_ast_xstr_node *n = (struct mrb_ast_xstr_node*)parser_palloc(p, sizeof(struct mrb_ast_xstr_node));
+  init_var_header(&n->header, p, NODE_XSTR);
   n->list = a;
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:dsym . a) */
 static node*
 new_dsym(parser_state *p, node *a)
 {
-  size_t total_size = sizeof(struct mrb_ast_dsym_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_dsym_node *n = (struct mrb_ast_dsym_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->hdr, p, NODE_DSYM, class);
+  struct mrb_ast_dsym_node *n = (struct mrb_ast_dsym_node*)parser_palloc(p, sizeof(struct mrb_ast_dsym_node));
+  init_var_header(&n->header, p, NODE_DSYM);
   n->list = a;
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
-/* (:dregx . (list . (flags . encoding))) */
+/* (:regx . (list . (flags . encoding))) */
 static node*
-new_dregx(parser_state *p, node *list, const char *flags, const char *encoding)
+new_regx(parser_state *p, node *list, const char *flags, const char *encoding)
 {
-  size_t total_size = sizeof(struct mrb_ast_dregx_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_dregx_node *n = (struct mrb_ast_dregx_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->hdr, p, NODE_DREGX, class);
+  struct mrb_ast_regx_node *n = (struct mrb_ast_regx_node*)parser_palloc(p, sizeof(struct mrb_ast_regx_node));
+  init_var_header(&n->header, p, NODE_REGX);
   n->list = list;
   n->flags = flags;
   n->encoding = encoding;
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 /* (:backref . n) */
 static node*
 new_back_ref(parser_state *p, int n)
 {
-  size_t total_size = sizeof(struct mrb_ast_back_ref_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_back_ref_node *backref_node = (struct mrb_ast_back_ref_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&backref_node->hdr, p, NODE_BACK_REF, class);
+  struct mrb_ast_back_ref_node *backref_node = (struct mrb_ast_back_ref_node*)parser_palloc(p, sizeof(struct mrb_ast_back_ref_node));
+  init_var_header(&backref_node->header, p, NODE_BACK_REF);
   backref_node->type = n;
-  return cons_head((node*)NODE_VARIABLE, (node*)backref_node);
+  return (node*)backref_node;
 }
 
 /* (:nthref . n) */
 static node*
 new_nth_ref(parser_state *p, int n)
 {
-  size_t total_size = sizeof(struct mrb_ast_nth_ref_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_nth_ref_node *nthref_node = (struct mrb_ast_nth_ref_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&nthref_node->hdr, p, NODE_NTH_REF, class);
+  struct mrb_ast_nth_ref_node *nthref_node = (struct mrb_ast_nth_ref_node*)parser_palloc(p, sizeof(struct mrb_ast_nth_ref_node));
+  init_var_header(&nthref_node->header, p, NODE_NTH_REF);
   nthref_node->nth = n;
-  return cons_head((node*)NODE_VARIABLE, (node*)nthref_node);
+  return (node*)nthref_node;
 }
 
 /* (:heredoc . a) */
 static node*
 new_heredoc(parser_state *p, struct mrb_parser_heredoc_info **infop)
 {
-  size_t total_size = sizeof(struct mrb_ast_heredoc_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_heredoc_node *n = (struct mrb_ast_heredoc_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->hdr, p, NODE_HEREDOC, class);
+  struct mrb_ast_heredoc_node *n = (struct mrb_ast_heredoc_node*)parser_palloc(p, sizeof(struct mrb_ast_heredoc_node));
+  init_var_header(&n->header, p, NODE_HEREDOC);
 
   /* Initialize embedded heredoc info struct */
   n->info.allow_indent = FALSE;
@@ -1915,7 +1535,7 @@ new_heredoc(parser_state *p, struct mrb_parser_heredoc_info **infop)
   /* Return pointer to embedded info if requested */
   *infop = &n->info;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  return (node*)n;
 }
 
 static void
@@ -1954,24 +1574,20 @@ new_str_empty(parser_state *p)
 static node*
 new_words(parser_state *p, node *a)
 {
-  size_t total_size = sizeof(struct mrb_ast_words_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_words_node *words_node = (struct mrb_ast_words_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&words_node->hdr, p, NODE_WORDS, class);
+  struct mrb_ast_words_node *words_node = (struct mrb_ast_words_node*)parser_palloc(p, sizeof(struct mrb_ast_words_node));
+  init_var_header(&words_node->header, p, NODE_WORDS);
   words_node->args = a;
-  return cons_head((node*)NODE_VARIABLE, (node*)words_node);
+  return (node*)words_node;
 }
 
 /* (:symbols . a) */
 static node*
 new_symbols(parser_state *p, node *a)
 {
-  size_t total_size = sizeof(struct mrb_ast_symbols_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_symbols_node *symbols_node = (struct mrb_ast_symbols_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&symbols_node->hdr, p, NODE_SYMBOLS, class);
+  struct mrb_ast_symbols_node *symbols_node = (struct mrb_ast_symbols_node*)parser_palloc(p, sizeof(struct mrb_ast_symbols_node));
+  init_var_header(&symbols_node->header, p, NODE_SYMBOLS);
   symbols_node->args = a;
-  return cons_head((node*)NODE_VARIABLE, (node*)symbols_node);
+  return (node*)symbols_node;
 }
 
 /* xxx ----------------------------- */
@@ -1995,17 +1611,20 @@ static void
 args_with_block(parser_state *p, node *a, node *b)
 {
   if (b) {
-    if (a->cdr && a->cdr->cdr) {
+    /* Handle callargs structure - direct casting like new_args() */
+    struct mrb_ast_callargs *callargs = (struct mrb_ast_callargs*)a;
+    if (callargs->block_arg) {
       yyerror(NULL, p, "both block arg and actual block given");
     }
-    a->cdr->cdr = b;
+    callargs->block_arg = b;
   }
 }
 
 static void
 endless_method_name(parser_state *p, node *defn)
 {
-  mrb_sym sym = node_to_sym(defn->cdr->car);
+  struct mrb_ast_def_node *def = (struct mrb_ast_def_node*)defn;
+  mrb_sym sym = def->name;
   mrb_int len;
   const char *name = mrb_sym_name_len(p->mrb, sym, &len);
 
@@ -2020,62 +1639,80 @@ endless_method_name(parser_state *p, node *defn)
 static void
 call_with_block(parser_state *p, node *a, node *b)
 {
-  node *n;
+  if (!a) return;
 
-  switch (node_to_type(a->car)) {
-  case NODE_VARIABLE:
-    /* Handle variable-sized nodes wrapped in NODE_VARIABLE */
+  /* Handle direct variable-sized nodes */
+  struct mrb_ast_var_header *header = (struct mrb_ast_var_header*)a;
+
+  enum node_type var_type = (enum node_type)header->node_type;
+  switch (var_type) {
+  case NODE_SUPER:
+  case NODE_ZSUPER:
+    /* For variable-sized super/zsuper nodes, update the args field directly */
     {
-      enum node_type var_type = VAR_NODE_TYPE(a->cdr);
-      if (var_type == NODE_SUPER || var_type == NODE_ZSUPER) {
-        /* For variable-sized super/zsuper nodes, we need to update the args field directly */
-        struct mrb_ast_super_node *super_n = super_node(a->cdr);
-        if (!super_n->args) {
-          super_n->args = new_callargs(p, 0, 0, b);
-        }
-        else {
-          args_with_block(p, super_n->args, b);
-        }
-        return;
+      struct mrb_ast_super_node *super_n = super_node(a);
+      if (!super_n->args) {
+        super_n->args = new_callargs(p, 0, 0, b);
       }
-      else if (var_type == NODE_YIELD) {
-        /* Variable-sized yield nodes should generate an error when given a block */
-        yyerror(NULL, p, "block given to yield");
-        return;
-      }
-      else if (var_type == NODE_RETURN) {
-        /* Variable-sized return nodes - recursively call with args */
-        struct mrb_ast_return_node *return_n = return_node(a->cdr);
-        if (return_n->args == NULL) return;
-        call_with_block(p, return_n->args, b);
-        return;
-      }
-      else if (var_type == NODE_BREAK) {
-        /* Variable-sized break nodes - recursively call with value */
-        struct mrb_ast_break_node *break_n = (struct mrb_ast_break_node*)a->cdr;
-        if (break_n->value == NULL) return;
-        call_with_block(p, break_n->value, b);
-        return;
-      }
-      else if (var_type == NODE_NEXT) {
-        /* Variable-sized next nodes - recursively call with value */
-        struct mrb_ast_next_node *next_n = (struct mrb_ast_next_node*)a->cdr;
-        if (next_n->value == NULL) return;
-        call_with_block(p, next_n->value, b);
-        return;
+      else {
+        args_with_block(p, super_n->args, b);
       }
     }
-    /* For other variable-sized nodes, fall through to default */
+    break;
+  case NODE_YIELD:
+    /* Variable-sized yield nodes should generate an error when given a block */
+    yyerror(NULL, p, "block given to yield");
+    break;
+  case NODE_RETURN:
+    /* Variable-sized return nodes - recursively call with args */
+    {
+      struct mrb_ast_return_node *return_n = return_node(a);
+      if (return_n->args != NULL) {
+        call_with_block(p, return_n->args, b);
+      }
+    }
+    break;
+  case NODE_BREAK:
+    /* Variable-sized break nodes - recursively call with value */
+    {
+      struct mrb_ast_break_node *break_n = (struct mrb_ast_break_node*)a;
+      if (break_n->value != NULL) {
+        call_with_block(p, break_n->value, b);
+      }
+    }
+    break;
+  case NODE_NEXT:
+    /* Variable-sized next nodes - recursively call with value */
+    {
+      struct mrb_ast_next_node *next_n = (struct mrb_ast_next_node*)a;
+      if (next_n->value != NULL) {
+        call_with_block(p, next_n->value, b);
+      }
+    }
     break;
   case NODE_CALL:
-  case NODE_FCALL:
-  case NODE_SCALL:
-    /* (NODE_CALL recv mid (args kw . blk)) */
-    n = a->cdr->cdr->cdr; /* (args kw . blk) */
-    if (!n->car) n->car = new_callargs(p, 0, 0, b);
-    else args_with_block(p, n->car, b);
+    /* Variable-sized call nodes - add block to existing args */
+    {
+      struct mrb_ast_call_node *call = call_node(a);
+
+      if (call->args && CALLARGS_NODE_BLOCK(call->args)) {
+        yyerror(NULL, p, "both block arg and actual block given");
+        return;
+      }
+
+      /* Use existing args and add block */
+      if (call->args) {
+        /* Modify existing callargs structure to add block */
+        args_with_block(p, call->args, b);
+      }
+      else {
+        /* Create new callargs with just the block */
+        call->args = new_callargs(p, NULL, NULL, b);
+      }
+    }
     break;
   default:
+    /* For other variable-sized nodes, do nothing */
     break;
   }
 }
@@ -2083,12 +1720,10 @@ call_with_block(parser_state *p, node *a, node *b)
 static node*
 new_negate(parser_state *p, node *n)
 {
-  size_t total_size = sizeof(struct mrb_ast_negate_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_negate_node *negate_node = (struct mrb_ast_negate_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&negate_node->hdr, p, NODE_NEGATE, class);
+  struct mrb_ast_negate_node *negate_node = (struct mrb_ast_negate_node*)parser_palloc(p, sizeof(struct mrb_ast_negate_node));
+  init_var_header(&negate_node->header, p, NODE_NEGATE);
   negate_node->operand = n;
-  return cons_head((node*)NODE_VARIABLE, (node*)negate_node);
+  return (node*)negate_node;
 }
 
 static node*
@@ -2100,44 +1735,44 @@ cond(node *n)
 static node*
 ret_args(parser_state *p, node *n)
 {
-  if (n->cdr->cdr) {
+  /* Handle callargs structure - direct casting like new_args() */
+  struct mrb_ast_callargs *callargs = (struct mrb_ast_callargs*)n;
+  if (callargs->block_arg) {
     yyerror(NULL, p, "block argument should not be given");
     return NULL;
   }
-  if (!n->car) return NULL;
-  if (!n->car->cdr) return n->car->car;
-  return new_array(p, n->car);
+  if (!callargs->regular_args) return NULL;
+  if (!callargs->regular_args->cdr) return callargs->regular_args->car;
+  return new_array(p, callargs->regular_args);
 }
 
 static void
 assignable(parser_state *p, node *lhs)
 {
-  if (node_to_int(lhs->car) == NODE_VARIABLE) {
-    node *var_node = lhs->cdr;
-    switch (VAR_NODE_TYPE(var_node)) {
-    case NODE_LVAR:
-      local_add(p, VAR_NODE_SYMBOL(var_node));
-      break;
-    case NODE_CONST:
-      if (p->in_def)
-        yyerror(NULL, p, "dynamic constant assignment");
-      break;
-    }
+  switch (get_node_type(lhs)) {
+  case NODE_LVAR:
+    local_add(p, VAR_NODE_SYMBOL(lhs));
+    break;
+  case NODE_CONST:
+    if (p->in_def)
+      yyerror(NULL, p, "dynamic constant assignment");
+    break;
+  default:
+    /* Other node types don't need special handling in assignable */
+    break;
   }
 }
 
 static node*
 var_reference(parser_state *p, node *lhs)
 {
-  if (node_to_int(lhs->car) == NODE_VARIABLE) {
-    node *var_node = lhs->cdr;
-    if (VAR_NODE_TYPE(var_node) == NODE_LVAR) {
-      mrb_sym sym = VAR_NODE_SYMBOL(var_node);
-      if (!local_var_p(p, sym)) {
-        node *n = new_fcall(p, sym, 0);
-        /* Don't free variable-sized nodes - they're managed by the parser allocator */
-        return n;
-      }
+  /* Check if this is a variable-sized node */
+  if (node_type_p(lhs, NODE_LVAR)) {
+    mrb_sym sym = VAR_NODE_SYMBOL(lhs);
+    if (!local_var_p(p, sym)) {
+      node *n = new_fcall(p, sym, 0);
+      /* Don't free variable-sized nodes - they're managed by the parser allocator */
+      return n;
     }
   }
   return lhs;
@@ -2149,7 +1784,7 @@ label_reference(parser_state *p, mrb_sym sym)
   const char *name = mrb_sym_name(p->mrb, sym);
 
   if (local_var_p(p, sym)) {
-    return new_xvar(p, sym, NODE_LVAR);
+    return new_lvar(p, sym);
   }
   else if (ISUPPER(name[0])) {
     return new_const(p, sym);
@@ -2211,9 +1846,9 @@ parsing_heredoc_info(parser_state *p)
   node *nd = p->parsing_heredoc;
   if (nd == NULL) return NULL;
   /* mrb_assert(nd->car->car == NODE_HEREDOC); */
-  if (nd->car->car == (node*)NODE_VARIABLE) {
+  if (get_node_type(nd->car) == NODE_HEREDOC) {
     /* Variable-sized heredoc node - return address of embedded info struct */
-    struct mrb_ast_heredoc_node *heredoc = heredoc_node(NODE_VAR_NODE_PTR(nd->car));
+    struct mrb_ast_heredoc_node *heredoc = (struct mrb_ast_heredoc_node*)nd->car;
     return &heredoc->info;
   }
   return (parser_heredoc_info*)nd->car->cdr;
@@ -2253,12 +1888,12 @@ prohibit_literals(parser_state *p, node *n)
     yyerror(NULL, p, "can't define singleton method for ().");
   }
   else {
-    switch (node_to_type(n->car)) {
+    enum node_type nt = get_node_type(n);
+    switch (nt) {
     case NODE_INT:
     case NODE_STR:
     case NODE_XSTR:
-    case NODE_DREGX:
-    case NODE_MATCH:
+    case NODE_REGX:
     case NODE_FLOAT:
     case NODE_ARRAY:
     case NODE_HEREDOC:
@@ -2377,9 +2012,9 @@ prohibit_literals(parser_state *p, node *n)
 %type <nd> heredoc words symbols
 %type <num> call_op call_op2     /* 0:'&.', 1:'.', 2:'::' */
 
-%type <nd> args_tail opt_args_tail f_kwarg f_kw f_kwrest
+%type <nd> args_tail opt_args_tail f_kwarg f_kw
 %type <nd> f_block_kwarg f_block_kw block_args_tail opt_block_args_tail
-%type <id> f_label
+%type <id> f_label f_kwrest
 
 %token tUPLUS             "unary plus"
 %token tUMINUS            "unary minus"
@@ -2541,7 +2176,7 @@ stmts           : none
                 | stmts terms stmt
                     {
                       /* Update the cons-list inside the existing variable-sized node */
-                      STMTS_NODE_STMTS($1->cdr) = push(STMTS_NODE_STMTS($1->cdr), newline_node($3));
+                      STMTS_NODE_STMTS($1) = push(STMTS_NODE_STMTS($1), newline_node($3));
                       $$ = $1;
                     }
                 | error stmt
@@ -2612,7 +2247,7 @@ stmt            : keyword_alias fsym {p->lstate = EXPR_FNAME;} fsym
                     }
                 | arg tASSOC tIDENTIFIER
                     {
-                      node *lhs = new_xvar(p, $3, NODE_LVAR);
+                      node *lhs = new_lvar(p, $3);
                       assignable(p, lhs);
                       $$ = new_asgn(p, lhs, $1);
                     }
@@ -3332,7 +2967,7 @@ aref_args       : none
                     }
                 | assocs trailer
                     {
-                      $$ = cons(new_kw_hash(p, $1), 0);
+                      $$ = cons(new_hash(p, $1), 0);
                     }
                 ;
 
@@ -3356,9 +2991,9 @@ paren_args      : '(' opt_call_args ')'
                       mrb_sym r = intern_op(mul);
                       mrb_sym k = intern_op(pow);
                       mrb_sym b = intern_op(and);
-                      $$ = new_callargs(p, push($2, new_splat(p, new_xvar(p, r, NODE_LVAR))),
-                                        new_kw_hash(p, list1(cons(new_kw_rest_args(p, 0), new_xvar(p, k, NODE_LVAR)))),
-                                        new_block_arg(p, new_xvar(p, b, NODE_LVAR)));
+                      $$ = new_callargs(p, push($2, new_splat(p, new_lvar(p, r))),
+                                        list1(cons(new_kw_rest_args(p, 0), new_lvar(p, k))),
+                                        new_block_arg(p, new_lvar(p, b)));
                     }
                 | '(' tBDOT3 rparen
                     {
@@ -3366,9 +3001,9 @@ paren_args      : '(' opt_call_args ')'
                       mrb_sym k = intern_op(pow);
                       mrb_sym b = intern_op(and);
                       if (local_var_p(p, r) && local_var_p(p, k) && local_var_p(p, b)) {
-                        $$ = new_callargs(p, list1(new_splat(p, new_xvar(p, r, NODE_LVAR))),
-                                          new_kw_hash(p, list1(cons(new_kw_rest_args(p, 0), new_xvar(p, k, NODE_LVAR)))),
-                                          new_block_arg(p, new_xvar(p, b, NODE_LVAR)));
+                        $$ = new_callargs(p, list1(new_splat(p, new_lvar(p, r))),
+                                          list1(cons(new_kw_rest_args(p, 0), new_lvar(p, k))),
+                                          new_block_arg(p, new_lvar(p, b)));
                       }
                       else {
                         yyerror(&@1, p, "unexpected argument forwarding ...");
@@ -3389,11 +3024,11 @@ opt_call_args   : none
                     }
                 | args comma assocs comma
                     {
-                      $$ = new_callargs(p,$1,new_kw_hash(p,$3),0);
+                      $$ = new_callargs(p,$1,$3,0);
                     }
                 | assocs comma
                     {
-                      $$ = new_callargs(p,0,new_kw_hash(p,$1),0);
+                      $$ = new_callargs(p,0,$1,0);
                     }
                 ;
 
@@ -3408,11 +3043,11 @@ call_args       : command
                     }
                 | assocs opt_block_arg
                     {
-                      $$ = new_callargs(p, 0, new_kw_hash(p, $1), $2);
+                      $$ = new_callargs(p, 0, $1, $2);
                     }
                 | args comma assocs opt_block_arg
                     {
-                      $$ = new_callargs(p, $1, new_kw_hash(p, $3), $4);
+                      $$ = new_callargs(p, $1, $3, $4);
                     }
                 | block_arg
                     {
@@ -3461,7 +3096,7 @@ args            : arg
                     }
                 | tSTAR
                     {
-                      $$ = list1(new_splat(p, new_xvar(p, intern_op(mul), NODE_LVAR)));
+                      $$ = list1(new_splat(p, new_lvar(p, intern_op(mul))));
                     }
                 | tSTAR arg
                     {
@@ -3474,7 +3109,7 @@ args            : arg
                     }
                 | args comma tSTAR
                     {
-                      $$ = push($1, new_splat(p, new_xvar(p, intern_op(mul), NODE_LVAR)));
+                      $$ = push($1, new_splat(p, new_lvar(p, intern_op(mul))));
                     }
                 | args comma tSTAR arg
                     {
@@ -3794,11 +3429,11 @@ f_margs         : f_arg
                     }
                 | f_arg ',' tSTAR f_norm_arg
                     {
-                      $$ = list3($1, new_arg(p, $4), 0);
+                      $$ = list3($1, new_lvar(p, $4), 0);
                     }
                 | f_arg ',' tSTAR f_norm_arg ',' f_arg
                     {
-                      $$ = list3($1, new_arg(p, $4), $6);
+                      $$ = list3($1, new_lvar(p, $4), $6);
                     }
                 | f_arg ',' tSTAR
                     {
@@ -3811,11 +3446,11 @@ f_margs         : f_arg
                     }
                 | tSTAR f_norm_arg
                     {
-                      $$ = list3(0, new_arg(p, $2), 0);
+                      $$ = list3(0, new_lvar(p, $2), 0);
                     }
                 | tSTAR f_norm_arg ',' f_arg
                     {
-                      $$ = list3(0, new_arg(p, $2), $4);
+                      $$ = list3(0, new_lvar(p, $2), $4);
                     }
                 | tSTAR
                     {
@@ -4234,7 +3869,7 @@ regexp          : tREGEXP_BEG tREGEXP
                       const char *encoding = (const char*)data->cdr->cdr;
                       /* Use data->car directly as pattern_list: (len . pattern) */
                       node *pattern_list = cons(data->car, (node*)NULL);
-                      $$ = new_dregx(p, pattern_list, flags, encoding);
+                      $$ = new_regx(p, pattern_list, flags, encoding);
                     }
                 | tREGEXP_BEG string_rep tREGEXP
                     {
@@ -4243,7 +3878,7 @@ regexp          : tREGEXP_BEG tREGEXP
                       const char *encoding = (const char*)data->cdr->cdr;
                       /* Append the pattern from $3->car to the string list $2 */
                       node *complete_list = push($2, data->car);
-                      $$ = new_dregx(p, complete_list, flags, encoding);
+                      $$ = new_regx(p, complete_list, flags, encoding);
                     }
                 ;
 
@@ -4373,19 +4008,19 @@ numeric         : tINTEGER
 
 variable        : tIDENTIFIER
                     {
-                      $$ = new_xvar(p, $1, NODE_LVAR);
+                      $$ = new_lvar(p, $1);
                     }
                 | tIVAR
                     {
-                      $$ = new_xvar(p, $1, NODE_IVAR);
+                      $$ = new_ivar(p, $1);
                     }
                 | tGVAR
                     {
-                      $$ = new_xvar(p, $1, NODE_GVAR);
+                      $$ = new_gvar(p, $1);
                     }
                 | tCVAR
                     {
-                      $$ = new_xvar(p, $1, NODE_CVAR);
+                      $$ = new_cvar(p, $1);
                     }
                 | tCONSTANT
                     {
@@ -4570,11 +4205,11 @@ kwrest_mark     : tPOW
 
 f_kwrest        : kwrest_mark tIDENTIFIER
                     {
-                      $$ = new_kw_rest_args(p, $2);
+                      $$ = $2;
                     }
                 | kwrest_mark
                     {
-                      $$ = new_kw_rest_args(p, 0);
+                      $$ = intern_op(pow);
                     }
                 ;
 
@@ -4709,7 +4344,7 @@ f_norm_arg      : f_bad_arg
 
 f_arg_item      : f_norm_arg
                     {
-                      $$ = new_arg(p, $1);
+                      $$ = new_lvar(p, $1);
                     }
                 | tLPAREN
                     {
@@ -4895,7 +4530,7 @@ assoc           : arg tASSOC arg
                     }
                 | tDSTAR
                     {
-                      $$ = cons(new_kw_rest_args(p, 0), new_xvar(p, intern_op(pow), NODE_LVAR));
+                      $$ = cons(new_kw_rest_args(p, 0), new_lvar(p, intern_op(pow)));
                     }
                 ;
 
@@ -5076,45 +4711,56 @@ backref_error(parser_state *p, node *n)
 static void
 void_expr_error(parser_state *p, node *n)
 {
-  int c;
-
   if (n == NULL) return;
-  c = node_to_int(n->car);
-  switch (c) {
-  case NODE_VARIABLE:
+
+  /* Check if this is a variable-sized node first */
+  struct mrb_ast_var_header *header = (struct mrb_ast_var_header*)n;
+  if (header) {
     /* Handle variable-sized nodes */
-    switch (VAR_NODE_TYPE(n->cdr)) {
+    switch ((enum node_type)header->node_type) {
     case NODE_BREAK:
     case NODE_RETURN:
     case NODE_NEXT:
     case NODE_REDO:
     case NODE_RETRY:
       yyerror(NULL, p, "void value expression");
-      break;
+      return;
     case NODE_AND:
     case NODE_OR:
       {
-        struct mrb_ast_and_node *and_n = (struct mrb_ast_and_node*)n->cdr;
+        struct mrb_ast_and_node *and_n = (struct mrb_ast_and_node*)n;
         void_expr_error(p, (node*)and_n->left);
         void_expr_error(p, (node*)and_n->right);
       }
-      break;
-    default:
-      break;
-    }
-    break;
-  case NODE_STMTS:
-  case NODE_BEGIN:
-    if (n->cdr) {
-      while (n->cdr) {
-        n = n->cdr;
+      return;
+    case NODE_STMTS:
+      {
+        struct mrb_ast_stmts_node *stmts = (struct mrb_ast_stmts_node*)n;
+        node *last = stmts->stmts;
+        if (last) {
+          /* Find the last statement in the cons list */
+          while (last->cdr) {
+            last = last->cdr;
+          }
+          void_expr_error(p, last->car);
+        }
       }
-      void_expr_error(p, n->car);
+      return;
+    case NODE_BEGIN:
+      {
+        struct mrb_ast_begin_node *begin_n = (struct mrb_ast_begin_node*)n;
+        if (begin_n->body) {
+          void_expr_error(p, (node*)begin_n->body);
+        }
+      }
+      return;
+    default:
+      /* Other variable-sized nodes are OK */
+      return;
     }
-    break;
-  default:
-    break;
   }
+
+  /* Should not reach here - all nodes should be variable-sized now */
 }
 
 static void pushback(parser_state *p, int c);
@@ -5276,7 +4922,7 @@ skips(parser_state *p, const char *s)
       }
       return TRUE;
     }
-    else{
+    else {
       s--;
     }
   }
@@ -7410,7 +7056,6 @@ parser_init_cxt(parser_state *p, mrb_ccontext *cxt)
   p->no_optimize = cxt->no_optimize;
   p->no_ext_ops = cxt->no_ext_ops;
   p->upper = cxt->upper;
-  p->var_nodes_enabled = cxt->use_variable_nodes;
   if (cxt->partial_hook) {
     p->cxt = cxt;
   }
@@ -7427,7 +7072,7 @@ parser_update_cxt(parser_state *p, mrb_ccontext *cxt)
   if (!node_type_p(p->tree, NODE_SCOPE)) return;
 
   /* Extract locals from variable-sized NODE_SCOPE */
-  struct mrb_ast_scope_node *scope = scope_node(p->tree->cdr);
+  struct mrb_ast_scope_node *scope = scope_node(p->tree);
   n0 = n = scope->locals;
   while (n) {
     i++;
@@ -7440,7 +7085,7 @@ parser_update_cxt(parser_state *p, mrb_ccontext *cxt)
   }
 }
 
-void mrb_parser_dump(mrb_state *mrb, node *tree, int offset);
+static void dump_node(mrb_state *mrb, node *tree, int offset);
 
 MRB_API void
 mrb_parser_parse(parser_state *p, mrb_ccontext *c)
@@ -7466,7 +7111,7 @@ mrb_parser_parse(parser_state *p, mrb_ccontext *c)
     }
     parser_update_cxt(p, c);
     if (c && c->dump_result) {
-      mrb_parser_dump(p->mrb, p->tree, 0);
+      dump_node(p->mrb, p->tree, 0);
     }
   }
   MRB_CATCH(p->mrb->jmp) {
@@ -7519,14 +7164,6 @@ mrb_parser_new(mrb_state *mrb)
   p->current_filename_index = -1;
   p->filename_table = NULL;
   p->filename_table_length = 0;
-
-  /* Initialize variable-sized node infrastructure */
-  for (int i = 0; i < SIZE_CLASS_COUNT; i++) {
-    p->var_free_lists[i] = NULL;
-    p->var_alloc_counts[i] = 0;
-  }
-  p->var_total_allocated = 0;
-  p->var_nodes_enabled = FALSE;
 
   return p;
 }
@@ -7790,7 +7427,7 @@ mrb_load_detect_file_cxt(mrb_state *mrb, FILE *fp, mrb_ccontext *c)
     binsize = bin_to_uint32(leading.h.binary_size);
     bin_obj = mrb_str_new(mrb, NULL, binsize);
     bin = (uint8_t*)RSTRING_PTR(bin_obj);
-    if ((size_t)binsize > bufsize)  {
+    if ((size_t)binsize > bufsize) {
       memcpy(bin, leading.b, bufsize);
       if (fread(bin + bufsize, binsize - bufsize, 1, fp) == 0) {
         binsize = bufsize;
@@ -7832,9 +7469,9 @@ mrb_load_string(mrb_state *mrb, const char *s)
 #ifndef MRB_NO_STDIO
 
 static void
-dump_prefix(node *tree, int offset)
+dump_prefix(int offset, uint16_t lineno)
 {
-  printf("%05d ", 0); /* location info not available in this context */
+  printf("%05d ", lineno);
   while (offset--) {
     putc(' ', stdout);
     putc(' ', stdout);
@@ -7845,56 +7482,60 @@ static void
 dump_recur(mrb_state *mrb, node *tree, int offset)
 {
   while (tree) {
-    mrb_parser_dump(mrb, tree->car, offset);
+    dump_node(mrb, tree->car, offset);
     tree = tree->cdr;
   }
 }
 
 static void
-dump_args(mrb_state *mrb, node *n, int offset)
+dump_locals(mrb_state *mrb, node *tree, int offset, uint16_t lineno)
 {
-  if (n->car) {
-    dump_prefix(n, offset+1);
-    printf("mandatory args:\n");
-    dump_recur(mrb, n->car, offset+2);
-  }
-  n = n->cdr;
-  if (n->car) {
-    dump_prefix(n, offset+1);
-    printf("optional args:\n");
-    {
-      node *n2 = n->car;
+  if (!tree || (!tree->car && !tree->cdr)) return;
 
-      while (n2) {
-        dump_prefix(n2, offset+2);
-        printf("%s=\n", mrb_sym_name(mrb, node_to_sym(n2->car->car)));
-        mrb_parser_dump(mrb, n2->car->cdr, offset+3);
-        n2 = n2->cdr;
+  dump_prefix(offset, lineno);
+  printf("locals:\n");
+  dump_prefix(offset+1, lineno);
+  while (tree) {
+    if (tree->car) {
+      mrb_sym sym = node_to_sym(tree->car);
+      if (sym != 0) {
+        const char *name = mrb_sym_name(mrb, sym);
+        if (name && strlen(name) > 0 && name[0] != '!' && name[0] != '@' && name[0] != '$') {
+          printf(" %s", mrb_sym_dump(mrb, sym));
+        }
+        else {
+          printf(" (invalid symbol: %s)", name ? name : "(null)");
+        }
+      }
+      else {
+        printf(" (anonymous)");
       }
     }
+    tree = tree->cdr;
   }
-  n = n->cdr;
-  if (n->car) {
-    mrb_sym rest = node_to_sym(n->car);
+  printf("\n");
+}
 
-    dump_prefix(n, offset+1);
-    if (rest == MRB_OPSYM(mul))
-      printf("rest=*\n");
-    else
-      printf("rest=*%s\n", mrb_sym_name(mrb, rest));
+static void
+dump_cpath(mrb_state *mrb, node *tree, int offset, uint16_t lineno)
+{
+  dump_prefix(offset, lineno);
+  printf("cpath: ");
+  if (!tree) {
+    printf("(null)\n");
   }
-  n = n->cdr;
-  if (n->car) {
-    dump_prefix(n, offset+1);
-    printf("post mandatory args:\n");
-    dump_recur(mrb, n->car, offset+2);
+  else if (node_to_int(tree->car) == 0) {
+    printf("(null)\n");
   }
-
-  n = n->cdr;
-  if (n) {
-    mrb_assert(node_to_int(n->car) == NODE_ARGS_TAIL);
-    mrb_parser_dump(mrb, n, offset);
+  else if (node_to_int(tree->car) == 1) {
+    printf("Object\n");
   }
+  else {
+    printf("\n");
+    dump_node(mrb, tree->car, offset+1);
+  }
+  dump_prefix(offset, lineno);
+  printf("name: %s\n", mrb_sym_dump(mrb, node_to_sym(tree->cdr)));
 }
 
 /*
@@ -7903,605 +7544,249 @@ dump_args(mrb_state *mrb, node *n, int offset)
  * performed at the caller, the string pointer returned as the return
  * value may become invalid.
  */
-#if 0
 static const char*
 str_dump(mrb_state *mrb, const char *str, int len)
 {
   int ai = mrb_gc_arena_save(mrb);
-  mrb_value s;
-# if INT_MAX > MRB_INT_MAX / 4
-  /* check maximum length with "\xNN" character */
-  if (len > MRB_INT_MAX / 4) {
-    len = MRB_INT_MAX / 4;
-  }
-# endif
-  s = mrb_str_new(mrb, str, (mrb_int)len);
+  mrb_value s = mrb_str_new(mrb, str, (mrb_int)len);
   s = mrb_str_dump(mrb, s);
   mrb_gc_arena_restore(mrb, ai);
   return RSTRING_PTR(s);
 }
-#endif
+
+static void
+dump_str(mrb_state *mrb, node *n, int offset, uint16_t lineno)
+{
+  while (n) {
+    dump_prefix(offset, lineno);
+    int len = node_to_int(n->car->car);
+    if (len >= 0) {
+      printf("str: %s\n", str_dump(mrb, (char*)n->car->cdr, len));
+    }
+    else {
+      printf("interpolation:\n");
+      dump_node(mrb, n->car->cdr, offset+1);
+    }
+    n = n->cdr;
+  }
+}
+
+static void
+dump_args(mrb_state *mrb, struct mrb_ast_args *args, int offset, uint16_t lineno)
+{
+  if (args->mandatory_args) {
+    dump_prefix(offset, lineno);
+    printf("mandatory args:\n");
+    dump_recur(mrb, args->mandatory_args, offset+1);
+  }
+  if (args->optional_args) {
+    dump_prefix(offset, lineno);
+    printf("optional args:\n");
+    {
+      node *n = args->optional_args;
+      while (n) {
+        dump_prefix(offset+1, lineno);
+        printf("%s=\n", mrb_sym_name(mrb, node_to_sym(n->car->car)));
+        dump_node(mrb, n->car->cdr, offset+2);
+        n = n->cdr;
+      }
+    }
+  }
+  if (args->rest_arg) {
+    mrb_sym rest = args->rest_arg;
+
+    dump_prefix(offset, lineno);
+    if (rest == MRB_OPSYM(mul))
+      printf("rest=*\n");
+    else
+      printf("rest=*%s\n", mrb_sym_name(mrb, rest));
+  }
+  if (args->post_mandatory_args) {
+    dump_prefix(offset, lineno);
+    printf("post mandatory args:\n");
+    dump_recur(mrb, args->post_mandatory_args, offset+1);
+  }
+  if (args->keyword_args) {
+    dump_prefix(offset, lineno);
+    printf("keyword args:\n");
+    {
+      node *n = args->keyword_args;
+      while (n) {
+        dump_prefix(offset+1, lineno);
+        printf("%s:\n", mrb_sym_name(mrb, node_to_sym(n->car->car)));
+        dump_node(mrb, n->car->cdr, offset+2);
+        n = n->cdr;
+      }
+    }
+  }
+  if (args->kwrest_arg) {
+    mrb_sym rest = args->kwrest_arg;
+
+    dump_prefix(offset, lineno);
+    if (rest == MRB_OPSYM(pow))
+      printf("kwrest=**\n");
+    else
+      printf("kwrest=**%s\n", mrb_sym_name(mrb, rest));
+  }
+  if (args->block_arg) {
+    mrb_sym blk = args->block_arg;
+
+    dump_prefix(offset, lineno);
+    if (blk == MRB_OPSYM(and))
+      printf("blk=&\n");
+    else
+      printf("blk=&%s\n", mrb_sym_name(mrb, blk));
+  }
+}
+
+static void
+dump_callargs(mrb_state *mrb, node *n, int offset, uint16_t lineno)
+{
+  if (!n) return;
+
+  struct mrb_ast_callargs *args = (struct mrb_ast_callargs*)n;
+  if (args->regular_args) {
+    dump_prefix(offset+1, lineno);
+    printf("args:\n");
+    dump_recur(mrb, args->regular_args, offset+2);
+  }
+  if (args->keyword_args) {
+    dump_prefix(offset+1, lineno);
+    printf("kw_args:\n");
+    node *kw = args->keyword_args;
+    while (kw) {
+      dump_prefix(offset+2, lineno);
+      printf("key:\n");
+      if (node_to_sym(kw->car->car) == MRB_OPSYM(pow)) {
+        dump_prefix(offset+3, lineno);
+        printf("**:\n");
+      }
+      else {
+        dump_node(mrb, kw->car->car, offset+3);
+      }
+      dump_prefix(offset+2, lineno);
+      printf("value:\n");
+      dump_node(mrb, kw->car->cdr, offset+3);
+      kw = kw->cdr;
+    }
+  }
+  if (args->block_arg) {
+    dump_prefix(offset+1, lineno);
+    printf("block:\n");
+    dump_node(mrb, args->block_arg, offset+2);
+  }
+}
 
 #endif
 
 void
-mrb_parser_dump(mrb_state *mrb, node *tree, int offset)
+dump_node(mrb_state *mrb, node *tree, int offset)
 {
 #ifndef MRB_NO_STDIO
-  int nodetype;
+  enum node_type nodetype;
+  uint16_t lineno = 0;
 
   if (!tree) return;
-  again:
-  dump_prefix(tree, offset);
-  nodetype = node_to_int(tree->car);
-  tree = tree->cdr;
+
+  /* Extract line number from variable-sized node header */
+  if (get_node_type(tree) != NODE_LAST) {
+    lineno = ((struct mrb_ast_var_header*)tree)->lineno;
+  }
+
+  dump_prefix(offset, lineno);
+
+  /* All nodes are now variable-sized nodes with headers */
+  nodetype = get_node_type(tree);
+
   switch (nodetype) {
-  case NODE_STMTS:
-    printf("NODE_STMTS:\n");
-    dump_recur(mrb, tree, offset+1);
-    break;
-
-  case NODE_BEGIN:
-    printf("NODE_BEGIN:\n");
-    mrb_parser_dump(mrb, tree, offset+1);
-    break;
-
-  case NODE_RESCUE:
-    printf("NODE_RESCUE:\n");
-    if (tree->car) {
-      dump_prefix(tree, offset+1);
-      printf("body:\n");
-      mrb_parser_dump(mrb, tree->car, offset+2);
-    }
-    tree = tree->cdr;
-    if (tree->car) {
-      node *n2 = tree->car;
-
-      dump_prefix(n2, offset+1);
-      printf("rescue:\n");
-      while (n2) {
-        node *n3 = n2->car;
-        if (n3->car) {
-          dump_prefix(n2, offset+2);
-          printf("handle classes:\n");
-          dump_recur(mrb, n3->car, offset+3);
-        }
-        if (n3->cdr->car) {
-          dump_prefix(n3, offset+2);
-          printf("exc_var:\n");
-          mrb_parser_dump(mrb, n3->cdr->car, offset+3);
-        }
-        if (n3->cdr->cdr->car) {
-          dump_prefix(n3, offset+2);
-          printf("rescue body:\n");
-          mrb_parser_dump(mrb, n3->cdr->cdr->car, offset+3);
-        }
-        n2 = n2->cdr;
-      }
-    }
-    tree = tree->cdr;
-    if (tree->car) {
-      dump_prefix(tree, offset+1);
-      printf("else:\n");
-      mrb_parser_dump(mrb, tree->car, offset+2);
-    }
-    break;
-
-  case NODE_ENSURE:
-    printf("NODE_ENSURE:\n");
-    dump_prefix(tree, offset+1);
-    printf("body:\n");
-    mrb_parser_dump(mrb, tree->car, offset+2);
-    dump_prefix(tree, offset+1);
-    printf("ensure:\n");
-    mrb_parser_dump(mrb, tree->cdr->cdr, offset+2);
-    break;
-
-  case NODE_LAMBDA:
-    printf("NODE_LAMBDA:\n");
-    dump_prefix(tree, offset+1);
-    goto block;
-
-  case NODE_BLOCK:
-    block:
-    printf("NODE_BLOCK:\n");
-    tree = tree->cdr;
-    if (tree->car) {
-      dump_args(mrb, tree->car, offset+1);
-    }
-    dump_prefix(tree, offset+1);
-    printf("body:\n");
-    mrb_parser_dump(mrb, tree->cdr->car, offset+2);
-    break;
-
-  case NODE_IF:
-    printf("NODE_IF:\n");
-    dump_prefix(tree, offset+1);
-    printf("cond:\n");
-    mrb_parser_dump(mrb, tree->car, offset+2);
-    dump_prefix(tree, offset+1);
-    printf("then:\n");
-    mrb_parser_dump(mrb, tree->cdr->car, offset+2);
-    if (tree->cdr->cdr->car) {
-      dump_prefix(tree, offset+1);
-      printf("else:\n");
-      mrb_parser_dump(mrb, tree->cdr->cdr->car, offset+2);
-    }
-    break;
-
-  case NODE_AND:
-    printf("NODE_AND:\n");
-    mrb_parser_dump(mrb, tree->car, offset+1);
-    mrb_parser_dump(mrb, tree->cdr, offset+1);
-    break;
-
-  case NODE_OR:
-    printf("NODE_OR:\n");
-    mrb_parser_dump(mrb, tree->car, offset+1);
-    mrb_parser_dump(mrb, tree->cdr, offset+1);
-    break;
-
-  case NODE_CASE:
-    printf("NODE_CASE:\n");
-    if (tree->car) {
-      mrb_parser_dump(mrb, tree->car, offset+1);
-    }
-    tree = tree->cdr;
-    while (tree) {
-      dump_prefix(tree, offset+1);
-      printf("case:\n");
-      dump_recur(mrb, tree->car->car, offset+2);
-      dump_prefix(tree, offset+1);
-      printf("body:\n");
-      mrb_parser_dump(mrb, tree->car->cdr, offset+2);
-      tree = tree->cdr;
-    }
-    break;
-
-  case NODE_WHILE:
-    printf("NODE_WHILE:\n");
-    dump_prefix(tree, offset+1);
-    printf("cond:\n");
-    mrb_parser_dump(mrb, tree->car, offset+2);
-    dump_prefix(tree, offset+1);
-    printf("body:\n");
-    mrb_parser_dump(mrb, tree->cdr, offset+2);
-    break;
-
-  case NODE_UNTIL:
-    printf("NODE_UNTIL:\n");
-    dump_prefix(tree, offset+1);
-    printf("cond:\n");
-    mrb_parser_dump(mrb, tree->car, offset+2);
-    dump_prefix(tree, offset+1);
-    printf("body:\n");
-    mrb_parser_dump(mrb, tree->cdr, offset+2);
-    break;
-
-  case NODE_WHILE_MOD:
-    printf("NODE_WHILE_MOD:\n");
-    dump_prefix(tree, offset+1);
-    printf("cond:\n");
-    mrb_parser_dump(mrb, tree->car, offset+2);
-    dump_prefix(tree, offset+1);
-    printf("body:\n");
-    mrb_parser_dump(mrb, tree->cdr, offset+2);
-    break;
-
-  case NODE_UNTIL_MOD:
-    printf("NODE_UNTIL_MOD:\n");
-    dump_prefix(tree, offset+1);
-    printf("cond:\n");
-    mrb_parser_dump(mrb, tree->car, offset+2);
-    dump_prefix(tree, offset+1);
-    printf("body:\n");
-    mrb_parser_dump(mrb, tree->cdr, offset+2);
-    break;
-
-  case NODE_FOR:
-    printf("NODE_FOR:\n");
-    dump_prefix(tree, offset+1);
-    printf("var:\n");
-    {
-      node *n2 = tree->car;
-
-      if (n2->car) {
-        dump_prefix(n2, offset+2);
-        printf("pre:\n");
-        dump_recur(mrb, n2->car, offset+3);
-      }
-      n2 = n2->cdr;
-      if (n2) {
-        if (n2->car) {
-          dump_prefix(n2, offset+2);
-          printf("rest:\n");
-          mrb_parser_dump(mrb, n2->car, offset+3);
-        }
-        n2 = n2->cdr;
-        if (n2) {
-          if (n2->car) {
-            dump_prefix(n2, offset+2);
-            printf("post:\n");
-            dump_recur(mrb, n2->car, offset+3);
-          }
-        }
-      }
-    }
-    tree = tree->cdr;
-    dump_prefix(tree, offset+1);
-    printf("in:\n");
-    mrb_parser_dump(mrb, tree->car, offset+2);
-    tree = tree->cdr;
-    dump_prefix(tree, offset+1);
-    printf("do:\n");
-    mrb_parser_dump(mrb, tree->car, offset+2);
-    break;
-
+  /* Variable-sized node cases */
   case NODE_SCOPE:
     printf("NODE_SCOPE:\n");
     {
-      node *n2 = tree->car;
-      mrb_bool first_lval = TRUE;
-
-      if (n2 && (n2->car || n2->cdr)) {
-        dump_prefix(n2, offset+1);
-        printf("local variables:\n");
-        dump_prefix(n2, offset+2);
-        while (n2) {
-          if (n2->car) {
-            if (!first_lval) printf(", ");
-            printf("%s", mrb_sym_name(mrb, node_to_sym(n2->car)));
-            first_lval = FALSE;
-          }
-          n2 = n2->cdr;
-        }
-        printf("\n");
+      struct mrb_ast_scope_node *scope = (struct mrb_ast_scope_node*)tree;
+      if (scope->locals) {
+        dump_locals(mrb, scope->locals, offset+1, lineno);
+      }
+      if (scope->body) {
+        dump_prefix(offset+1, lineno);
+        printf("body:\n");
+        dump_node(mrb, scope->body, offset+2);
       }
     }
-    tree = tree->cdr;
-    offset++;
-    goto again;
-
-  case NODE_FCALL:
-  case NODE_CALL:
-  case NODE_SCALL:
-    switch (nodetype) {
-    case NODE_FCALL:
-      printf("NODE_FCALL:\n"); break;
-    case NODE_CALL:
-      printf("NODE_CALL(.):\n"); break;
-    case NODE_SCALL:
-      printf("NODE_SCALL(&.):\n"); break;
-    default:
-      break;
-    }
-    mrb_parser_dump(mrb, tree->car, offset+1);
-    dump_prefix(tree, offset+1);
-    printf("method='%s' (%d)\n",
-        mrb_sym_dump(mrb, node_to_sym(tree->cdr->car)),
-        node_to_int(tree->cdr->car));
-    tree = tree->cdr->cdr->car;
-    if (tree) {
-      dump_prefix(tree, offset+1);
-      printf("args:\n");
-      dump_recur(mrb, tree->car, offset+2);
-      if (tree->cdr) {
-        if (tree->cdr->car) {
-          dump_prefix(tree, offset+1);
-          printf("kwargs:\n");
-          mrb_parser_dump(mrb, tree->cdr->car, offset+2);
-        }
-        if (tree->cdr->cdr) {
-          dump_prefix(tree, offset+1);
-          printf("block:\n");
-          mrb_parser_dump(mrb, tree->cdr->cdr, offset+2);
-        }
-      }
-    }
-    break;
-
-  case NODE_DOT2:
-    printf("NODE_DOT2:\n");
-    mrb_parser_dump(mrb, tree->car, offset+1);
-    mrb_parser_dump(mrb, tree->cdr, offset+1);
-    break;
-
-  case NODE_DOT3:
-    printf("NODE_DOT3:\n");
-    mrb_parser_dump(mrb, tree->car, offset+1);
-    mrb_parser_dump(mrb, tree->cdr, offset+1);
-    break;
-
-  case NODE_COLON2:
-    printf("NODE_COLON2:\n");
-    mrb_parser_dump(mrb, tree->car, offset+1);
-    dump_prefix(tree, offset+1);
-    printf("::%s\n", mrb_sym_name(mrb, node_to_sym(tree->cdr)));
-    break;
-
-  case NODE_COLON3:
-    printf("NODE_COLON3: ::%s\n", mrb_sym_name(mrb, node_to_sym(tree)));
-    break;
-
-  case NODE_ARRAY:
-    printf("NODE_ARRAY:\n");
-    dump_recur(mrb, tree, offset+1);
-    break;
-
-  case NODE_HASH:
-    printf("NODE_HASH:\n");
-    while (tree) {
-      dump_prefix(tree, offset+1);
-      printf("key:\n");
-      mrb_parser_dump(mrb, tree->car->car, offset+2);
-      dump_prefix(tree, offset+1);
-      printf("value:\n");
-      mrb_parser_dump(mrb, tree->car->cdr, offset+2);
-      tree = tree->cdr;
-    }
-    break;
-
-  case NODE_KW_HASH:
-    printf("NODE_KW_HASH:\n");
-    while (tree) {
-      dump_prefix(tree, offset+1);
-      printf("key:\n");
-      mrb_parser_dump(mrb, tree->car->car, offset+2);
-      dump_prefix(tree, offset+1);
-      printf("value:\n");
-      mrb_parser_dump(mrb, tree->car->cdr, offset+2);
-      tree = tree->cdr;
-    }
-    break;
-
-  case NODE_SPLAT:
-    printf("NODE_SPLAT:\n");
-    mrb_parser_dump(mrb, tree, offset+1);
-    break;
-
-  case NODE_ASGN:
-    printf("NODE_ASGN:\n");
-    dump_prefix(tree, offset+1);
-    printf("lhs:\n");
-    mrb_parser_dump(mrb, tree->car, offset+2);
-    dump_prefix(tree, offset+1);
-    printf("rhs:\n");
-    mrb_parser_dump(mrb, tree->cdr, offset+2);
-    break;
-
-  case NODE_MASGN:
-    printf("NODE_MASGN:\n");
-    dump_prefix(tree, offset+1);
-    printf("mlhs:\n");
-    {
-      node *n2 = tree->car;
-
-      if (n2->car) {
-        dump_prefix(tree, offset+2);
-        printf("pre:\n");
-        dump_recur(mrb, n2->car, offset+3);
-      }
-      n2 = n2->cdr;
-      if (n2) {
-        if (n2->car) {
-          dump_prefix(n2, offset+2);
-          printf("rest:\n");
-          if (n2->car == int_to_node(-1)) {
-            dump_prefix(n2, offset+2);
-            printf("(empty)\n");
-          }
-          else {
-            mrb_parser_dump(mrb, n2->car, offset+3);
-          }
-        }
-        n2 = n2->cdr;
-        if (n2 && n2->car) {
-          dump_prefix(n2, offset+2);
-          printf("post:\n");
-          dump_recur(mrb, n2->car, offset+3);
-        }
-      }
-    }
-    dump_prefix(tree, offset+1);
-    printf("rhs:\n");
-    mrb_parser_dump(mrb, tree->cdr, offset+2);
-    break;
-
-  case NODE_OP_ASGN:
-    printf("NODE_OP_ASGN:\n");
-    dump_prefix(tree, offset+1);
-    printf("lhs:\n");
-    mrb_parser_dump(mrb, tree->car, offset+2);
-    tree = tree->cdr;
-    dump_prefix(tree, offset+1);
-    printf("op='%s' (%d)\n", mrb_sym_name(mrb, node_to_sym(tree->car)), node_to_int(tree->car));
-    tree = tree->cdr;
-    mrb_parser_dump(mrb, tree->car, offset+1);
-    break;
-
-  case NODE_SUPER:
-    printf("NODE_SUPER:\n");
-    if (tree) {
-      dump_prefix(tree, offset+1);
-      printf("args:\n");
-      dump_recur(mrb, tree->car, offset+2);
-      if (tree->cdr) {
-        dump_prefix(tree, offset+1);
-        printf("block:\n");
-        mrb_parser_dump(mrb, tree->cdr, offset+2);
-      }
-    }
-    break;
-
-  case NODE_ZSUPER:
-    printf("NODE_ZSUPER:\n");
-    if (tree) {
-      dump_prefix(tree, offset+1);
-      printf("args:\n");
-      dump_recur(mrb, tree->car, offset+2);
-      if (tree->cdr) {
-        dump_prefix(tree, offset+1);
-        printf("block:\n");
-        mrb_parser_dump(mrb, tree->cdr, offset+2);
-      }
-    }
-    break;
-
-  case NODE_RETURN:
-    printf("NODE_RETURN:\n");
-    mrb_parser_dump(mrb, tree, offset+1);
-    break;
-
-  case NODE_YIELD:
-    printf("NODE_YIELD:\n");
-    dump_recur(mrb, tree, offset+1);
-    break;
-
-  case NODE_BREAK:
-    printf("NODE_BREAK:\n");
-    mrb_parser_dump(mrb, tree, offset+1);
-    break;
-
-  case NODE_NEXT:
-    printf("NODE_NEXT:\n");
-    mrb_parser_dump(mrb, tree, offset+1);
-    break;
-
-  case NODE_REDO:
-    printf("NODE_REDO\n");
-    break;
-
-  case NODE_RETRY:
-    printf("NODE_RETRY\n");
-    break;
-
-  case NODE_LVAR:
-    printf("NODE_LVAR %s\n", mrb_sym_name(mrb, node_to_sym(tree)));
-    break;
-
-  case NODE_GVAR:
-    printf("NODE_GVAR %s\n", mrb_sym_name(mrb, node_to_sym(tree)));
-    break;
-
-  case NODE_IVAR:
-    printf("NODE_IVAR %s\n", mrb_sym_name(mrb, node_to_sym(tree)));
-    break;
-
-  case NODE_CVAR:
-    printf("NODE_CVAR %s\n", mrb_sym_name(mrb, node_to_sym(tree)));
-    break;
-
-  case NODE_NVAR:
-    printf("NODE_NVAR %d\n", node_to_int(tree));
-    break;
-
-  case NODE_CONST:
-    printf("NODE_CONST %s\n", mrb_sym_name(mrb, node_to_sym(tree)));
-    break;
-
-  case NODE_MATCH:
-    printf("NODE_MATCH:\n");
-    dump_prefix(tree, offset + 1);
-    printf("lhs:\n");
-    mrb_parser_dump(mrb, tree->car, offset + 2);
-    dump_prefix(tree, offset + 1);
-    printf("rhs:\n");
-    mrb_parser_dump(mrb, tree->cdr, offset + 2);
-    break;
-
-  case NODE_BACK_REF:
-    printf("NODE_BACK_REF: $%c\n", node_to_int(tree));
-    break;
-
-  case NODE_NTH_REF:
-    printf("NODE_NTH_REF: $%d\n", node_to_int(tree));
-    break;
-
-  case NODE_ARG:
-    printf("NODE_ARG %s\n", mrb_sym_name(mrb, node_to_sym(tree)));
-    break;
-
-  case NODE_BLOCK_ARG:
-    printf("NODE_BLOCK_ARG:\n");
-    mrb_parser_dump(mrb, tree, offset+1);
     break;
 
   case NODE_INT:
-    printf("NODE_INT %s base %d\n", (char*)tree->car, node_to_int(tree->cdr->car));
+    printf("NODE_INT: %d\n", INT_NODE_VALUE(tree));
+    break;
+
+  case NODE_BIGINT:
+    printf("NODE_BIGINT: %s (base %d)\n", BIGINT_NODE_STRING(tree), BIGINT_NODE_BASE(tree));
     break;
 
   case NODE_FLOAT:
-    printf("NODE_FLOAT %s\n", (char*)tree);
-    break;
-
-  case NODE_NEGATE:
-    printf("NODE_NEGATE:\n");
-    mrb_parser_dump(mrb, tree, offset+1);
+    printf("NODE_FLOAT: %s\n", FLOAT_NODE_VALUE(tree));
     break;
 
   case NODE_STR:
     printf("NODE_STR:\n");
-    dump_recur(mrb, tree, offset+1);
+    dump_str(mrb, STR_NODE_LIST(tree), offset+1, lineno);
     break;
 
   case NODE_XSTR:
     printf("NODE_XSTR:\n");
-    dump_recur(mrb, tree, offset+1);
-    break;
-
-  case NODE_REGX:
-    printf("NODE_REGX /%s/\n", (char*)tree->car);
-    if (tree->cdr->car) {
-      dump_prefix(tree, offset+1);
-      printf("opt: %s\n", (char*)tree->cdr->car);
-    }
-    if (tree->cdr->cdr) {
-      dump_prefix(tree, offset+1);
-      printf("enc: %s\n", (char*)tree->cdr->cdr);
-    }
-    break;
-
-  case NODE_DREGX:
-    printf("NODE_DREGX:\n");
-    dump_recur(mrb, tree->car, offset+1);
-    dump_prefix(tree, offset+1);
-    printf("tail: %s\n", (char*)tree->cdr->cdr->car);
-    if (tree->cdr->cdr->cdr->car) {
-      dump_prefix(tree, offset+1);
-      printf("opt: %s\n", (char*)tree->cdr->cdr->cdr->car);
-    }
-    if (tree->cdr->cdr->cdr->cdr) {
-      dump_prefix(tree, offset+1);
-      printf("enc: %s\n", (char*)tree->cdr->cdr->cdr->cdr);
-    }
+    dump_str(mrb, XSTR_NODE_LIST(tree), offset+1, lineno);
     break;
 
   case NODE_SYM:
-    printf("NODE_SYM :%s (%d)\n", mrb_sym_dump(mrb, node_to_sym(tree)),
-           node_to_int(tree));
+    printf("NODE_SYM: %s\n", mrb_sym_dump(mrb, SYM_NODE_VALUE(tree)));
     break;
 
   case NODE_DSYM:
     printf("NODE_DSYM:\n");
-    mrb_parser_dump(mrb, tree, offset+1);
+    dump_str(mrb, dsym_node(tree)->list, offset+1, lineno);
     break;
 
-  case NODE_WORDS:
-    printf("NODE_WORDS:\n");
-    dump_recur(mrb, tree, offset+1);
+  case NODE_LVAR:
+    printf("NODE_LVAR: %s\n", mrb_sym_dump(mrb, VAR_NODE_SYMBOL(tree)));
     break;
 
-  case NODE_SYMBOLS:
-    printf("NODE_SYMBOLS:\n");
-    dump_recur(mrb, tree, offset+1);
+  case NODE_GVAR:
+    printf("NODE_GVAR: %s\n", mrb_sym_dump(mrb, VAR_NODE_SYMBOL(tree)));
     break;
 
-  case NODE_SELF:
-    printf("NODE_SELF\n");
+  case NODE_IVAR:
+    printf("NODE_IVAR: %s\n", mrb_sym_dump(mrb, VAR_NODE_SYMBOL(tree)));
     break;
 
-  case NODE_NIL:
-    printf("NODE_NIL\n");
+  case NODE_CVAR:
+    printf("NODE_CVAR: %s\n", mrb_sym_dump(mrb, VAR_NODE_SYMBOL(tree)));
+    break;
+
+  case NODE_NVAR:
+    printf("NODE_NVAR: %d\n", nvar_node(tree)->num);
+    break;
+
+  case NODE_CONST:
+    printf("NODE_CONST: %s\n", mrb_sym_dump(mrb, VAR_NODE_SYMBOL(tree)));
+    break;
+
+  case NODE_CALL:
+    printf("NODE_CALL: %s\n", mrb_sym_dump(mrb, CALL_NODE_METHOD(tree)));
+    if (CALL_NODE_RECEIVER(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("receiver:\n");
+      dump_node(mrb, CALL_NODE_RECEIVER(tree), offset+2);
+    }
+    if (CALL_NODE_ARGS(tree)) {
+      dump_callargs(mrb, CALL_NODE_ARGS(tree), offset, lineno);
+    }
+    break;
+
+  case NODE_ARRAY:
+    printf("NODE_ARRAY:\n");
+    if (ARRAY_NODE_ELEMENTS(tree)) {
+      dump_recur(mrb, ARRAY_NODE_ELEMENTS(tree), offset+1);
+    }
     break;
 
   case NODE_TRUE:
@@ -8512,10 +7797,471 @@ mrb_parser_dump(mrb_state *mrb, node *tree, int offset)
     printf("NODE_FALSE\n");
     break;
 
+  case NODE_NIL:
+    printf("NODE_NIL\n");
+    break;
+
+  case NODE_SELF:
+    printf("NODE_SELF\n");
+    break;
+
+  case NODE_IF:
+    printf("NODE_IF:\n");
+    if (IF_NODE_CONDITION(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("cond:\n");
+      dump_node(mrb, IF_NODE_CONDITION(tree), offset+2);
+    }
+    if (IF_NODE_THEN(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("then:\n");
+      dump_node(mrb, IF_NODE_THEN(tree), offset+2);
+    }
+    if (IF_NODE_ELSE(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("else:\n");
+      dump_node(mrb, IF_NODE_ELSE(tree), offset+2);
+    }
+    break;
+
+  case NODE_DEF:
+    printf("NODE_DEF: %s\n", mrb_sym_dump(mrb, DEF_NODE_NAME(tree)));
+    if (DEF_NODE_ARGS(tree)) {
+      dump_args(mrb, SDEF_NODE_ARGS(tree), offset+1, lineno);
+    }
+    if (DEF_NODE_LOCALS(tree)) {
+      dump_locals(mrb, DEF_NODE_LOCALS(tree), offset+1, lineno);
+    }
+    if (DEF_NODE_BODY(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("body:\n");
+      dump_node(mrb, DEF_NODE_BODY(tree), offset+2);
+    }
+    break;
+
+  case NODE_ASGN:
+    printf("NODE_ASGN:\n");
+    if (ASGN_NODE_LHS(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("lhs:\n");
+      dump_node(mrb, ASGN_NODE_LHS(tree), offset+2);
+    }
+    if (ASGN_NODE_RHS(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("rhs:\n");
+      dump_node(mrb, ASGN_NODE_RHS(tree), offset+2);
+    }
+    break;
+
+  case NODE_MASGN:
+    printf("NODE_MASGN:\n");
+    if (MASGN_NODE_LHS(tree)) {
+      dump_prefix(offset+1, lineno);
+      node *lhs = MASGN_NODE_LHS(tree);
+      if (lhs) {
+        printf("lhs:\n");
+        dump_recur(mrb, lhs->car, offset+2);
+        if (lhs->cdr) {
+           dump_recur(mrb, lhs->cdr->car, offset+2);
+           if (lhs->cdr->cdr) dump_recur(mrb, lhs->cdr->cdr->car, offset+2);
+        }
+      }
+    }
+    if (MASGN_NODE_RHS(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("rhs:\n");
+      dump_node(mrb, MASGN_NODE_RHS(tree), offset+2);
+    }
+    break;
+
+  case NODE_RETURN:
+    printf("NODE_RETURN:\n");
+    if (RETURN_NODE_ARGS(tree)) {
+      dump_node(mrb, RETURN_NODE_ARGS(tree), offset);
+    }
+    break;
+
+  case NODE_BREAK:
+    printf("NODE_BREAK:\n");
+    if (BREAK_NODE_VALUE(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("value:\n");
+      dump_node(mrb, BREAK_NODE_VALUE(tree), offset+2);
+    }
+    break;
+
+  case NODE_NEXT:
+    printf("NODE_NEXT:\n");
+    if (NEXT_NODE_VALUE(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("value:\n");
+      dump_node(mrb, NEXT_NODE_VALUE(tree), offset+2);
+    }
+    break;
+
+  case NODE_NEGATE:
+    printf("NODE_NEGATE:\n");
+    if (NEGATE_NODE_OPERAND(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("operand:\n");
+      dump_node(mrb, NEGATE_NODE_OPERAND(tree), offset+2);
+    }
+    break;
+
+  case NODE_STMTS:
+    printf("NODE_STMTS:\n");
+    if (STMTS_NODE_STMTS(tree)) {
+      dump_recur(mrb, STMTS_NODE_STMTS(tree), offset+1);
+    }
+    break;
+
+  case NODE_BEGIN:
+    printf("NODE_BEGIN:\n");
+    if (BEGIN_NODE_BODY(tree)) {
+      dump_node(mrb, BEGIN_NODE_BODY(tree), offset+1);
+    }
+    break;
+
+  case NODE_RESCUE:
+    printf("NODE_RESCUE:\n");
+    if (RESCUE_NODE_BODY(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("body:\n");
+      dump_node(mrb, RESCUE_NODE_BODY(tree), offset+2);
+    }
+    if (RESCUE_NODE_RESCUE_CLAUSES(tree)) {
+      node *n2 = RESCUE_NODE_RESCUE_CLAUSES(tree);
+      dump_prefix(offset+1, lineno);
+      printf("rescue:\n");
+      while (n2) {
+        node *n3 = n2->car;
+        if (n3->car) {
+          dump_prefix(offset+2, lineno);
+          printf("handle classes:\n");
+          dump_recur(mrb, n3->car, offset+3);
+        }
+        if (n3->cdr->car) {
+          dump_prefix(offset+2, lineno);
+          printf("exc_var:\n");
+          dump_node(mrb, n3->cdr->car, offset+3);
+        }
+        if (n3->cdr->cdr->car) {
+          dump_prefix(offset+2, lineno);
+          printf("rescue body:\n");
+          dump_node(mrb, n3->cdr->cdr->car, offset+3);
+        }
+        n2 = n2->cdr;
+      }
+    }
+    if (RESCUE_NODE_ELSE_CLAUSE(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("else:\n");
+      dump_node(mrb, RESCUE_NODE_ELSE_CLAUSE(tree), offset+2);
+    }
+    break;
+
+  case NODE_ENSURE:
+    printf("NODE_ENSURE:\n");
+    if (ENSURE_NODE_BODY(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("body:\n");
+      dump_node(mrb, ENSURE_NODE_BODY(tree), offset+2);
+    }
+    if (ENSURE_NODE_ENSURE_CLAUSE(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("ensure:\n");
+      dump_node(mrb, ENSURE_NODE_ENSURE_CLAUSE(tree), offset+2);
+    }
+    break;
+
+  case NODE_LAMBDA:
+    printf("NODE_LAMBDA:\n");
+    goto block;
+
+  case NODE_BLOCK:
+    printf("NODE_BLOCK:\n");
+  block:
+    if (BLOCK_NODE_LOCALS(tree)) {
+      dump_locals(mrb, BLOCK_NODE_LOCALS(tree), offset+1, lineno);
+    }
+    if (BLOCK_NODE_ARGS(tree)) {
+      dump_args(mrb, BLOCK_NODE_ARGS(tree), offset+1, lineno);
+    }
+    dump_prefix(offset+1, lineno);
+    printf("body:\n");
+    dump_node(mrb, BLOCK_NODE_BODY(tree), offset+2);
+    break;
+
+  case NODE_AND:
+    printf("NODE_AND:\n");
+    dump_node(mrb, AND_NODE_LEFT(tree), offset+1);
+    dump_node(mrb, AND_NODE_RIGHT(tree), offset+1);
+    break;
+
+  case NODE_OR:
+    printf("NODE_OR:\n");
+    dump_node(mrb, OR_NODE_LEFT(tree), offset+1);
+    dump_node(mrb, OR_NODE_RIGHT(tree), offset+1);
+    break;
+
+  case NODE_CASE:
+    printf("NODE_CASE:\n");
+    if (tree->car) {
+      dump_node(mrb, tree->car, offset+1);
+    }
+    tree = tree->cdr;
+    while (tree) {
+      dump_prefix(offset+1, lineno);
+      printf("case:\n");
+      dump_recur(mrb, tree->car->car, offset+2);
+      dump_prefix(offset+1, lineno);
+      printf("body:\n");
+      dump_node(mrb, tree->car->cdr, offset+2);
+      tree = tree->cdr;
+    }
+    break;
+
+  case NODE_WHILE:
+    printf("NODE_WHILE:\n");
+    dump_prefix(offset+1, lineno);
+    printf("cond:\n");
+    dump_node(mrb, WHILE_NODE_CONDITION(tree), offset+2);
+    dump_prefix(offset+1, lineno);
+    printf("body:\n");
+    dump_node(mrb, WHILE_NODE_BODY(tree), offset+2);
+    break;
+
+  case NODE_UNTIL:
+    printf("NODE_UNTIL:\n");
+    dump_prefix(offset+1, lineno);
+    printf("cond:\n");
+    dump_node(mrb, UNTIL_NODE_CONDITION(tree), offset+2);
+    dump_prefix(offset+1, lineno);
+    printf("body:\n");
+    dump_node(mrb, UNTIL_NODE_BODY(tree), offset+2);
+    break;
+
+  case NODE_WHILE_MOD:
+    printf("NODE_WHILE_MOD:\n");
+    dump_prefix(offset+1, lineno);
+    printf("cond:\n");
+    dump_node(mrb, WHILE_NODE_CONDITION(tree), offset+2);
+    dump_prefix(offset+1, lineno);
+    printf("body:\n");
+    dump_node(mrb, WHILE_NODE_BODY(tree), offset+2);
+    break;
+
+  case NODE_UNTIL_MOD:
+    printf("NODE_UNTIL_MOD:\n");
+    dump_prefix(offset+1, lineno);
+    printf("cond:\n");
+    dump_node(mrb, UNTIL_NODE_CONDITION(tree), offset+2);
+    dump_prefix(offset+1, lineno);
+    printf("body:\n");
+    dump_node(mrb, UNTIL_NODE_BODY(tree), offset+2);
+    break;
+
+  case NODE_FOR:
+    printf("NODE_FOR:\n");
+    {
+      if (FOR_NODE_VAR(tree)) {
+        dump_prefix(offset+1, lineno);
+        printf("var:\n");
+        dump_node(mrb, FOR_NODE_VAR(tree), offset+2);
+      }
+      if (FOR_NODE_ITERABLE(tree)) {
+        dump_prefix(offset+1, lineno);
+        printf("iterable:\n");
+        dump_node(mrb, FOR_NODE_ITERABLE(tree), offset+2);
+      }
+      if (FOR_NODE_BODY(tree)) {
+        dump_prefix(offset+1, lineno);
+        printf("body:\n");
+        dump_node(mrb, FOR_NODE_BODY(tree), offset+2);
+      }
+    }
+    break;
+
+  case NODE_DOT2:
+    printf("NODE_DOT2:\n");
+    {
+      if (DOT2_NODE_LEFT(tree)) {
+        dump_prefix(offset+1, lineno);
+        printf("left:\n");
+        dump_node(mrb, DOT2_NODE_LEFT(tree), offset+2);
+      }
+      if (DOT2_NODE_RIGHT(tree)) {
+        dump_prefix(offset+1, lineno);
+        printf("right:\n");
+        dump_node(mrb, DOT2_NODE_RIGHT(tree), offset+2);
+      }
+    }
+    break;
+
+  case NODE_DOT3:
+    printf("NODE_DOT3:\n");
+    {
+      if (DOT3_NODE_LEFT(tree)) {
+        dump_prefix(offset+1, lineno);
+        printf("left:\n");
+        dump_node(mrb, DOT3_NODE_LEFT(tree), offset+2);
+      }
+      if (DOT3_NODE_RIGHT(tree)) {
+        dump_prefix(offset+1, lineno);
+        printf("right:\n");
+        dump_node(mrb, DOT3_NODE_RIGHT(tree), offset+2);
+      }
+    }
+    break;
+
+  case NODE_COLON2:
+    printf("NODE_COLON2:\n");
+    if (COLON2_NODE_BASE(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("base:\n");
+      dump_node(mrb, COLON2_NODE_BASE(tree), offset+2);
+    }
+    dump_prefix(offset+1, lineno);
+    printf("name: %s\n", mrb_sym_name(mrb, COLON2_NODE_NAME(tree)));
+    break;
+
+  case NODE_COLON3:
+    printf("NODE_COLON3: ::%s\n", mrb_sym_name(mrb, COLON3_NODE_NAME(tree)));
+    break;
+
+  case NODE_HASH:
+    {
+      printf("NODE_HASH:\n");
+      node *pairs = HASH_NODE_PAIRS(tree);
+      while (pairs) {
+        dump_prefix(offset+1, lineno);
+        printf("key:\n");
+        dump_node(mrb, pairs->car->car, offset+2);
+        dump_prefix(offset+1, lineno);
+        printf("value:\n");
+        dump_node(mrb, pairs->car->cdr, offset+2);
+        pairs = pairs->cdr;
+      }
+    }
+    break;
+
+  case NODE_SPLAT:
+    printf("NODE_SPLAT:\n");
+    dump_node(mrb, SPLAT_NODE_VALUE(tree), offset+1);
+    break;
+
+  case NODE_OP_ASGN:
+    printf("NODE_OP_ASGN:\n");
+    dump_prefix(offset+1, lineno);
+    printf("lhs:\n");
+    dump_node(mrb, OP_ASGN_NODE_LHS(tree), offset+2);
+    dump_prefix(offset+1, lineno);
+    printf("op='%s' (%d)\n", mrb_sym_name(mrb, OP_ASGN_NODE_OP(tree)), (int)OP_ASGN_NODE_OP(tree));
+    dump_node(mrb, OP_ASGN_NODE_RHS(tree), offset+1);
+    break;
+
+  case NODE_SUPER:
+    printf("NODE_SUPER:\n");
+    if (SUPER_NODE_ARGS(tree)) {
+      dump_callargs(mrb, SUPER_NODE_ARGS(tree), offset, lineno);
+    }
+    break;
+
+  case NODE_ZSUPER:
+    printf("NODE_ZSUPER:\n");
+    if (SUPER_NODE_ARGS(tree)) {
+      dump_callargs(mrb, SUPER_NODE_ARGS(tree), offset, lineno);
+    }
+    break;
+
+  case NODE_YIELD:
+    printf("NODE_YIELD:\n");
+    dump_recur(mrb, YIELD_NODE_ARGS(tree), offset+1);
+    break;
+
+  case NODE_REDO:
+    printf("NODE_REDO\n");
+    break;
+
+  case NODE_RETRY:
+    printf("NODE_RETRY\n");
+    break;
+
+  case NODE_BACK_REF:
+    printf("NODE_BACK_REF: $%c\n", node_to_int(tree));
+    break;
+
+  case NODE_NTH_REF:
+    printf("NODE_NTH_REF: $%d\n", node_to_int(tree));
+    break;
+
+  case NODE_BLOCK_ARG:
+    printf("NODE_BLOCK_ARG:\n");
+    dump_node(mrb, block_arg_node(tree)->value, offset+1);
+    break;
+
+  case NODE_REGX:
+    printf("NODE_REGX:\n");
+    if (REGX_NODE_LIST(tree)) {
+      dump_str(mrb, REGX_NODE_LIST(tree), offset+1, lineno);
+    }
+    if (REGX_NODE_FLAGS(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("flags: %s\n", REGX_NODE_FLAGS(tree));
+    }
+    if (REGX_NODE_ENCODING(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("encoding: %s\n", REGX_NODE_ENCODING(tree));
+    }
+    break;
+
+  case NODE_WORDS:
+    printf("NODE_WORDS:\n");
+    if (WORDS_NODE_ARGS(tree)) {
+      node *list = WORDS_NODE_ARGS(tree);
+      while (list && list->car) {
+        node *item = list->car;
+        if (item->car == 0 && item->cdr == 0) {
+          /* Skip separator (0 . 0) */
+        }
+        else if (item->car && item->cdr) {
+          /* String item: (len . str) */
+          dump_prefix(offset+1, lineno);
+          int len = node_to_int(item->car);
+          if (len >= 0 && len < 1000 && item->cdr) {
+            printf("word: \"%.*s\"\n", len, (char*)item->cdr);
+          }
+        }
+        list = list->cdr;
+      }
+    }
+    break;
+
+  case NODE_SYMBOLS:
+    printf("NODE_SYMBOLS:\n");
+    if (SYMBOLS_NODE_ARGS(tree)) {
+      node *list = SYMBOLS_NODE_ARGS(tree);
+      while (list && list->car) {
+        node *item = list->car;
+        if (item->car == 0 && item->cdr == 0) {
+          /* Skip separator (0 . 0) */
+        } else if (item->car && item->cdr) {
+          /* String item: (len . str) */
+          dump_prefix(offset+1, lineno);
+          int len = node_to_int(item->car);
+          if (len >= 0 && len < 1000 && item->cdr) {
+            printf("symbol: \"%.*s\"\n", len, (char*)item->cdr);
+          }
+        }
+        list = list->cdr;
+      }
+    }
+    break;
+
   case NODE_ALIAS:
     printf("NODE_ALIAS %s %s:\n",
-        mrb_sym_dump(mrb, node_to_sym(tree->car)),
-        mrb_sym_dump(mrb, node_to_sym(tree->cdr)));
+           mrb_sym_dump(mrb, node_to_sym(tree->car)),
+           mrb_sym_dump(mrb, node_to_sym(tree->cdr)));
     break;
 
   case NODE_UNDEF:
@@ -8532,189 +8278,112 @@ mrb_parser_dump(mrb_state *mrb, node *tree, int offset)
 
   case NODE_CLASS:
     printf("NODE_CLASS:\n");
-    if (tree->car->car == int_to_node(0)) {
-      dump_prefix(tree, offset+1);
-      printf(":%s\n", mrb_sym_name(mrb, node_to_sym(tree->car->cdr)));
+    {
+      if (CLASS_NODE_NAME(tree)) {
+        dump_cpath(mrb, MODULE_NODE_NAME(tree), offset+1, lineno);
+      }
+      if (CLASS_NODE_SUPERCLASS(tree)) {
+        dump_prefix(offset+1, lineno);
+        printf("super:\n");
+        dump_node(mrb, CLASS_NODE_SUPERCLASS(tree), offset+2);
+      }
+      if (CLASS_NODE_BODY(tree)) {
+        dump_prefix(offset+1, lineno);
+        printf("body:\n");
+        dump_node(mrb, CLASS_NODE_BODY(tree)->cdr, offset+2);
+      }
     }
-    else if (tree->car->car == int_to_node(1)) {
-      dump_prefix(tree, offset+1);
-      printf("::%s\n", mrb_sym_name(mrb, node_to_sym(tree->car->cdr)));
-    }
-    else {
-      mrb_parser_dump(mrb, tree->car->car, offset+1);
-      dump_prefix(tree, offset+1);
-      printf("::%s\n", mrb_sym_name(mrb, node_to_sym(tree->car->cdr)));
-    }
-    if (tree->cdr->car) {
-      dump_prefix(tree, offset+1);
-      printf("super:\n");
-      mrb_parser_dump(mrb, tree->cdr->car, offset+2);
-    }
-    dump_prefix(tree, offset+1);
-    printf("body:\n");
-    mrb_parser_dump(mrb, tree->cdr->cdr->car->cdr, offset+2);
     break;
 
   case NODE_MODULE:
     printf("NODE_MODULE:\n");
-    if (tree->car->car == int_to_node(0)) {
-      dump_prefix(tree, offset+1);
-      printf(":%s\n", mrb_sym_name(mrb, node_to_sym(tree->car->cdr)));
+    {
+      if (MODULE_NODE_NAME(tree)) {
+        dump_cpath(mrb, MODULE_NODE_NAME(tree), offset+1, lineno);
+      }
+      if (MODULE_NODE_BODY(tree)) {
+        dump_prefix(offset+1, lineno);
+        printf("body:\n");
+        dump_node(mrb, MODULE_NODE_BODY(tree)->cdr, offset+2);
+      }
     }
-    else if (tree->car->car == int_to_node(1)) {
-      dump_prefix(tree, offset+1);
-      printf("::%s\n", mrb_sym_name(mrb, node_to_sym(tree->car->cdr)));
-    }
-    else {
-      mrb_parser_dump(mrb, tree->car->car, offset+1);
-      dump_prefix(tree, offset+1);
-      printf("::%s\n", mrb_sym_name(mrb, node_to_sym(tree->car->cdr)));
-    }
-    dump_prefix(tree, offset+1);
-    printf("body:\n");
-    mrb_parser_dump(mrb, tree->cdr->car->cdr, offset+2);
     break;
 
   case NODE_SCLASS:
     printf("NODE_SCLASS:\n");
-    mrb_parser_dump(mrb, tree->car, offset+1);
-    dump_prefix(tree, offset+1);
-    printf("body:\n");
-    mrb_parser_dump(mrb, tree->cdr->car->cdr, offset+2);
-    break;
-
-  case NODE_DEF:
-    printf("NODE_DEF:\n");
-    dump_prefix(tree, offset+1);
-    printf("%s\n", mrb_sym_dump(mrb, node_to_sym(tree->car)));
-    tree = tree->cdr;
     {
-      node *n2 = tree->car;
-      mrb_bool first_lval = TRUE;
-
-      if (n2 && (n2->car || n2->cdr)) {
-        dump_prefix(n2, offset+1);
-        printf("local variables:\n");
-        dump_prefix(n2, offset+2);
-        while (n2) {
-          if (n2->car) {
-            if (!first_lval) printf(", ");
-            printf("%s", mrb_sym_name(mrb, node_to_sym(n2->car)));
-            first_lval = FALSE;
-          }
-          n2 = n2->cdr;
-        }
-        printf("\n");
+      if (SCLASS_NODE_OBJ(tree)) {
+        dump_prefix(offset+1, lineno);
+        printf("obj:\n");
+        dump_node(mrb, SCLASS_NODE_OBJ(tree), offset+2);
+      }
+      if (SCLASS_NODE_BODY(tree)) {
+        dump_prefix(offset+1, lineno);
+        printf("body:\n");
+        dump_node(mrb, SCLASS_NODE_BODY(tree)->cdr, offset+2);
       }
     }
-    tree = tree->cdr;
-    if (tree->car) {
-      dump_args(mrb, tree->car, offset);
-    }
-    mrb_parser_dump(mrb, tree->cdr->car, offset+1);
     break;
 
   case NODE_SDEF:
-    printf("NODE_SDEF:\n");
-    mrb_parser_dump(mrb, tree->car, offset+1);
-    tree = tree->cdr;
-    dump_prefix(tree, offset+1);
-    printf(":%s\n", mrb_sym_dump(mrb, node_to_sym(tree->car)));
-    tree = tree->cdr->cdr;
-    if (tree->car) {
-      dump_args(mrb, tree->car, offset+1);
+    printf("NODE_SDEF: %s\n", mrb_sym_dump(mrb, DEF_NODE_NAME(tree)));
+    if (SDEF_NODE_OBJ(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("recv:\n");
+      dump_node(mrb, SDEF_NODE_OBJ(tree), offset+2);
     }
-    tree = tree->cdr;
-    mrb_parser_dump(mrb, tree->car, offset+1);
+    if (SDEF_NODE_ARGS(tree)) {
+      dump_args(mrb, SDEF_NODE_ARGS(tree), offset+1, lineno);
+    }
+    if (SDEF_NODE_LOCALS(tree)) {
+      dump_locals(mrb, SDEF_NODE_LOCALS(tree), offset+1, lineno);
+    }
+    if (SDEF_NODE_BODY(tree)) {
+      dump_prefix(offset+1, lineno);
+      printf("body:\n");
+      dump_node(mrb, SDEF_NODE_BODY(tree), offset+2);
+    }
     break;
 
   case NODE_POSTEXE:
     printf("NODE_POSTEXE:\n");
-    mrb_parser_dump(mrb, tree, offset+1);
+    dump_node(mrb, tree, offset+1);
     break;
 
   case NODE_HEREDOC:
-    printf("NODE_HEREDOC (<<%s):\n", ((parser_heredoc_info*)tree)->term);
-    dump_recur(mrb, ((parser_heredoc_info*)tree)->doc, offset+1);
-    break;
-
-  case NODE_ARGS_TAIL:
-    printf("NODE_ARGS_TAIL:\n");
-    {
-      node *kws = tree->car;
-
-      while (kws) {
-        mrb_parser_dump(mrb, kws->car, offset+1);
-        kws = kws->cdr;
-      }
+    printf("NODE_HEREDOC:\n");
+    if (heredoc_node(tree)->info.term) {
+      dump_prefix(offset+1, lineno);
+      printf("terminator: \"%s\"\n", heredoc_node(tree)->info.term);
     }
-    tree = tree->cdr;
-    if (tree->car) {
-      mrb_assert(node_to_int(tree->car->car) == NODE_KW_REST_ARGS);
-      mrb_parser_dump(mrb, tree->car, offset+1);
+    if (heredoc_node(tree)->info.doc) {
+      dump_prefix(offset+1, lineno);
+      printf("body:\n");
+      dump_str(mrb, heredoc_node(tree)->info.doc, offset+2, lineno);
     }
-    tree = tree->cdr;
-    if (tree->car) {
-      dump_prefix(tree, offset+1);
-      printf("block='%s'\n", mrb_sym_name(mrb, node_to_sym(tree->car)));
+    if (heredoc_node(tree)->info.allow_indent) {
+      dump_prefix(offset+1, lineno);
+      printf("allow_indent: true\n");
     }
-    break;
-
-  case NODE_KW_ARG:
-    printf("NODE_KW_ARG %s:\n", mrb_sym_name(mrb, node_to_sym(tree->car)));
-    mrb_parser_dump(mrb, tree->cdr->car, offset + 1);
-    break;
-
-  case NODE_KW_REST_ARGS:
-    if (tree)
-      printf("NODE_KW_REST_ARGS %s\n", mrb_sym_name(mrb, node_to_sym(tree)));
-    else
-      printf("NODE_KW_REST_ARGS\n");
-    break;
-
-  case NODE_VARIABLE:
-    /* Handle variable-sized nodes wrapped in NODE_VARIABLE */
-    {
-      enum node_type var_type = VAR_NODE_TYPE(tree);
-      switch (var_type) {
-      case NODE_SCOPE:
-        printf("NODE_SCOPE:\n");
-        {
-          struct mrb_ast_scope_node *scope = scope_node(tree);
-          node *n2 = scope->locals;
-          mrb_bool first_lval = TRUE;
-
-          if (n2 && (n2->car || n2->cdr)) {
-            dump_prefix(tree, offset+1);
-            printf("local variables:\n");
-            dump_prefix(tree, offset+2);
-            while (n2) {
-              if (n2->car) {
-                if (!first_lval) printf(", ");
-                printf("%s", mrb_sym_name(mrb, node_to_sym(n2->car)));
-                first_lval = FALSE;
-              }
-              n2 = n2->cdr;
-            }
-            printf("\n");
-          }
-        }
-        tree = scope_node(tree)->body;
-        offset++;
-        goto again;
-
-      default:
-        printf("NODE_VARIABLE (unsupported type: %d)\n", var_type);
-        break;
-      }
+    if (heredoc_node(tree)->info.remove_indent) {
+      dump_prefix(offset+1, lineno);
+      printf("remove_indent: true\n");
     }
     break;
 
   default:
-    printf("node type: %d (0x%x)\n", nodetype, (unsigned)nodetype);
+    /* Fallback: treat as a traditional cons-list and recursively dump */
+    printf("unknown node type %d (0x%x), dumping as list:\n", nodetype, (unsigned)nodetype);
+    dump_recur(mrb, tree, offset+1);
     break;
   }
 #endif
+}
+
+void
+mrb_parser_dump(mrb_state *mrb, node *tree, int offset)
+{
+  dump_node(mrb, tree, offset);
 }
 
 typedef mrb_bool mrb_parser_foreach_top_variable_func(mrb_state *mrb, mrb_sym sym, void *user);
@@ -8726,7 +8395,7 @@ mrb_parser_foreach_top_variable(mrb_state *mrb, struct mrb_parser_state *p, mrb_
   const mrb_ast_node *n = p->tree;
   if (node_type_p((node*)n, NODE_SCOPE)) {
     /* Extract locals from variable-sized NODE_SCOPE */
-    struct mrb_ast_scope_node *scope = scope_node(n->cdr);
+    struct mrb_ast_scope_node *scope = scope_node(n);
     n = scope->locals;
     for (; n; n = n->cdr) {
       mrb_sym sym = node_to_sym(n->car);
