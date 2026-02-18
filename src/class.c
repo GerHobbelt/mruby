@@ -1633,7 +1633,7 @@ get_args_v(mrb_state *mrb, mrb_args_format format, void** ptr, va_list *ap)
 
     case ':':
       {
-        mrb_value ksrc = mrb_hash_p(kdict) ? mrb_hash_dup(mrb, kdict) : mrb_hash_new(mrb);
+        mrb_value ksrc = mrb_hash_p(kdict) ? kdict : mrb_hash_new(mrb);
         const mrb_kwargs *kwargs = GET_ARG(const mrb_kwargs*);
         mrb_value *rest;
 
@@ -3959,7 +3959,7 @@ init_copy(mrb_state *mrb, mrb_value dest, mrb_value obj)
     case MRB_TT_ISTRUCT:
       mrb_istruct_copy(dest, obj);
       break;
-#if !defined(MRB_NO_FLOAT) && defined(MRB_WORDBOX_NO_FLOAT_TRUNCATE)
+#if !defined(MRB_NO_FLOAT) && defined(MRB_WORD_BOXING)
     case MRB_TT_FLOAT:
       {
         struct RFloat *f = (struct RFloat*)mrb_obj_ptr(dest);
@@ -4206,7 +4206,7 @@ static const mrb_irep new_irep = {
 
 mrb_alignas(8)
 static const struct RProc new_proc = {
-  NULL, NULL, MRB_TT_PROC, MRB_GC_RED, MRB_OBJ_IS_FROZEN, MRB_PROC_SCOPE | MRB_PROC_STRICT,
+  NULL, MRB_TT_PROC, MRB_GC_RED, MRB_OBJ_IS_FROZEN, MRB_PROC_SCOPE | MRB_PROC_STRICT,
   { &new_irep }, NULL, { NULL }
 };
 
@@ -4238,7 +4238,7 @@ static const mrb_irep neq_irep = {
 
 mrb_alignas(8)
 static const struct RProc neq_proc = {
-  NULL, NULL, MRB_TT_PROC, MRB_GC_RED, MRB_OBJ_IS_FROZEN, MRB_PROC_SCOPE | MRB_PROC_STRICT,
+  NULL, MRB_TT_PROC, MRB_GC_RED, MRB_OBJ_IS_FROZEN, MRB_PROC_SCOPE | MRB_PROC_STRICT,
   { &neq_irep }, NULL, { NULL }
 };
 

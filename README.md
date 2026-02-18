@@ -49,7 +49,7 @@ of the Ministry of Economy, Trade and Industry of Japan.
 
 To get mruby, you can download the stable version 3.4.0 from the official mruby
 GitHub repository or clone the trunk of the mruby source tree with the "git
-clone" command. You can also install and compile mruby using [ruby-install](https://github.com/postmodern/ruby-install), [ruby-build](https://github.com/rbenv/ruby-build) or [rvm](https://github.com/rvm/rvm).
+clone" command. You can also install and compile mruby using [ruby-install](https://github.com/postmodern/ruby-install), [ruby-build](https://github.com/rbenv/ruby-build), [rvm](https://github.com/rvm/rvm), [conda](https://anaconda.org/channels/conda-forge/packages/mruby/overview) or [Homebrew](https://formulae.brew.sh/formula/mruby).
 
 The latest development version of mruby can be downloaded via the following URL: [https://github.com/mruby/mruby/zipball/master](https://github.com/mruby/mruby/zipball/master)
 
@@ -176,5 +176,5 @@ By contributing, you grant non-exclusive rights to your code under the MIT Licen
 
 [![mruby Contributors](https://contrib.rocks/image?repo=mruby/mruby&anon=1&max=500)](https://github.com/mruby/mruby/graphs/contributors)
 
-[ISO-standard]: https://www.iso.org/iso/iso_catalogue/catalogue_tc/catalogue_detail.htm?csnumber=59579
+[ISO-standard]: https://www.iso.org/standard/59579.html
 [contribution-guidelines]: CONTRIBUTING.md

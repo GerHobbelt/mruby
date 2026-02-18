@@ -2043,6 +2043,70 @@ mrb_hash_compact(mrb_state *mrb, mrb_value hash)
 }
 
 /*
+ * Internal method for pattern matching key check + value extraction.
+ * Returns an array of values if all keys exist, false otherwise.
+ *
+ *   {a: 1, b: 2}.__pat_values([:a, :b])  #=> [1, 2]
+ *   {a: 1}.__pat_values([:a, :b])         #=> false
+ */
+static mrb_value
+mrb_hash_pat_values(mrb_state *mrb, mrb_value hash)
+{
+  mrb_value keys;
+  mrb_get_args(mrb, "A", &keys);
+
+  const mrb_value *ary = RARRAY_PTR(keys);
+  mrb_int klen = RARRAY_LEN(keys);
+  struct RHash *h = mrb_hash_ptr(hash);
+  mrb_value result = mrb_ary_new_capa(mrb, klen);
+  int ai = mrb_gc_arena_save(mrb);
+
+  for (mrb_int i = 0; i < klen; i++) {
+    mrb_value val;
+    if (!h_get(mrb, h, ary[i], &val)) {
+      return mrb_false_value();
+    }
+    mrb_ary_push(mrb, result, val);
+    mrb_gc_arena_restore(mrb, ai);
+  }
+  return result;
+}
+
+/*
+ * Internal method for pattern matching **rest.
+ * Returns a new hash excluding keys in the given array.
+ *
+ *   {a: 1, b: 2, c: 3}.__except([:a, :c])  #=> {b: 2}
+ */
+static mrb_value
+mrb_hash_except_keys(mrb_state *mrb, mrb_value hash)
+{
+  mrb_value keys;
+  mrb_get_args(mrb, "A", &keys);
+
+  const mrb_value *ary = RARRAY_PTR(keys);
+  mrb_int klen = RARRAY_LEN(keys);
+  mrb_value result = mrb_hash_new(mrb);
+  struct RHash *h = mrb_hash_ptr(hash);
+  int ai = mrb_gc_arena_save(mrb);
+
+  H_EACH(h, entry) {
+    mrb_bool found = FALSE;
+    for (mrb_int i = 0; i < klen; i++) {
+      if (mrb_equal(mrb, entry->key, ary[i])) {
+        found = TRUE;
+        break;
+      }
+    }
+    if (!found) {
+      mrb_hash_set(mrb, result, entry->key, entry->val);
+    }
+    mrb_gc_arena_restore(mrb, ai);
+  }
+  return result;
+}
+
+/*
  * call-seq:
  *    hash.to_s    -> string
  *    hash.inspect -> string
@@ -2280,5 +2344,7 @@ mrb_init_hash(mrb_state *mrb)
   mrb_define_method_id(mrb, h, MRB_SYM(rassoc),          mrb_hash_rassoc,      MRB_ARGS_REQ(1));
   mrb_define_method_id(mrb, h, MRB_SYM(__merge),         mrb_hash_merge_m,     MRB_ARGS_REQ(1));
   mrb_define_method_id(mrb, h, MRB_SYM(__compact),       mrb_hash_compact,     MRB_ARGS_NONE()); /* implementation of Hash#compact! */
+  mrb_define_method_id(mrb, h, MRB_SYM(__pat_values),    mrb_hash_pat_values,  MRB_ARGS_REQ(1)); /* for pattern matching keys */
+  mrb_define_method_id(mrb, h, MRB_SYM(__except),        mrb_hash_except_keys, MRB_ARGS_REQ(1)); /* for pattern matching **rest */
 }
 #undef lesser

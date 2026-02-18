@@ -4451,6 +4451,32 @@ codegen_case_match(codegen_scope *s, node *varnode, int val)
  * fail_pos: linked list of jump positions for pattern match failure
  * known_array_len: -1 if unknown, >= 0 if target is known to be an array of that length
  */
+/* generate code to load a hash pattern key onto the stack */
+static void
+gen_pat_key(codegen_scope *s, node *key)
+{
+  if (node_type(key) == NODE_SYM) {
+    genop_2(s, OP_LOADSYM, cursp(), sym_idx(s, sym_node(key)->symbol));
+  }
+  else {
+    codegen(s, key, VAL);
+  }
+}
+
+/* generate OP_ARRAY of hash pattern keys on the stack */
+static void
+gen_pat_keys_ary(codegen_scope *s, node *pairs, int num_keys)
+{
+  int i = 0;
+  node *pair;
+  for (pair = pairs; pair; pair = pair->cdr, i++) {
+    gen_pat_key(s, pair->car->car);
+    push();
+  }
+  genop_2(s, OP_ARRAY, cursp() - num_keys, num_keys);
+  for (i = 1; i < num_keys; i++) pop();
+}
+
 static void
 codegen_pattern(codegen_scope *s, node *pattern, int target, uint32_t *fail_pos, int known_array_len)
 {
@@ -4498,9 +4524,12 @@ codegen_pattern(codegen_scope *s, node *pattern, int target, uint32_t *fail_pos,
        * 1. Left pattern is not another NODE_PAT_ALT (avoid recursion issues)
        * 2. Left pattern generated at least one JMPNOT
        * 3. The last JMPNOT is immediately before current position
+       * 4. The instruction is actually OP_JMPNOT (not OP_JMP which has
+       *    different format S vs BS - converting OP_JMP would corrupt bytecode)
        * In this case, convert JMPNOT to JMPIF and skip generating JMP */
       if (node_type(pat_alt->left) != NODE_PAT_ALT &&
-          left_fail != JMPLINK_START && left_fail + 2 == s->pc) {
+          left_fail != JMPLINK_START && left_fail + 2 == s->pc &&
+          s->iseq[left_fail - 2] == OP_JMPNOT) {
         /* Extract the previous link from the JMPNOT chain.
          * The chain uses relative offsets where the end is marked by
          * an offset that points to address 0 (i.e., (pos+2)+offset == 0) */
@@ -4564,9 +4593,11 @@ codegen_pattern(codegen_scope *s, node *pattern, int target, uint32_t *fail_pos,
         *fail_pos = tmp;
       }
       else {
-        /* Variable not found - this is an error case, but for robustness fail the match */
-        tmp = genjmp(s, OP_JMP, *fail_pos);
-        *fail_pos = tmp;
+        /* Variable not found - raise compile error like CRuby */
+        const char *name = mrb_sym_name_len(s->mrb, pat_pin->name, NULL);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%.200s: no such local variable", name);
+        codegen_error(s, buf);
       }
     }
     break;
@@ -4938,88 +4969,88 @@ codegen_pattern(codegen_scope *s, node *pattern, int target, uint32_t *fail_pos,
       /* Count keys */
       for (pair = pat_hash->pairs; pair; pair = pair->cdr) num_keys++;
 
-      /* Build array of keys to pass to deconstruct_keys */
-      /* Generate: target.deconstruct_keys([key1, key2, ...]) */
+      /* Call deconstruct_keys.
+       * Pass nil when all keys are needed (rest or exact match).
+       * Pass keys array only for partial match (optimization for custom classes). */
       gen_move(s, cursp(), target, 0);
       push();
-      if (pat_hash->rest == (node*)-1) {
-        /* **nil: pass nil to deconstruct_keys (exact match) */
+      if (pat_hash->rest == NULL && num_keys > 0) {
+        /* Partial match: pass keys array */
+        gen_pat_keys_ary(s, pat_hash->pairs, num_keys);
+      }
+      else {
         genop_1(s, OP_LOADNIL, cursp());
         push();
       }
-      else if (num_keys > 0) {
-        /* Build array of expected keys */
+      genop_3(s, OP_SEND, hash_reg, sym_idx(s, MRB_SYM_2(s->mrb, deconstruct_keys)), 1);
+      pop();
+
+      /* Check all keys exist and get values via __pat_values */
+      if (num_keys > 0) {
+        int vals_reg = cursp();
+        gen_move(s, vals_reg, hash_reg, 0);
+        push();
+        gen_pat_keys_ary(s, pat_hash->pairs, num_keys);
+        genop_3(s, OP_SEND, vals_reg, sym_idx(s, MRB_SYM_2(s->mrb, __pat_values)), 1);
+        pop();  /* keys_ary */
+        /* vals_reg = values array or false; fail if false */
+        tmp = genjmp2(s, OP_JMPNOT, vals_reg, *fail_pos, 1);
+        *fail_pos = tmp;
+
+        /* Match each value against its pattern */
         int i = 0;
         for (pair = pat_hash->pairs; pair; pair = pair->cdr, i++) {
-          node *key = pair->car->car;
-          if (node_type(key) == NODE_SYM) {
-            genop_2(s, OP_LOADSYM, cursp(), sym_idx(s, sym_node(key)->symbol));
-          }
-          else {
-            /* String or other key - codegen it */
-            codegen(s, key, VAL);
-          }
+          node *pat = pair->car->cdr;
+
+          gen_move(s, cursp(), vals_reg, 0);
           push();
-        }
-        genop_2(s, OP_ARRAY, cursp() - num_keys, num_keys);
-        /* Adjust stack: we pushed num_keys items, now just need 1 for array */
-        for (i = 1; i < num_keys; i++) pop();
-      }
-      else {
-        /* Empty hash pattern or ** only: pass empty array */
-        genop_2(s, OP_ARRAY, cursp(), 0);
-        push();
-      }
-      genop_3(s, OP_SEND, hash_reg, sym_idx(s, MRB_SYM_2(s->mrb, deconstruct_keys)), 1);
-      pop();  /* Pop argument */
-      /* hash_reg now contains the deconstructed hash */
+          gen_int(s, cursp(), i);
+          push(); push(); pop(); pop(); pop();
+          genop_3(s, OP_SEND, cursp(), sym_idx(s, MRB_OPSYM_2(s->mrb, aref)), 1);
+          push();
 
-      /* Match each key-pattern pair */
-      for (pair = pat_hash->pairs; pair; pair = pair->cdr) {
-        node *key = pair->car->car;
-        node *pat = pair->car->cdr;
-
-        /* Generate: hash[key] */
-        gen_move(s, cursp(), hash_reg, 0);
-        push();
-        if (node_type(key) == NODE_SYM) {
-          genop_2(s, OP_LOADSYM, cursp(), sym_idx(s, sym_node(key)->symbol));
+          codegen_pattern(s, pat, cursp() - 1, fail_pos, -1);
+          pop();
         }
-        else {
-          codegen(s, key, VAL);
-        }
-        push(); push(); pop(); pop(); pop();
-        genop_3(s, OP_SEND, cursp(), sym_idx(s, MRB_OPSYM_2(s->mrb, aref)), 1);
-        push();  /* Preserve value for codegen_pattern */
-
-        /* Match pattern against value */
-        codegen_pattern(s, pat, cursp() - 1, fail_pos, -1);
-        pop();  /* Clean up value slot */
+        pop();  /* vals_reg */
       }
 
       /* Handle rest pattern */
-      if (pat_hash->rest == (node*)-1) {
-        /* **nil: verify no extra keys (already handled by deconstruct_keys returning nil for unknown keys) */
-        /* The exact match behavior depends on deconstruct_keys implementation */
+      if (pat_hash->rest == (node*)-1 || (num_keys == 0 && pat_hash->rest == NULL)) {
+        /* **nil or empty {}: exact match - verify hash.size == num_keys */
+        gen_move(s, cursp(), hash_reg, 0);
+        push();
+        genop_3(s, OP_SEND, cursp() - 1, sym_idx(s, MRB_SYM_2(s->mrb, size)), 0);
+        gen_int(s, cursp(), num_keys);
+        genop_1(s, OP_EQ, cursp() - 1);
+        tmp = genjmp2(s, OP_JMPNOT, cursp() - 1, *fail_pos, 1);
+        *fail_pos = tmp;
+        pop();
       }
       else if (pat_hash->rest && pat_hash->rest != (node*)-2) {
-        /* **var: capture remaining keys into a variable */
-        /* This requires computing: hash.reject {|k,v| [key1, key2, ...].include?(k) } */
-        /* For now, this is a more complex operation - we'll implement basic support */
+        /* **var: capture remaining keys via hash.__except(keys_array) */
         struct mrb_ast_pat_var_node *rest_var = pat_var_node(pat_hash->rest);
         if (rest_var->name) {
           int var_idx = lv_idx(s, rest_var->name);
-          /* Simplified: just copy the hash for now */
-          /* Full implementation would filter out matched keys */
-          gen_move(s, cursp(), hash_reg, 0);
-          if (var_idx > 0) {
-            gen_move(s, var_idx, cursp(), 1);
+          int recv = cursp();
+          gen_move(s, recv, hash_reg, 0);
+          push();
+          if (num_keys > 0) {
+            gen_pat_keys_ary(s, pat_hash->pairs, num_keys);
+            genop_3(s, OP_SEND, recv, sym_idx(s, MRB_SYM_2(s->mrb, __except)), 1);
+            pop();
           }
+          else {
+            genop_3(s, OP_SEND, recv, sym_idx(s, MRB_SYM_2(s->mrb, dup)), 0);
+          }
+          if (var_idx > 0) {
+            gen_move(s, var_idx, recv, 1);
+          }
+          pop();
         }
       }
-      /* **  (anonymous rest) - nothing to capture */
 
-      pop();  /* Pop hash_reg */
+      pop();  /* hash_reg */
     }
     break;
 
@@ -6696,11 +6727,12 @@ codegen(codegen_scope *s, node *tree, int val)
             fail_pos + 2 == s->pc &&
             s->iseq[fail_pos - 2] == OP_JMPNOT) {
           if (mp->raise_on_fail) {
-            /* Single failure point with raise - replace JMPNOT with MATCHERR */
-            int reg = s->iseq[fail_pos - 1];  /* Register from JMPNOT */
-            s->pc = fail_pos - 2;  /* Rewind past JMPNOT */
-            s->lastpc = s->pc;
-            genop_1(s, OP_MATCHERR, reg);  /* Emit MATCHERR with the register */
+            /* Replace JMPNOT(BS,4bytes) with MATCHERR(B,2bytes)+NOP+NOP;
+             * keep the same size so that any jump targeting s->pc stays valid */
+            s->iseq[fail_pos - 2] = OP_MATCHERR;
+            /* fail_pos-1 already holds the register operand */
+            s->iseq[fail_pos] = OP_NOP;
+            s->iseq[fail_pos + 1] = OP_NOP;
             s->sp = saved_sp - 1;
             if (val) push();
             break;  /* Pattern matching complete */
