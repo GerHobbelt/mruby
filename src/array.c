@@ -1124,7 +1124,6 @@ mrb_ary_splice(mrb_state *mrb, mrb_value ary, mrb_int head, mrb_int len, mrb_val
   mrb_int alen = ARY_LEN(a);
   const mrb_value *argv;
   mrb_int argc;
-  mrb_int tail;
 
   ary_modify(mrb, a);
 
@@ -1140,7 +1139,8 @@ mrb_ary_splice(mrb_state *mrb, mrb_value ary, mrb_int head, mrb_int len, mrb_val
   out_of_range:
     mrb_raisef(mrb, E_INDEX_ERROR, "index %i is out of array", head);
   }
-  tail = head + len;
+
+  mrb_int tail = head + len;
   if (alen < len || alen < tail) {
     len = alen - head;
     tail = head + len;
@@ -1956,11 +1956,8 @@ mrb_ary_cmp(mrb_state *mrb, mrb_value ary1)
   if (mrb_obj_equal(mrb, ary1, ary2)) return mrb_fixnum_value(0);
   if (!mrb_array_p(ary2)) return mrb_nil_value();
 
-  /* Hoist pointer retrieval outside loop to avoid repeated conditionals */
-  mrb_value *ptr1 = RARRAY_PTR(ary1);
-  mrb_value *ptr2 = RARRAY_PTR(ary2);
   for (mrb_int i=0; i<RARRAY_LEN(ary1) && i<RARRAY_LEN(ary2); i++) {
-    mrb_int n = mrb_cmp(mrb, ptr1[i], ptr2[i]);
+    mrb_int n = mrb_cmp(mrb, RARRAY_PTR(ary1)[i], RARRAY_PTR(ary2)[i]);
     if (n == -2) return mrb_nil_value();
     if (n != 0) return mrb_fixnum_value(n);
   }
@@ -2049,8 +2046,11 @@ mrb_ary_delete(mrb_state *mrb, mrb_value self)
 
 
 static mrb_bool
-sort_cmp(mrb_state *mrb, mrb_value ary, mrb_value *p, mrb_value a_val, mrb_value b_val, mrb_value blk)
+sort_cmp(mrb_state *mrb, mrb_value ary, mrb_value a_val, mrb_value b_val, mrb_value blk)
 {
+  mrb_value *p = RARRAY_PTR(ary);
+  mrb_int n = RARRAY_LEN(ary);
+
   mrb_int cmp;
   int ai = mrb_gc_arena_save(mrb);
 
@@ -2094,7 +2094,7 @@ sort_cmp(mrb_state *mrb, mrb_value ary, mrb_value *p, mrb_value a_val, mrb_value
   if (cmp == -2) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "comparison failed");
   }
-  if (RARRAY_PTR(ary) != p) {
+  if (RARRAY_PTR(ary) != p || RARRAY_LEN(ary) != n) {
     mrb_raise(mrb, E_RUNTIME_ERROR, "array modified during sort");
   }
   return cmp > 0;
@@ -2109,10 +2109,10 @@ heapify(mrb_state *mrb, mrb_value ary, mrb_value *a, mrb_int index, mrb_int size
     mrb_int left_index = 2 * index + 1;
     mrb_int right_index = left_index + 1;
 
-    if (left_index < size && sort_cmp(mrb, ary, a, a[left_index], a[max], blk)) {
+    if (left_index < size && sort_cmp(mrb, ary, a[left_index], a[max], blk)) {
       max = left_index;
     }
-    if (right_index < size && sort_cmp(mrb, ary, a, a[right_index], a[max], blk)) {
+    if (right_index < size && sort_cmp(mrb, ary, a[right_index], a[max], blk)) {
       max = right_index;
     }
 
@@ -2139,7 +2139,7 @@ insertion_sort(mrb_state *mrb, mrb_value ary, mrb_value *a, mrb_int size, mrb_va
     mrb_int j = i - 1;
 
     /* Move elements that are greater than key to one position ahead */
-    while (j >= 0 && sort_cmp(mrb, ary, a, a[j], key, blk)) {
+    while (j >= 0 && sort_cmp(mrb, ary, a[j], key, blk)) {
       a[j + 1] = a[j];
       j--;
     }

@@ -309,6 +309,15 @@ mpz_clear(mpz_ctx_t *ctx, mpz_t *s)
 static void
 mpz_move(mpz_ctx_t *ctx, mpz_t *y, mpz_t *x)
 {
+#if MRB_BIGINT_POOL_SIZE > 0
+  if (MPZ_HAS_POOL(ctx) && is_pool_memory(x, MPZ_POOL(ctx))) {
+    /* Source is pool memory - use deep copy instead of pointer transfer */
+    mpz_set(ctx, y, x);
+    mpz_clear(ctx, x);
+    return;
+  }
+#endif
+  /* Normal move: transfer ownership */
   mpz_clear(ctx, y);
   y->sn = x->sn;
   y->sz = x->sz;
