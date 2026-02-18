@@ -2153,7 +2153,7 @@ prohibit_literals(parser_state *p, node *n)
 %nonassoc tLOWEST
 %nonassoc tLBRACE_ARG
 
-%nonassoc  modifier_if modifier_unless modifier_while modifier_until
+%nonassoc  modifier_if modifier_unless modifier_while modifier_until keyword_in
 %left  keyword_or keyword_and
 %right keyword_not
 %right '=' tOP_ASGN
@@ -2447,7 +2447,7 @@ expr            : command_call
                       p->in_kwarg--;
                       $$ = new_match_pat(p, $1, $4, FALSE);
                     }
-                | arg
+                | arg   %prec tLOWEST
                 ;
 
 defn_head       : keyword_def fname
@@ -3986,7 +3986,7 @@ p_value         : p_var
                     }
                 | tSTRING
                     {
-                      $$ = new_pat_value(p, $1);
+                      $$ = new_pat_value(p, new_str(p, list1($1)));
                     }
                 | keyword_nil
                     {
@@ -4133,6 +4133,7 @@ p_hash_elems    : p_hash_elem
 
 /* Hash pattern element: key: pattern or key: (shorthand) */
 /* Use p_as, not p_expr to avoid brace-less recursion inside hash patterns */
+/* Note: CRuby only supports label syntax (foo:), not hashrocket (:foo =>) */
 p_hash_elem     : tIDENTIFIER tLABEL_TAG p_as
                     {
                       /* {key: pattern} */
@@ -4142,11 +4143,6 @@ p_hash_elem     : tIDENTIFIER tLABEL_TAG p_as
                     {
                       /* {key:} shorthand - binds to variable with same name */
                       $$ = cons(new_sym(p, $1), new_pat_var(p, $1));
-                    }
-                | symbol tASSOC p_as
-                    {
-                      /* {:"key" => pattern} or {:key => pattern} */
-                      $$ = cons($1, $3);
                     }
                 ;
 
@@ -6123,6 +6119,11 @@ parser_yylex(parser_state *p)
   int cmd_state;
   enum mrb_lex_state_enum last_state;
   int token_column;
+
+  /* Early termination if too many errors - prevents DoS from malformed input */
+  if (p->nerr > 10) {
+    return 0;  /* EOF */
+  }
 
   if (p->lex_strterm) {
     if (is_strterm_type(p, STR_FUNC_HEREDOC)) {

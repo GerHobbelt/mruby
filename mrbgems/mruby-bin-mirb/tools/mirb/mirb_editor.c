@@ -340,6 +340,7 @@ mirb_editor_init(mirb_editor *ed)
   ed->prompt_cont_fmt = NULL;
   ed->line_num_base = 1;
   ed->use_color = FALSE;
+  mirb_highlight_init(&ed->highlight, FALSE);
   ed->initialized = TRUE;
 
   return TRUE;
@@ -573,6 +574,7 @@ void
 mirb_editor_set_color(mirb_editor *ed, mrb_bool enable)
 {
   ed->use_color = enable;
+  mirb_highlight_init(&ed->highlight, enable);
 }
 
 /*
@@ -657,10 +659,13 @@ refresh_display(mirb_editor *ed)
   mirb_term_cursor_col(1);
   mirb_term_clear_below();
 
+  /* Reset highlight state for fresh scan */
+  mirb_highlight_reset(&ed->highlight);
+
   /* Redraw all lines */
   for (size_t i = 0; i < ed->buf.line_count; i++) {
     print_prompt(ed, i);
-    printf("%s", mirb_buffer_line_at(&ed->buf, i));
+    mirb_highlight_print_line(&ed->highlight, mirb_buffer_line_at(&ed->buf, i));
 
     if (i < ed->buf.line_count - 1) {
       printf("\r\n");
@@ -676,7 +681,8 @@ refresh_display(mirb_editor *ed)
 
   /* Position column on cursor line (calculate actual prompt length) */
   size_t prompt_len = calc_prompt_len(ed, ed->buf.cursor_line);
-  mirb_term_cursor_col((int)(prompt_len + ed->buf.cursor_col + 1));
+  size_t display_col = mirb_buffer_cursor_display_col(&ed->buf);
+  mirb_term_cursor_col((int)(prompt_len + display_col + 1));
 
   /* Update tracking */
   ed->prev_line_count = ed->buf.line_count;
@@ -942,6 +948,13 @@ handle_key(mirb_editor *ed, int key, mirb_edit_result *result)
         perform_dedent(&ed->buf);
       }
     }
+#ifdef MRB_UTF8_STRING
+    /* Handle UTF-8 multibyte characters (bytes >= 0x80) */
+    else if (key >= 128 && key <= 255) {
+      mirb_history_browse_stop(&ed->hist);
+      mirb_buffer_insert_char(&ed->buf, (char)key);
+    }
+#endif
     return TRUE;
   }
 }

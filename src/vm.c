@@ -1880,6 +1880,8 @@ RETRY_TRY_BLOCK:
       mrb_value va = regs[a], vb = regs[a+1];
       switch (mrb_type(va)) {
       case MRB_TT_ARRAY:
+        /* optimize only for Array class; subclasses/singleton may override [] */
+        if (mrb_obj_ptr(va)->c != mrb->array_class) goto getidx_fallback;
         if (!mrb_integer_p(vb)) goto getidx_fallback;
         else {
           mrb_int idx = mrb_integer(vb);
@@ -1892,11 +1894,15 @@ RETRY_TRY_BLOCK:
         }
         break;
       case MRB_TT_HASH:
+        /* optimize only for Hash class; subclasses/singleton may override [] */
+        if (mrb_obj_ptr(va)->c != mrb->hash_class) goto getidx_fallback;
         va = mrb_hash_get(mrb, va, vb);
         ci = mrb->c->ci;
         regs[a] = va;
         break;
       case MRB_TT_STRING:
+        /* optimize only for String class; subclasses/singleton may override [] */
+        if (mrb_obj_ptr(va)->c != mrb->string_class) goto getidx_fallback;
         switch (mrb_type(vb)) {
         case MRB_TT_INTEGER:
         case MRB_TT_STRING:
@@ -1917,10 +1923,30 @@ RETRY_TRY_BLOCK:
     }
 
     CASE(OP_SETIDX, B) {
-      c = 2;
-      mid = MRB_OPSYM(aset);
-      SET_NIL_VALUE(regs[a+3]);
-      goto L_SENDB_SYM;
+      mrb_value va = regs[a], vb = regs[a+1], vc = regs[a+2];
+      switch (mrb_type(va)) {
+      case MRB_TT_ARRAY:
+        /* optimize only for Array class; subclasses/singleton may override []= */
+        if (mrb_obj_ptr(va)->c != mrb->array_class) goto setidx_fallback;
+        if (!mrb_integer_p(vb)) goto setidx_fallback;
+        mrb_ary_set(mrb, va, mrb_integer(vb), vc);
+        ci = mrb->c->ci;
+        regs[a] = vc;
+        NEXT;
+      case MRB_TT_HASH:
+        /* optimize only for Hash class; subclasses/singleton may override []= */
+        if (mrb_obj_ptr(va)->c != mrb->hash_class) goto setidx_fallback;
+        mrb_hash_set(mrb, va, vb, vc);
+        ci = mrb->c->ci;
+        regs[a] = vc;
+        NEXT;
+      default:
+      setidx_fallback:
+        c = 2;
+        mid = MRB_OPSYM(aset);
+        SET_NIL_VALUE(regs[a+3]);
+        goto L_SENDB_SYM;
+      }
     }
 
     CASE(OP_GETCONST, BB) {
@@ -3422,3 +3448,4 @@ mrb_top_run(mrb_state *mrb, const struct RProc *proc, mrb_value self, mrb_int st
   }
   return mrb_vm_run(mrb, proc, self, stack_keep);
 }
+#undef CASE

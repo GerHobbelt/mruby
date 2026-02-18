@@ -19,6 +19,27 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Windows compatibility */
+#ifdef _MSC_VER
+#define strdup _strdup
+#endif
+
+/* strndup is not available on Windows (MSVC and MinGW) */
+#ifdef _WIN32
+static char*
+strndup(const char *s, size_t n)
+{
+  size_t len = strlen(s);
+  if (len > n) len = n;
+  char *p = (char*)malloc(len + 1);
+  if (p) {
+    memcpy(p, s, len);
+    p[len] = '\0';
+  }
+  return p;
+}
+#endif
+
 #ifdef MRB_USE_READLINE
 #ifndef MRB_USE_LINENOISE
 #include MRB_READLINE_HEADER

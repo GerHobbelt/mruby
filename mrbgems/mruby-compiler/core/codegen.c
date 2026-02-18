@@ -4302,8 +4302,10 @@ codegen_case(codegen_scope *s, node *varnode, int val)
   }
 }
 
-/* Forward declaration for pattern matching code generation */
-static void codegen_pattern(codegen_scope *s, node *pattern, int target, uint32_t *fail_pos);
+/* Forward declaration for pattern matching code generation
+ * known_array_len: -1 if unknown, >= 0 if target is known to be an array of that length
+ */
+static void codegen_pattern(codegen_scope *s, node *pattern, int target, uint32_t *fail_pos, int known_array_len);
 
 /* Pattern matching case/in expression */
 static void
@@ -4316,6 +4318,15 @@ codegen_case_match(codegen_scope *s, node *varnode, int val)
   int head = cursp();
   uint32_t case_end_jumps = JMPLINK_START;
   uint32_t tmp;
+
+  /* Check if value is an array literal - allows optimizations in pattern matching */
+  int known_array_len = -1;
+  if (node_type(value) == NODE_ARRAY) {
+    struct mrb_ast_array_node *arr = array_node(value);
+    node *elem;
+    known_array_len = 0;
+    for (elem = arr->elements; elem; elem = elem->cdr) known_array_len++;
+  }
 
   /* Generate code for the case value */
   codegen(s, value, VAL);
@@ -4333,7 +4344,7 @@ codegen_case_match(codegen_scope *s, node *varnode, int val)
 
     if (pattern) {
       /* Generate pattern matching code */
-      codegen_pattern(s, pattern, head, &fail_pos);
+      codegen_pattern(s, pattern, head, &fail_pos, known_array_len);
     }
 
     /* Generate guard clause if present */
@@ -4391,9 +4402,10 @@ codegen_case_match(codegen_scope *s, node *varnode, int val)
 /* Generate pattern matching code for a single pattern.
  * target: stack position of the value being matched
  * fail_pos: linked list of jump positions for pattern match failure
+ * known_array_len: -1 if unknown, >= 0 if target is known to be an array of that length
  */
 static void
-codegen_pattern(codegen_scope *s, node *pattern, int target, uint32_t *fail_pos)
+codegen_pattern(codegen_scope *s, node *pattern, int target, uint32_t *fail_pos, int known_array_len)
 {
   uint32_t tmp;
 
@@ -4433,16 +4445,40 @@ codegen_pattern(codegen_scope *s, node *pattern, int target, uint32_t *fail_pos)
       uint32_t success_pos = JMPLINK_START;
 
       /* Try left pattern */
-      codegen_pattern(s, pat_alt->left, target, &left_fail);
-      /* Left succeeded - jump to success */
-      tmp = genjmp(s, OP_JMP, success_pos);
-      success_pos = tmp;
+      codegen_pattern(s, pat_alt->left, target, &left_fail, known_array_len);
+
+      /* Optimize JMPNOT+JMP to JMPIF when:
+       * 1. Left pattern is not another NODE_PAT_ALT (avoid recursion issues)
+       * 2. Left pattern generated at least one JMPNOT
+       * 3. The last JMPNOT is immediately before current position
+       * In this case, convert JMPNOT to JMPIF and skip generating JMP */
+      if (node_type(pat_alt->left) != NODE_PAT_ALT &&
+          left_fail != JMPLINK_START && left_fail + 2 == s->pc) {
+        /* Extract the previous link from the JMPNOT chain.
+         * The chain uses relative offsets where the end is marked by
+         * an offset that points to address 0 (i.e., (pos+2)+offset == 0) */
+        int16_t prev_offset = (int16_t)PEEK_S(s->iseq + left_fail);
+        int32_t next_addr = (int32_t)(left_fail + 2) + prev_offset;
+        uint32_t prev_link = (next_addr == 0) ? JMPLINK_START : (uint32_t)next_addr;
+        /* Convert JMPNOT to JMPIF */
+        s->iseq[left_fail - 2] = OP_JMPIF;
+        /* Clear offset to mark end of success chain */
+        emit_S(s, left_fail, 0);
+        success_pos = left_fail;
+        /* Continue with remaining fail chain */
+        left_fail = prev_link;
+      }
+      else {
+        /* Left succeeded - jump to success */
+        tmp = genjmp(s, OP_JMP, success_pos);
+        success_pos = tmp;
+      }
 
       /* Left failed - try right pattern */
       if (left_fail != JMPLINK_START) {
         dispatch_linked(s, left_fail);
       }
-      codegen_pattern(s, pat_alt->right, target, fail_pos);
+      codegen_pattern(s, pat_alt->right, target, fail_pos, known_array_len);
 
       /* Dispatch success jumps */
       if (success_pos != JMPLINK_START) {
@@ -4455,7 +4491,7 @@ codegen_pattern(codegen_scope *s, node *pattern, int target, uint32_t *fail_pos)
     {
       struct mrb_ast_pat_as_node *pat_as = pat_as_node(pattern);
       /* First match the pattern */
-      codegen_pattern(s, pat_as->pattern, target, fail_pos);
+      codegen_pattern(s, pat_as->pattern, target, fail_pos, known_array_len);
       /* Then bind the value to the variable */
       int idx = lv_idx(s, pat_as->name);
       if (idx > 0) {
@@ -4492,7 +4528,7 @@ codegen_pattern(codegen_scope *s, node *pattern, int target, uint32_t *fail_pos)
     {
       struct mrb_ast_pat_array_node *pat_arr = pat_array_node(pattern);
       int pre_len = 0, post_len = 0;
-      int arr_reg = cursp();
+      int arr_reg;
       node *elem;
       int i;
 
@@ -4500,95 +4536,189 @@ codegen_pattern(codegen_scope *s, node *pattern, int target, uint32_t *fail_pos)
       for (elem = pat_arr->pre; elem; elem = elem->cdr) pre_len++;
       for (elem = pat_arr->post; elem; elem = elem->cdr) post_len++;
 
-      /* Call deconstruct on target */
-      gen_move(s, cursp(), target, 0);
-      push();
-      genop_3(s, OP_SEND, arr_reg, sym_idx(s, MRB_SYM_2(s->mrb, deconstruct)), 0);
+      /* Optimization: if we know the target is an array, skip deconstruct */
+      if (known_array_len >= 0) {
+        /* Use target directly as array register */
+        arr_reg = target;
+        /* Compile-time size check */
+        if (pat_arr->rest == 0) {
+          /* No rest: exact length match required */
+          if (known_array_len != pre_len) {
+            /* Size mismatch - always fail */
+            tmp = genjmp(s, OP_JMP, *fail_pos);
+            *fail_pos = tmp;
+            break;
+          }
+          /* Size matches, no runtime check needed */
+        }
+        else {
+          /* Has rest: minimum length check */
+          int min_len = pre_len + post_len;
+          if (known_array_len < min_len) {
+            /* Size too small - always fail */
+            tmp = genjmp(s, OP_JMP, *fail_pos);
+            *fail_pos = tmp;
+            break;
+          }
+          /* Size sufficient, no runtime check needed */
+        }
 
-      /* Check length constraints */
-      if (pat_arr->rest == 0) {
-        /* No rest: exact length match */
-        /* Generate: arr.size == pre_len */
-        gen_move(s, cursp(), arr_reg, 0);
-        push();
-        genop_3(s, OP_SEND, cursp() - 1, sym_idx(s, MRB_SYM_2(s->mrb, size)), 0);
-        gen_int(s, cursp(), pre_len);
-        push(); push(); pop(); pop(); pop();
-        genop_3(s, OP_SEND, cursp(), sym_idx(s, MRB_OPSYM_2(s->mrb, eq)), 1);
-        tmp = genjmp2(s, OP_JMPNOT, cursp(), *fail_pos, 1);
-        *fail_pos = tmp;
+        /* Match pre-rest elements using GETIDX (faster than SEND :[]) */
+        i = 0;
+        for (elem = pat_arr->pre; elem; elem = elem->cdr, i++) {
+          /* Get arr[i] using GETIDX */
+          gen_move(s, cursp(), arr_reg, 0);
+          push();
+          gen_int(s, cursp(), i);
+          genop_1(s, OP_GETIDX, cursp() - 1);  /* R[cursp-1] = R[cursp-1][R[cursp]] */
+          /* Element is now at cursp-1 */
+          /* Match element pattern (elements are not known arrays) */
+          codegen_pattern(s, elem->car, cursp() - 1, fail_pos, -1);
+          pop();  /* Clean up element slot */
+        }
+
+        /* Bind rest elements if rest is a variable */
+        if (pat_arr->rest && pat_arr->rest != (node*)-1) {
+          struct mrb_ast_pat_var_node *rest_var = pat_var_node(pat_arr->rest);
+          if (rest_var->name) {
+            int var_idx = lv_idx(s, rest_var->name);
+            /* Generate: arr[pre_len..-(post_len+1)] or arr[pre_len..-1] if no post */
+            gen_move(s, cursp(), arr_reg, 0);  /* arr at cursp */
+            push();
+            gen_int(s, cursp(), pre_len);      /* start at cursp */
+            push();
+            if (post_len > 0) {
+              gen_int(s, cursp(), -(post_len + 1));  /* end at cursp */
+            }
+            else {
+              gen_int(s, cursp(), -1);         /* end at cursp */
+            }
+            /* start at cursp-1, end at cursp; create inclusive range at cursp-1 */
+            genop_1(s, OP_RANGE_INC, cursp() - 1);
+            /* arr at cursp-2, range at cursp-1 */
+            pop();  /* cursp now at range position */
+            pop();  /* cursp now at arr position */
+            genop_3(s, OP_SEND, cursp(), sym_idx(s, MRB_OPSYM_2(s->mrb, aref)), 1);
+            if (var_idx > 0) {
+              gen_move(s, var_idx, cursp(), 1);
+            }
+          }
+        }
+
+        /* Match post-rest elements using GETIDX */
+        i = -post_len;
+        for (elem = pat_arr->post; elem; elem = elem->cdr, i++) {
+          /* Get arr[i] using GETIDX (negative index from end) */
+          gen_move(s, cursp(), arr_reg, 0);
+          push();
+          gen_int(s, cursp(), i);
+          genop_1(s, OP_GETIDX, cursp() - 1);
+          /* Match element pattern */
+          codegen_pattern(s, elem->car, cursp() - 1, fail_pos, -1);
+          pop();  /* Clean up element slot */
+        }
+        /* No arr_reg to pop since we used target directly */
       }
       else {
-        /* Has rest: minimum length check */
-        int min_len = pre_len + post_len;
-        if (min_len > 0) {
-          /* Generate: arr.size >= min_len */
+        /* General case: need to call deconstruct and check size at runtime */
+        arr_reg = cursp();
+
+        /* Call deconstruct on target */
+        gen_move(s, cursp(), target, 0);
+        push();
+        genop_3(s, OP_SEND, arr_reg, sym_idx(s, MRB_SYM_2(s->mrb, deconstruct)), 0);
+
+        /* Check length constraints */
+        if (pat_arr->rest == 0) {
+          /* No rest: exact length match */
+          /* Generate: arr.size == pre_len using EQ opcode */
           gen_move(s, cursp(), arr_reg, 0);
           push();
           genop_3(s, OP_SEND, cursp() - 1, sym_idx(s, MRB_SYM_2(s->mrb, size)), 0);
-          gen_int(s, cursp(), min_len);
-          push(); push(); pop(); pop(); pop();
-          genop_3(s, OP_SEND, cursp(), sym_idx(s, MRB_OPSYM_2(s->mrb, ge)), 1);
-          tmp = genjmp2(s, OP_JMPNOT, cursp(), *fail_pos, 1);
+          gen_int(s, cursp(), pre_len);
+          /* EQ: R[a] = R[a] == R[a+1]; size at cursp-1, pre_len at cursp */
+          genop_1(s, OP_EQ, cursp() - 1);
+          tmp = genjmp2(s, OP_JMPNOT, cursp() - 1, *fail_pos, 1);
           *fail_pos = tmp;
+          pop();
         }
-      }
-
-      /* Match pre-rest elements */
-      i = 0;
-      for (elem = pat_arr->pre; elem; elem = elem->cdr, i++) {
-        /* Get arr[i] */
-        gen_move(s, cursp(), arr_reg, 0);
-        push();
-        gen_int(s, cursp(), i);
-        push(); push(); pop(); pop(); pop();
-        genop_3(s, OP_SEND, cursp(), sym_idx(s, MRB_OPSYM_2(s->mrb, aref)), 1);
-        /* Match element pattern */
-        codegen_pattern(s, elem->car, cursp(), fail_pos);
-      }
-
-      /* Bind rest elements if rest is a variable */
-      if (pat_arr->rest && pat_arr->rest != (node*)-1) {
-        struct mrb_ast_pat_var_node *rest_var = pat_var_node(pat_arr->rest);
-        if (rest_var->name) {
-          int var_idx = lv_idx(s, rest_var->name);
-          /* Generate: arr[pre_len..-(post_len+1)] or arr[pre_len..-1] if no post */
-          gen_move(s, cursp(), arr_reg, 0);  /* arr at cursp */
-          push();
-          gen_int(s, cursp(), pre_len);      /* start at cursp */
-          push();
-          if (post_len > 0) {
-            gen_int(s, cursp(), -(post_len + 1));  /* end at cursp */
+        else {
+          /* Has rest: minimum length check */
+          int min_len = pre_len + post_len;
+          if (min_len > 0) {
+            /* Generate: arr.size >= min_len using GE opcode */
+            gen_move(s, cursp(), arr_reg, 0);
+            push();
+            genop_3(s, OP_SEND, cursp() - 1, sym_idx(s, MRB_SYM_2(s->mrb, size)), 0);
+            gen_int(s, cursp(), min_len);
+            /* GE: R[a] = R[a] >= R[a+1]; size at cursp-1, min_len at cursp */
+            genop_1(s, OP_GE, cursp() - 1);
+            tmp = genjmp2(s, OP_JMPNOT, cursp() - 1, *fail_pos, 1);
+            *fail_pos = tmp;
+            pop();
           }
-          else {
-            gen_int(s, cursp(), -1);         /* end at cursp */
-          }
-          /* start at cursp-1, end at cursp; create inclusive range at cursp-1 */
-          genop_1(s, OP_RANGE_INC, cursp() - 1);
-          /* arr at cursp-2, range at cursp-1 */
-          pop();  /* cursp now at range position */
-          pop();  /* cursp now at arr position */
+        }
+
+        /* Match pre-rest elements */
+        i = 0;
+        for (elem = pat_arr->pre; elem; elem = elem->cdr, i++) {
+          /* Get arr[i] */
+          gen_move(s, cursp(), arr_reg, 0);
+          push();
+          gen_int(s, cursp(), i);
+          push(); push(); pop(); pop(); pop();
           genop_3(s, OP_SEND, cursp(), sym_idx(s, MRB_OPSYM_2(s->mrb, aref)), 1);
-          if (var_idx > 0) {
-            gen_move(s, var_idx, cursp(), 1);
+          push();  /* Preserve element result for codegen_pattern */
+          /* Match element pattern */
+          codegen_pattern(s, elem->car, cursp() - 1, fail_pos, -1);
+          pop();  /* Clean up element slot */
+        }
+
+        /* Bind rest elements if rest is a variable */
+        if (pat_arr->rest && pat_arr->rest != (node*)-1) {
+          struct mrb_ast_pat_var_node *rest_var = pat_var_node(pat_arr->rest);
+          if (rest_var->name) {
+            int var_idx = lv_idx(s, rest_var->name);
+            /* Generate: arr[pre_len..-(post_len+1)] or arr[pre_len..-1] if no post */
+            gen_move(s, cursp(), arr_reg, 0);  /* arr at cursp */
+            push();
+            gen_int(s, cursp(), pre_len);      /* start at cursp */
+            push();
+            if (post_len > 0) {
+              gen_int(s, cursp(), -(post_len + 1));  /* end at cursp */
+            }
+            else {
+              gen_int(s, cursp(), -1);         /* end at cursp */
+            }
+            /* start at cursp-1, end at cursp; create inclusive range at cursp-1 */
+            genop_1(s, OP_RANGE_INC, cursp() - 1);
+            /* arr at cursp-2, range at cursp-1 */
+            pop();  /* cursp now at range position */
+            pop();  /* cursp now at arr position */
+            genop_3(s, OP_SEND, cursp(), sym_idx(s, MRB_OPSYM_2(s->mrb, aref)), 1);
+            if (var_idx > 0) {
+              gen_move(s, var_idx, cursp(), 1);
+            }
           }
         }
-      }
 
-      /* Match post-rest elements */
-      i = -post_len;
-      for (elem = pat_arr->post; elem; elem = elem->cdr, i++) {
-        /* Get arr[i] (negative index from end) */
-        gen_move(s, cursp(), arr_reg, 0);
-        push();
-        gen_int(s, cursp(), i);
-        push(); push(); pop(); pop(); pop();
-        genop_3(s, OP_SEND, cursp(), sym_idx(s, MRB_OPSYM_2(s->mrb, aref)), 1);
-        /* Match element pattern */
-        codegen_pattern(s, elem->car, cursp(), fail_pos);
-      }
+        /* Match post-rest elements */
+        i = -post_len;
+        for (elem = pat_arr->post; elem; elem = elem->cdr, i++) {
+          /* Get arr[i] (negative index from end) */
+          gen_move(s, cursp(), arr_reg, 0);
+          push();
+          gen_int(s, cursp(), i);
+          push(); push(); pop(); pop(); pop();
+          genop_3(s, OP_SEND, cursp(), sym_idx(s, MRB_OPSYM_2(s->mrb, aref)), 1);
+          push();  /* Preserve element result for codegen_pattern */
+          /* Match element pattern */
+          codegen_pattern(s, elem->car, cursp() - 1, fail_pos, -1);
+          pop();  /* Clean up element slot */
+        }
 
-      pop();  /* Pop arr_reg */
+        pop();  /* Pop arr_reg */
+      }
     }
     break;
 
@@ -4671,8 +4801,10 @@ codegen_pattern(codegen_scope *s, node *pattern, int target, uint32_t *fail_pos)
         }
         push(); push(); pop(); pop(); pop();
         genop_3(s, OP_SEND, cursp(), sym_idx(s, MRB_OPSYM_2(s->mrb, aref)), 1);
+        push();  /* Preserve element result for codegen_pattern */
         /* Match element pattern - on fail, try next index */
-        codegen_pattern(s, elem->car, cursp(), &match_fail);
+        codegen_pattern(s, elem->car, cursp() - 1, &match_fail, -1);
+        pop();  /* Clean up element slot */
       }
 
       /* All elements matched - bind pre and post if named */
@@ -4811,9 +4943,11 @@ codegen_pattern(codegen_scope *s, node *pattern, int target, uint32_t *fail_pos)
         }
         push(); push(); pop(); pop(); pop();
         genop_3(s, OP_SEND, cursp(), sym_idx(s, MRB_OPSYM_2(s->mrb, aref)), 1);
+        push();  /* Preserve value for codegen_pattern */
 
         /* Match pattern against value */
-        codegen_pattern(s, pat, cursp(), fail_pos);
+        codegen_pattern(s, pat, cursp() - 1, fail_pos, -1);
+        pop();  /* Clean up value slot */
       }
 
       /* Handle rest pattern */
@@ -5036,22 +5170,31 @@ codegen_masgn(codegen_scope *s, node *varnode, node *rhs, int sp, int val)
         int regs[16];  /* support up to 16 variables */
         node *lhs = masgn_n->pre;
         node *rhs_elem = t;
-        int count = 0;
+        int rhs_count = 0, lhs_count = 0;
         mrb_bool all_simple = TRUE;
 
+        /* Count lhs variables */
+        while (lhs && lhs_count < 16) {
+          lhs_count++;
+          lhs = lhs->cdr;
+        }
+
         /* Count and check rhs are all simple literals */
-        while (rhs_elem && count < 16) {
+        while (rhs_elem && rhs_count < 16) {
           if (!is_simple_literal(rhs_elem->car)) {
             all_simple = FALSE;
             break;
           }
-          count++;
+          rhs_count++;
           rhs_elem = rhs_elem->cdr;
         }
-        if (all_simple && count > 0 && all_lvar_pre(s, lhs, regs, count)) {
+        /* Only apply when lhs and rhs counts match exactly */
+        lhs = masgn_n->pre;
+        if (all_simple && lhs_count > 0 && lhs_count == rhs_count &&
+            all_lvar_pre(s, lhs, regs, lhs_count)) {
           /* Direct generation: generate literals into target registers */
           rhs_elem = t;
-          for (int i = 0; i < count; i++) {
+          for (int i = 0; i < lhs_count; i++) {
             gen_literal_to_reg(s, rhs_elem->car, regs[i]);
             rhs_elem = rhs_elem->cdr;
           }
@@ -6364,29 +6507,138 @@ codegen(codegen_scope *s, node *tree, int val)
     {
       /* One-line pattern matching: expr in pattern / expr => pattern */
       struct mrb_ast_match_pat_node *mp = match_pat_node(tree);
-      int head = cursp();
+      int head;
+      int known_array_len = -1;
       uint32_t fail_pos = JMPLINK_START;
+
+      /* Optimize: for simple variable pattern, generate value directly into variable */
+      if (node_type(mp->pattern) == NODE_PAT_VAR) {
+        struct mrb_ast_pat_var_node *pat_var = pat_var_node(mp->pattern);
+        if (pat_var->name) {
+          int idx = lv_idx(s, pat_var->name);
+          if (idx > 0) {
+            codegen(s, mp->value, VAL);
+            pop();
+            gen_move(s, idx, cursp(), 0);  /* peephole optimizes LOADI+MOVE */
+            goto match_pat_push_result;
+          }
+        }
+        /* Wildcard pattern - just evaluate value for side effects */
+        codegen(s, mp->value, NOVAL);
+      match_pat_push_result:
+        if (val) {
+          /* 'in' pattern returns true, '=>' pattern returns nil */
+          if (mp->raise_on_fail) {
+            gen_load_nil(s, 1);
+          }
+          else {
+            genop_1(s, OP_LOADT, cursp());
+            push();
+          }
+        }
+        break;
+      }
+
+      /* Optimize: array literal => array pattern with matching sizes */
+      if (node_type(mp->value) == NODE_ARRAY &&
+          node_type(mp->pattern) == NODE_PAT_ARRAY) {
+        struct mrb_ast_array_node *arr = array_node(mp->value);
+        struct mrb_ast_pat_array_node *pat = pat_array_node(mp->pattern);
+        /* Only optimize for exact match (no rest, no post) */
+        if (pat->rest == 0 && pat->post == NULL) {
+          /* Count array elements and pattern pre elements */
+          int arr_len = 0, pat_len = 0;
+          node *e;
+          for (e = arr->elements; e; e = e->cdr) arr_len++;
+          for (e = pat->pre; e; e = e->cdr) pat_len++;
+          if (arr_len == pat_len) {
+            /* Sizes match - skip deconstruct and size check */
+            int arr_reg = cursp();
+            int i = 0;
+            codegen(s, mp->value, VAL);  /* Generate array */
+            /* Extract elements directly with GETIDX */
+            for (e = pat->pre; e; e = e->cdr, i++) {
+              gen_move(s, cursp(), arr_reg, 0);
+              push();
+              gen_int(s, cursp(), i);
+              push();
+              genop_1(s, OP_GETIDX, cursp() - 2);  /* R[a] = R[a][R[a+1]] */
+              pop();
+              /* Match element pattern (element is now at cursp()-1) */
+              codegen_pattern(s, e->car, cursp() - 1, &fail_pos, -1);
+              pop();  /* clean up array copy slot */
+            }
+            pop();  /* pop array */
+            if (fail_pos != JMPLINK_START) {
+              goto pattern_fail_handling;
+            }
+            /* Pattern always matches - push result if needed */
+            if (val) {
+              if (mp->raise_on_fail) {
+                gen_load_nil(s, 1);  /* '=>' pattern returns nil */
+              }
+              else {
+                genop_1(s, OP_LOADT, cursp());  /* 'in' pattern returns true */
+                push();
+              }
+            }
+            break;
+          }
+        }
+      }
+
+      head = cursp();
+
+      /* Check if value is array literal for optimization */
+      if (node_type(mp->value) == NODE_ARRAY) {
+        struct mrb_ast_array_node *arr = array_node(mp->value);
+        node *elem;
+        known_array_len = 0;
+        for (elem = arr->elements; elem; elem = elem->cdr) known_array_len++;
+      }
 
       /* Evaluate the value */
       codegen(s, mp->value, VAL);
 
       /* Generate pattern matching code */
-      codegen_pattern(s, mp->pattern, head, &fail_pos);
+      codegen_pattern(s, mp->pattern, head, &fail_pos, known_array_len);
 
-      /* Pattern matched */
-      pop();  /* pop the value */
+    pattern_fail_handling:
       if (fail_pos != JMPLINK_START) {
         /* Pattern can fail - generate failure handling code */
         uint32_t match_pos;
+        int saved_sp = cursp();  /* save stack pointer before branching */
 
+        /* Success path: pattern matched */
+        pop();  /* pop the value */
         if (val) {
-          genop_1(s, OP_LOADT, cursp());
-          push();
+          /* 'in' pattern returns true, '=>' pattern returns nil */
+          if (mp->raise_on_fail) {
+            gen_load_nil(s, 1);
+          }
+          else {
+            genop_1(s, OP_LOADT, cursp());
+            push();
+          }
         }
-        match_pos = genjmp(s, OP_JMP, JMPLINK_START);
 
-        /* Pattern failed */
-        dispatch_linked(s, fail_pos);
+        /* Optimize: single JMPNOT can be inverted to JMPIF, eliminating JMP */
+        /* Conditions: (1) single entry in fail_pos chain, and
+         * (2) JMPNOT is immediately before current position (no code between) */
+        if ((int32_t)(fail_pos + 2) + (int16_t)PEEK_S(s->iseq+fail_pos) == 0 &&
+            fail_pos + 2 == s->pc) {
+          /* Single failure point - invert JMPNOT to JMPIF */
+          s->iseq[fail_pos - 2] = OP_JMPIF;
+          match_pos = fail_pos;
+        }
+        else {
+          /* Multiple failure points - need JMP to skip error handling */
+          match_pos = genjmp(s, OP_JMP, JMPLINK_START);
+          dispatch_linked(s, fail_pos);
+        }
+
+        /* Failure path: restore stack pointer (value still on stack at runtime) */
+        s->sp = saved_sp;
         pop();  /* pop the value */
         if (mp->raise_on_fail) {
           /* expr => pattern: raise NoMatchingPatternError */
@@ -6415,6 +6667,19 @@ codegen(codegen_scope *s, node *tree, int val)
 
         /* End of pattern matching */
         dispatch(s, match_pos);
+      }
+      else {
+        /* Pattern always matches - pop value and push result if needed */
+        pop();  /* pop the value */
+        if (val) {
+          if (mp->raise_on_fail) {
+            gen_load_nil(s, 1);  /* '=>' pattern returns nil */
+          }
+          else {
+            genop_1(s, OP_LOADT, cursp());  /* 'in' pattern returns true */
+            push();
+          }
+        }
       }
     }
     break;
