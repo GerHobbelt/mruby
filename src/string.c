@@ -1200,7 +1200,8 @@ mrb_str_cmp(mrb_state *mrb, mrb_value str1, mrb_value str2)
   mrb_int len1 = RSTR_LEN(s1);
   mrb_int len2 = RSTR_LEN(s2);
   mrb_int len = lesser(len1, len2);
-  mrb_int retval = memcmp(RSTR_PTR(s1), RSTR_PTR(s2), len);
+  mrb_int retval = (len == 0) ? 0 : memcmp(RSTR_PTR(s1), RSTR_PTR(s2), len);
+
   if (retval == 0) {
     if (len1 == len2) return 0;
     if (len1 > len2)  return 1;

@@ -1009,7 +1009,8 @@ pack_hex(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count, 
   }
 
   /* calculate output buffer size needed - one byte per two hex chars */
-  int output_bytes = (count + 1) / 2;
+  /* use count/2 + (count&1) to avoid overflow when count == INT_MAX */
+  int output_bytes = count / 2 + (count & 1);
   dst = str_len_ensure(mrb, dst, didx + output_bytes);
   char *dptr = RSTRING_PTR(dst) + didx;
   char *dptr0 = dptr;
@@ -1478,7 +1479,23 @@ pack_uu(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count)
 
   if (count <= 1) count = 45; /* default line length for UU-encoding */
 
-  str_len_ensure(mrb, dst, didx + ((slen * 4 + 2) / 3) + (slen / count + 1) * 2);
+  /* Calculate buffer size by accounting for per-line encoding
+   * Each line encodes separately, so padding happens per line, not globally
+   */
+  mrb_int num_lines = (slen + count - 1) / count;  /* Number of lines */
+  mrb_int total_encoded = 0;
+  mrb_int temp_slen = slen;
+
+  /* Calculate actual encoded size line by line */
+  while (temp_slen > 0) {
+    mrb_int line_len = (temp_slen > count) ? count : temp_slen;
+    total_encoded += ((line_len + 2) / 3) * 4;  /* Each line's encoded size */
+    temp_slen -= line_len;
+  }
+
+  /* Total buffer = encoded data + (length char + newline) per line + terminating line */
+  mrb_int buffer_size = total_encoded + num_lines * 2 + 2;
+  str_len_ensure(mrb, dst, didx + buffer_size);
   char *dptr = RSTRING_PTR(dst) + didx;
 
   while (slen > 0) {

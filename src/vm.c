@@ -268,6 +268,13 @@ mrb_vm_ci_proc_set(mrb_callinfo *ci, const struct RProc *p)
   CI_PROC_SET(ci, p);
 }
 
+#define MRB_PROC_RESOLVE_ALIAS(ci, p) do {\
+  if (MRB_PROC_ALIAS_P(p)) {\
+    (ci)->mid = (p)->body.mid;\
+    (p) = (p)->upper;\
+  }\
+} while (0)
+
 #define CI_TARGET_CLASS(ci) (((ci)->u.env && (ci)->u.env->tt == MRB_TT_ENV)? (ci)->u.env->c : (ci)->u.target_class)
 
 struct RClass*
@@ -825,10 +832,7 @@ mrb_funcall_with_block(mrb_state *mrb, mrb_value self, mrb_sym mid, mrb_int argc
     }
     else {
       /* handle alias */
-      if (MRB_PROC_ALIAS_P(ci->proc)) {
-        ci->mid = ci->proc->body.mid;
-        ci->proc = ci->proc->upper;
-      }
+      MRB_PROC_RESOLVE_ALIAS(ci, ci->proc);
       ci->cci = CINFO_SKIP;
       val = mrb_run(mrb, ci->proc, self);
     }
@@ -883,10 +887,7 @@ exec_irep(mrb_state *mrb, mrb_value self, const struct RProc *p)
 
   ci->stack[0] = self;
   /* handle alias */
-  if (MRB_PROC_ALIAS_P(p)) {
-    ci->mid = p->body.mid;
-    p = p->upper;
-  }
+  MRB_PROC_RESOLVE_ALIAS(ci, p);
   CI_PROC_SET(ci, p);
   if (MRB_PROC_CFUNC_P(p)) {
     if (MRB_PROC_NOARG_P(p) && (ci->n > 0 || ci->nk > 0)) {
@@ -1036,10 +1037,7 @@ send_method(mrb_state *mrb, mrb_value self, mrb_bool pub)
   if (MRB_METHOD_PROC_P(m)) {
     p = MRB_METHOD_PROC(m);
     /* handle alias */
-    if (MRB_PROC_ALIAS_P(p)) {
-      ci->mid = p->body.mid;
-      p = p->upper;
-    }
+    MRB_PROC_RESOLVE_ALIAS(ci, p);
     CI_PROC_SET(ci, p);
   }
   if (MRB_METHOD_CFUNC_P(m)) {
@@ -1517,46 +1515,36 @@ prepare_tagged_break(mrb_state *mrb, uint32_t tag, const mrb_callinfo *return_ci
 
 #ifdef MRB_USE_VM_SWITCH_DISPATCH
 
-#define INIT_DISPATCH for (;;) { insn = BYTECODE_DECODER(*ci->pc); CODE_FETCH_HOOK(mrb, irep, ci->pc, regs); switch (insn) {
-#define CASE(insn,ops) case insn: { const mrb_code *pc = ci->pc+1; FETCH_ ## ops (); ci->pc = pc; } L_ ## insn ## _BODY:
+#define INIT_DISPATCH for (;;) { CALL_CODE_HOOKS(); switch (insn) {
+#define CASE(insn,ops) case insn: DECODE_OPERANDS(ops); L_ ## insn ## _BODY:
 #define NEXT goto L_END_DISPATCH
 #define JUMP NEXT
-#ifdef MRB_USE_TASK_SCHEDULER
-#define END_DISPATCH L_END_DISPATCH: \
-  if (mrb->task.switching || mrb->c->status == MRB_TASK_STOPPED) \
-    return mrb_nil_value(); \
-  }}
-#else
-#define END_DISPATCH L_END_DISPATCH:;}}
-#endif
+#define END_DISPATCH L_END_DISPATCH: RETURN_IF_TASK_STOPPED(mrb);}}
 
 #else
 
 #define INIT_DISPATCH JUMP; return mrb_nil_value();
-#define CASE(insn,ops) L_ ## insn: { const mrb_code *pc = ci->pc+1; FETCH_ ## ops (); ci->pc = pc; } L_ ## insn ## _BODY:
-#ifdef MRB_USE_TASK_SCHEDULER
-#define NEXT if (mrb->task.switching || mrb->c->status == MRB_TASK_STOPPED) return mrb_nil_value(); \
-  insn=BYTECODE_DECODER(*ci->pc); CODE_FETCH_HOOK(mrb, irep, ci->pc, regs); goto *optable[insn]
-#else
-#define NEXT insn=BYTECODE_DECODER(*ci->pc); CODE_FETCH_HOOK(mrb, irep, ci->pc, regs); goto *optable[insn]
-#endif
+#define CASE(insn,ops) L_ ## insn: DECODE_OPERANDS(ops); L_ ## insn ## _BODY:
+#define NEXT RETURN_IF_TASK_STOPPED(mrb); CALL_CODE_HOOKS(); goto *optable[insn]
 #define JUMP NEXT
-
-#ifdef MRB_USE_TASK_SCHEDULER
-#define END_DISPATCH \
-  if (mrb->task.switching || mrb->c->status == MRB_TASK_STOPPED) \
-    return mrb_nil_value();
-#else
-#define END_DISPATCH
-#endif
+#define END_DISPATCH RETURN_IF_TASK_STOPPED(mrb)
 
 #endif
 
+#define DECODE_OPERANDS(ops) do { const mrb_code *pc = ci->pc+1; FETCH_ ## ops (); ci->pc = pc; } while (0)
+#define CALL_CODE_HOOKS() do { insn = BYTECODE_DECODER(*ci->pc); CODE_FETCH_HOOK(mrb, irep, ci->pc, regs); } while (0)
+
 #ifdef MRB_USE_TASK_SCHEDULER
-#define TASK_STOP(mrb) \
+#define RETURN_IF_TASK_STOPPED(mrb) do { \
+  if ((mrb)->task.switching || (mrb)->c->status == MRB_TASK_STOPPED) \
+    return mrb_nil_value(); \
+} while (0)
+#define TASK_STOP(mrb) do { \
   if (mrb->c->status != MRB_TASK_STOPPED) \
-    mrb->c->status = MRB_TASK_STOPPED;
+    mrb->c->status = MRB_TASK_STOPPED; \
+} while (0)
 #else
+#define RETURN_IF_TASK_STOPPED(mrb)
 #define TASK_STOP(mrb)
 #endif
 
@@ -2228,10 +2216,7 @@ RETRY_TRY_BLOCK:
       if (MRB_METHOD_PROC_P(m)) {
         const struct RProc *p = MRB_METHOD_PROC(m);
         /* handle alias */
-        if (MRB_PROC_ALIAS_P(p)) {
-          ci->mid = p->body.mid;
-          p = p->upper;
-        }
+        MRB_PROC_RESOLVE_ALIAS(ci, p);
         CI_PROC_SET(ci, p);
         if (!MRB_PROC_CFUNC_P(p)) {
           /* setup environment for calling method */
@@ -2280,11 +2265,8 @@ RETRY_TRY_BLOCK:
       const struct RProc *p = mrb_proc_ptr(recv);
 
       /* handle alias */
-      if (MRB_PROC_ALIAS_P(p)) {
-        ci->mid = p->body.mid;
-        p = p->upper;
-      }
-      else if (MRB_PROC_ENV_P(p)) {
+      MRB_PROC_RESOLVE_ALIAS(ci, p);
+      if (MRB_PROC_ENV_P(p)) {
         ci->mid = MRB_PROC_ENV(p)->mid;
       }
       /* replace callinfo */
