@@ -18,6 +18,8 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <direct.h>
+#include <stdint.h>
 
 /* Maximum path length */
 #ifndef PATH_MAX
@@ -198,57 +200,22 @@ mrb_hal_io_rename(mrb_state *mrb, const char *oldpath, const char *newpath)
 int
 mrb_hal_io_symlink(mrb_state *mrb, const char *target, const char *linkpath)
 {
-  DWORD flags = 0;
-  (void)mrb;
-
-  /* Check if target is a directory */
-  DWORD attrs = GetFileAttributes(target);
-  if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-    flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
-  }
-
-  if (!CreateSymbolicLink(linkpath, target, flags)) {
-    set_errno_from_win_error(GetLastError());
-    return -1;
-  }
-  return 0;
+  (void)target;
+  (void)linkpath;
+  /* Symlinks require special privileges on Windows */
+  mrb_raise(mrb, E_NOTIMP_ERROR, "symlink is not supported on Windows");
+  return -1;  /* not reached */
 }
 
 int64_t
 mrb_hal_io_readlink(mrb_state *mrb, const char *path, char *buf, size_t bufsize)
 {
-  HANDLE h;
-  DWORD ret;
-  char temp[PATH_MAX];
-  (void)mrb;
-
-  h = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                 OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-  if (h == INVALID_HANDLE_VALUE) {
-    set_errno_from_win_error(GetLastError());
-    return -1;
-  }
-
-  ret = GetFinalPathNameByHandle(h, temp, PATH_MAX, FILE_NAME_NORMALIZED);
-  CloseHandle(h);
-
-  if (ret == 0 || ret >= PATH_MAX) {
-    errno = EIO;
-    return -1;
-  }
-
-  /* Remove \\?\ prefix if present */
-  const char *result = temp;
-  if (strncmp(temp, "\\\\?\\", 4) == 0) {
-    result = temp + 4;
-  }
-
-  size_t len = strlen(result);
-  if (len > bufsize) {
-    len = bufsize;
-  }
-  memcpy(buf, result, len);
-  return (int64_t)len;
+  (void)path;
+  (void)buf;
+  (void)bufsize;
+  /* Symlinks require special handling on Windows */
+  mrb_raise(mrb, E_NOTIMP_ERROR, "readlink is not supported on Windows");
+  return -1;  /* not reached */
 }
 
 char*
@@ -472,9 +439,10 @@ mrb_hal_io_spawn_process(mrb_state *mrb, const char *cmd,
   si.cb = sizeof(si);
   si.dwFlags = STARTF_USESTDHANDLES;
 
-  /* Convert file descriptors to handles */
+  /* Convert file descriptors to handles and make them inheritable */
   if (stdin_fd != -1) {
     h_stdin = (HANDLE)_get_osfhandle(stdin_fd);
+    SetHandleInformation(h_stdin, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     si.hStdInput = h_stdin;
   }
   else {
@@ -483,6 +451,7 @@ mrb_hal_io_spawn_process(mrb_state *mrb, const char *cmd,
 
   if (stdout_fd != -1) {
     h_stdout = (HANDLE)_get_osfhandle(stdout_fd);
+    SetHandleInformation(h_stdout, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     si.hStdOutput = h_stdout;
   }
   else {
@@ -491,6 +460,7 @@ mrb_hal_io_spawn_process(mrb_state *mrb, const char *cmd,
 
   if (stderr_fd != -1) {
     h_stderr = (HANDLE)_get_osfhandle(stderr_fd);
+    SetHandleInformation(h_stderr, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     si.hStdError = h_stderr;
   }
   else {
@@ -510,7 +480,7 @@ mrb_hal_io_spawn_process(mrb_state *mrb, const char *cmd,
   CloseHandle(pi.hThread);
 
   /* Store process handle as PID (will be used in waitpid) */
-  *pid = (int)pi.hProcess;
+  *pid = (int)(intptr_t)pi.hProcess;
 
   return 0;
 }
@@ -518,7 +488,7 @@ mrb_hal_io_spawn_process(mrb_state *mrb, const char *cmd,
 int
 mrb_hal_io_waitpid(mrb_state *mrb, int pid, int *status, int options)
 {
-  HANDLE h = (HANDLE)pid;
+  HANDLE h = (HANDLE)(intptr_t)pid;
   DWORD wait_result;
   DWORD exit_code;
   DWORD timeout;

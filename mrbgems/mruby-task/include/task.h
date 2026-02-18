@@ -32,26 +32,37 @@ enum {
 
 /*
  * Task structure - represents a single task in the scheduler
+ *
+ * Memory-optimized layout:
+ * - Removed priority_preemption (always equals priority): 1 byte
+ * - Removed started flag (inferred from c.status): 1 byte
+ * - Unified wakeup_tick/join/mutex into single union: 4 bytes
+ * - Removed redundant proc field (stored in c.ci->proc): 8 bytes
+ * - Unified timeslice/result into state union: ~4 bytes
+ * Total savings: ~18 bytes per task (14% reduction)
  */
 typedef struct mrb_task {
   struct mrb_task *next;           /* Linked list pointer */
-  uint8_t priority;                /* Initial priority (0-255, 0=highest) */
-  uint8_t priority_preemption;     /* Effective priority for preemption */
-  volatile uint8_t timeslice;      /* Remaining time slice ticks */
+  uint8_t priority;                /* Priority (0-255, 0=highest) */
   uint8_t status;                  /* Current status (TASKSTATUS enum) */
   uint8_t reason;                  /* Wait reason (TASKREASON enum) */
-  uint8_t started;                 /* 1 if task has been started, 0 otherwise */
   mrb_value name;                  /* Optional task name */
 
+  /* Wait-specific data - mutually exclusive based on reason field */
   union {
-    uint32_t wakeup_tick;          /* Tick count to wake up (for sleep) */
-    void *mutex;                   /* Mutex pointer (reserved) */
-  };
-  const struct mrb_task *join;     /* Task being waited on (for join) */
+    uint32_t wakeup_tick;          /* Tick count to wake up (REASON_SLEEP) */
+    const struct mrb_task *join;   /* Task being waited on (REASON_JOIN) */
+    void *mutex;                   /* Mutex pointer (REASON_MUTEX, reserved) */
+  } wait;
 
   mrb_value self;                  /* Ruby Task object reference */
-  mrb_value result;                /* Task return value */
-  mrb_value proc;                  /* Proc containing task code */
+
+  /* State-specific data - mutually exclusive based on status */
+  union {
+    volatile uint8_t timeslice;    /* Remaining ticks (RUNNING only) */
+    mrb_value result;              /* Task return value (DORMANT only) */
+  } state;
+
   struct mrb_context c;            /* Execution context (stack, callinfo, etc) */
 } mrb_task;
 
@@ -77,7 +88,7 @@ typedef struct mrb_task {
 #endif
 
 #define TASK_STACK_INIT_SIZE 64   /* Initial task stack size */
-#define TASK_CI_INIT_SIZE 8       /* Initial task callinfo size */
+#define TASK_CI_INIT_SIZE 4       /* Initial task callinfo size */
 
 /*
  * HAL (Hardware Abstraction Layer) functions

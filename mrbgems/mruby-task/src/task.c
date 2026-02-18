@@ -126,9 +126,10 @@ mrb_task_mark_all(mrb_state *mrb)
 
       /* Mark task-specific values */
       mrb_gc_mark_value(mrb, t->self);
-      mrb_gc_mark_value(mrb, t->result);
+      if (t->status == MRB_TASK_STATUS_DORMANT) {
+        mrb_gc_mark_value(mrb, t->state.result);
+      }
       mrb_gc_mark_value(mrb, t->name);
-      mrb_gc_mark_value(mrb, t->proc);
 
       t = t->next;
     }
@@ -167,7 +168,7 @@ q_insert_task(mrb_state *mrb, mrb_task *t)
   mrb_task *prev = NULL;
 
   /* Find insertion point - insert before first task with lower priority */
-  while (curr != NULL && curr->priority_preemption <= t->priority_preemption) {
+  while (curr != NULL && curr->priority <= t->priority) {
     prev = curr;
     curr = curr->next;
   }
@@ -280,12 +281,12 @@ wake_up_join_waiters(mrb_state *mrb, mrb_task *completed_task)
   mrb_task *curr = q_waiting_;
   while (curr != NULL) {
     mrb_task *next = curr->next;
-    if (curr->reason == MRB_TASK_REASON_JOIN && curr->join == completed_task) {
+    if (curr->reason == MRB_TASK_REASON_JOIN && curr->wait.join == completed_task) {
       mrb_task_disable_irq();
       q_delete_task(mrb, curr);
       curr->status = MRB_TASK_STATUS_READY;
       curr->reason = MRB_TASK_REASON_NONE;
-      curr->join = NULL;
+      curr->wait.join = NULL;
       q_insert_task(mrb, curr);
       mrb_task_enable_irq();
     }
@@ -314,7 +315,7 @@ execute_task(mrb_state *mrb, mrb_task *t)
 
   /* Set task as running */
   t->status = MRB_TASK_STATUS_RUNNING;
-  t->timeslice = MRB_TIMESLICE_TICK_COUNT;
+  t->state.timeslice = MRB_TIMESLICE_TICK_COUNT;
 
   /* Switch to task context */
   prev_c = mrb->c;
@@ -324,9 +325,8 @@ execute_task(mrb_state *mrb, mrb_task *t)
   mrb->c = &t->c;
 
   /* If task hasn't started yet, pop dummy callinfo */
-  if (!t->started) {
+  if (t->c.status == MRB_FIBER_CREATED) {
     t->c.ci--;
-    t->started = 1;
   }
 
   /* Clear switching flag */
@@ -336,15 +336,19 @@ execute_task(mrb_state *mrb, mrb_task *t)
   t->c.status = MRB_FIBER_RUNNING;
 
   /* Save proc and PC to locals before calling mrb_vm_exec */
-  /* Use current callinfo's proc if available, otherwise use task's stored proc */
-  const struct RProc *proc = t->c.ci->proc ? t->c.ci->proc : mrb_proc_ptr(t->proc);
+  const struct RProc *proc = t->c.ci->proc;
   const mrb_code *pc = t->c.ci->pc;
+
+  /* With C function boundary checks, proc should never be NULL on resume */
+  if (!proc) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "task context corrupted: no proc on resume");
+  }
 
   /* Set vmexec flag to prevent fiber_terminate from being called */
   t->c.vmexec = TRUE;
 
   /* Execute task - PC is saved in ci->pc from previous run */
-  t->result = mrb_vm_exec(mrb, proc, pc);
+  t->state.result = mrb_vm_exec(mrb, proc, pc);
 
   /* Clear vmexec flag */
   t->c.vmexec = FALSE;
@@ -387,9 +391,9 @@ mrb_tick(mrb_state *mrb)
 
   /* Decrease timeslice for running task */
   t = q_ready_;
-  if (t && t->status == MRB_TASK_STATUS_RUNNING && t->timeslice > 0) {
-    t->timeslice--;
-    if (t->timeslice == 0) {
+  if (t && t->status == MRB_TASK_STATUS_RUNNING && t->state.timeslice > 0) {
+    t->state.timeslice--;
+    if (t->state.timeslice == 0) {
       switching_ = TRUE;  /* Trigger context switch */
     }
   }
@@ -404,7 +408,7 @@ mrb_tick(mrb_state *mrb)
       next = curr->next;
 
       if (curr->reason == MRB_TASK_REASON_SLEEP) {
-        if ((int32_t)(curr->wakeup_tick - tick_) <= 0) {
+        if ((int32_t)(curr->wait.wakeup_tick - tick_) <= 0) {
           /* Time to wake up */
           q_delete_task(mrb, curr);
           curr->status = MRB_TASK_STATUS_READY;
@@ -412,8 +416,8 @@ mrb_tick(mrb_state *mrb)
           q_insert_task(mrb, curr);
           switching_ = TRUE;
         }
-        else if (curr->wakeup_tick < next_wakeup) {
-          next_wakeup = curr->wakeup_tick;
+        else if (curr->wait.wakeup_tick < next_wakeup) {
+          next_wakeup = curr->wait.wakeup_tick;
         }
       }
 
@@ -479,7 +483,7 @@ mrb_task_run(mrb_state *mrb)
  */
 
 static void
-sleep_us_impl(mrb_state *mrb, mrb_int usec)
+sleep_us_impl(mrb_state *mrb, uint32_t usec)
 {
   mrb_task *t;
 
@@ -515,11 +519,11 @@ sleep_us_impl(mrb_state *mrb, mrb_int usec)
   t->status = MRB_TASK_STATUS_WAITING;
   t->reason = MRB_TASK_REASON_SLEEP;
   /* Convert microseconds to ticks (tick unit is in milliseconds) */
-  t->wakeup_tick = tick_ + USEC_TO_TICKS(usec);
+  t->wait.wakeup_tick = tick_ + USEC_TO_TICKS(usec);
 
   /* Update next wakeup time if this task wakes earlier */
-  if ((int32_t)(t->wakeup_tick - wakeup_tick_) < 0) {
-    wakeup_tick_ = t->wakeup_tick;
+  if ((int32_t)(t->wait.wakeup_tick - wakeup_tick_) < 0) {
+    wakeup_tick_ = t->wait.wakeup_tick;
   }
 
   q_insert_task(mrb, t);
@@ -531,7 +535,7 @@ sleep_us_impl(mrb_state *mrb, mrb_int usec)
 }
 
 static void
-sleep_ms_impl(mrb_state *mrb, mrb_int ms)
+sleep_ms_impl(mrb_state *mrb, uint32_t ms)
 {
   sleep_us_impl(mrb, ms * 1000);
 }
@@ -563,7 +567,7 @@ mrb_f_sleep(mrb_state *mrb, mrb_value self)
   }
 
   mrb_int ms = (mrb_int)(sec * 1000);
-  sleep_ms_impl(mrb, ms);
+  sleep_ms_impl(mrb, (uint32_t)ms);
 
   return mrb_fixnum_value((mrb_int)sec);
 }
@@ -579,7 +583,7 @@ mrb_f_sleep_ms(mrb_state *mrb, mrb_value self)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "time interval must be positive");
   }
 
-  sleep_ms_impl(mrb, ms);
+  sleep_ms_impl(mrb, (uint32_t)ms);
 
   return mrb_nil_value();
 }
@@ -595,7 +599,7 @@ mrb_f_usleep(mrb_state *mrb, mrb_value self)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "time interval must be positive");
   }
 
-  sleep_us_impl(mrb, usec);
+  sleep_us_impl(mrb, (uint32_t)usec);
 
   return mrb_fixnum_value(usec);
 }
@@ -650,11 +654,10 @@ mrb_task_s_new(mrb_state *mrb, mrb_value self)
   /* Allocate and initialize task */
   t = task_alloc(mrb);
   t->priority = (uint8_t)priority;
-  t->priority_preemption = (uint8_t)priority;
   t->status = MRB_TASK_STATUS_READY;
   t->reason = MRB_TASK_REASON_NONE;
   t->name = name_val;
-  t->proc = blk;  /* Store proc to keep it from being GC'd */
+  /* Note: proc is stored in t->c.ci->proc and marked via callinfo GC */
 
   /* Create Ruby object to hold task */
   task_obj = mrb_obj_value(mrb_data_object_alloc(mrb, mrb_class_get(mrb, "Task"),
@@ -770,6 +773,14 @@ mrb_task_s_pass(mrb_state *mrb, mrb_value self)
     task_run_one_iteration(mrb);
   }
   else {
+    /* Check for C function boundary - cannot yield from C function */
+    mrb_callinfo *ci;
+    for (ci = mrb->c->ci; ci >= mrb->c->cibase; ci--) {
+      if (ci->cci > 0) {
+        mrb_raise(mrb, E_RUNTIME_ERROR, "can't pass across C function boundary");
+      }
+    }
+
     /* In task context - trigger context switch */
     switching_ = TRUE;
   }
@@ -978,7 +989,6 @@ mrb_task_set_priority(mrb_state *mrb, mrb_value self)
 
   mrb_task_disable_irq();
   t->priority = (uint8_t)priority;
-  t->priority_preemption = (uint8_t)priority;
 
   /* Re-sort in queue if task is ready */
   if (t->status == MRB_TASK_STATUS_READY || t->status == MRB_TASK_STATUS_RUNNING) {
@@ -1089,7 +1099,7 @@ mrb_task_join(mrb_state *mrb, mrb_value self)
 
   /* If task is already dormant, return immediately */
   if (t->status == MRB_TASK_STATUS_DORMANT) {
-    return t->result;
+    return t->state.result;
   }
 
   /* Wait for task to complete */
@@ -1097,14 +1107,14 @@ mrb_task_join(mrb_state *mrb, mrb_value self)
   q_delete_task(mrb, current);
   current->status = MRB_TASK_STATUS_WAITING;
   current->reason = MRB_TASK_REASON_JOIN;
-  current->join = t;
+  current->wait.join = t;
   q_insert_task(mrb, current);
   mrb_task_enable_irq();
 
   /* Trigger context switch */
   switching_ = TRUE;
 
-  return t->result;
+  return t->state.result;
 }
 
 /*

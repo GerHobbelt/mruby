@@ -8,10 +8,13 @@ MRuby::Gem::Specification.new('mruby-dir') do |spec|
     # No HAL found - determine appropriate error message or auto-load
     suggested_hal = if ENV['MRUBY_DIR_HAL']
       ENV['MRUBY_DIR_HAL']
-    elsif spec.for_windows?
+    elsif spec.build.primary_toolchain == 'visualcpp'
+      # Visual C++ on Windows - use native Windows HAL
       'hal-win-dir'
     elsif RUBY_PLATFORM =~ /linux|darwin|bsd/
       'hal-posix-dir'
+    elsif spec.for_windows?
+      'hal-win-dir'
     else
       nil
     end
