@@ -47,14 +47,11 @@ static const char* tok(parser_state *p);
 static int toklen(parser_state *p);
 
 /* Forward declarations for variable-sized simple node functions */
-static node* new_self_var(parser_state *p);
-static node* new_nil_var(parser_state *p);
-static node* new_const_var(parser_state *p, mrb_sym symbol);
 
 /* Forward declarations for variable-sized advanced node functions */
-static node* new_rescue_var(parser_state *p, node *body, node *rescue_clauses, node *else_clause);
-static node* new_block_var(parser_state *p, node *locals, node *args, node *body);
-static node* new_args_tail_var(parser_state *p, node *keywords, node *kwrest, mrb_sym block);
+
+/* Helper function to check node type for both traditional and variable-sized nodes */
+static mrb_bool node_type_p(node *n, enum node_type type);
 
 #define identchar(c) (ISALNUM(c) || (c) == '_' || !ISASCII(c))
 
@@ -266,20 +263,6 @@ list4_gen(parser_state *p, node *a, node *b, node *c, node *d)
 #define list4(a,b,c,d) list4_gen(p, (a),(b),(c),(d))
 
 static node*
-list5_gen(parser_state *p, node *a, node *b, node *c, node *d, node *e)
-{
-  return cons_head(a, cons(b, cons(c, cons(d, cons(e, 0)))));
-}
-#define list5(a,b,c,d,e) list5_gen(p, (a),(b),(c),(d),(e))
-
-static node*
-list6_gen(parser_state *p, node *a, node *b, node *c, node *d, node *e, node *f)
-{
-  return cons_head(a, cons(b, cons(c, cons(d, cons(e, cons(f, 0))))));
-}
-#define list6(a,b,c,d,e,f) list6_gen(p, (a),(b),(c),(d),(e),(f))
-
-static node*
 append_gen(parser_state *p, node *a, node *b)
 {
   node *c = a;
@@ -442,6 +425,21 @@ locals_node(parser_state *p)
   return p->locals ? p->locals->car : NULL;
 }
 
+/* Helper function to check node type for both traditional and variable-sized nodes */
+static mrb_bool
+node_type_p(node *n, enum node_type type)
+{
+  if (!n) return FALSE;
+
+  /* Check traditional cons-list nodes */
+  if (node_to_int(n->car) == type) return TRUE;
+
+  /* Check variable-sized nodes */
+  if (n->car == (node*)NODE_VARIABLE && VAR_NODE_TYPE(n->cdr) == type) return TRUE;
+
+  return FALSE;
+}
+
 static void
 nvars_nest(parser_state *p)
 {
@@ -464,10 +462,6 @@ nvars_unnest(parser_state *p)
 static node*
 new_scope(parser_state *p, node *body)
 {
-  if (!p->var_nodes_enabled) {
-    return cons_head((node*)NODE_SCOPE, cons(locals_node(p), body));
-  }
-
   size_t total_size = sizeof(struct mrb_ast_scope_node);
   enum mrb_ast_size_class class = size_to_class(total_size);
   struct mrb_ast_scope_node *scope_node = (struct mrb_ast_scope_node*)parser_alloc_var(p, total_size, class);
@@ -481,24 +475,21 @@ new_scope(parser_state *p, node *body)
 static node*
 new_stmts(parser_state *p, node *body)
 {
-  if (body) {
-    /* If body is already a NODE_STMTS, just return it directly */
-    if (node_to_type(body->car) == NODE_STMTS) {
-      return body;
-    }
-    return list2((node*)NODE_STMTS, body);
-  }
-  return cons_head((node*)NODE_STMTS, 0);
+  size_t total_size = sizeof(struct mrb_ast_stmts_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_stmts_node *n = (struct mrb_ast_stmts_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->hdr, p, NODE_STMTS, class);
+  n->stmts = body ? list1(body) : 0;  /* Wrap single statement in cons-list */
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
-/* (:begin body) */
+/* (:begin body) - Always use variable-sized nodes */
 static node*
 new_begin(parser_state *p, node *body)
 {
-  if (!p->var_nodes_enabled) {
-    return cons_head((node*)NODE_BEGIN, body);
-  }
-
   size_t total_size = sizeof(struct mrb_ast_begin_node);
   enum mrb_ast_size_class class = size_to_class(total_size);
   struct mrb_ast_begin_node *begin_node = (struct mrb_ast_begin_node*)parser_alloc_var(p, total_size, class);
@@ -509,14 +500,21 @@ new_begin(parser_state *p, node *body)
 
 #define newline_node(n) (n)
 
-/* (:rescue body rescue else) */
+/* (:rescue body rescue else) - Always use variable-sized nodes */
 static node*
 new_rescue(parser_state *p, node *body, node *resq, node *els)
 {
-  if (p->var_nodes_enabled) {
-    return new_rescue_var(p, body, resq, els);
-  }
-  return list4((node*)NODE_RESCUE, body, resq, els);
+  size_t total_size = sizeof(struct mrb_ast_rescue_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_rescue_node *n = (struct mrb_ast_rescue_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->hdr, p, NODE_RESCUE, class);
+  n->body = body;
+  n->rescue_clauses = resq;
+  n->else_clause = els;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 static node*
@@ -525,14 +523,10 @@ new_mod_rescue(parser_state *p, node *body, node *resq)
   return new_rescue(p, body, list1(list3(0, 0, resq)), 0);
 }
 
-/* (:ensure body ensure) */
+/* (:ensure body ensure) - Always use variable-sized nodes */
 static node*
 new_ensure(parser_state *p, node *a, node *b)
 {
-  if (!p->var_nodes_enabled) {
-    return cons_head((node*)NODE_ENSURE, cons(a, cons(0, b)));
-  }
-
   size_t total_size = sizeof(struct mrb_ast_ensure_node);
   enum mrb_ast_size_class class = size_to_class(total_size);
   struct mrb_ast_ensure_node *ensure_node = (struct mrb_ast_ensure_node*)parser_alloc_var(p, total_size, class);
@@ -546,10 +540,14 @@ new_ensure(parser_state *p, node *a, node *b)
 static node*
 new_nil(parser_state *p)
 {
-  if (p->var_nodes_enabled) {
-    return new_nil_var(p);
-  }
-  return list1((node*)NODE_NIL);
+  size_t total_size = sizeof(struct mrb_ast_nil_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_nil_node *n = (struct mrb_ast_nil_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->hdr, p, NODE_NIL, class);
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:true) */
@@ -593,97 +591,79 @@ new_alias(parser_state *p, mrb_sym a, mrb_sym b)
   return cons_head((node*)NODE_VARIABLE, (node*)alias_node);
 }
 
-/* Forward declarations for variable-sized AST node creation functions */
-static node* new_array_var(parser_state *p, node *a);
-static node* new_hash_var(parser_state *p, node *a);
-static node* new_if_var(parser_state *p, node *condition, node *then_body, node *else_body);
-static node* new_while_var(parser_state *p, node *condition, node *body);
-static node* new_until_var(parser_state *p, node *condition, node *body);
-static node* new_case_var(parser_state *p, node *value, node *when_list);
-static node* new_for_var(parser_state *p, node *var, node *iterable, node *body);
-static node* new_def_var(parser_state *p, mrb_sym name, node *args, node *body);
-static node* new_class_var(parser_state *p, node *name, node *superclass, node *body);
-static node* new_module_var(parser_state *p, node *name, node *body);
-static node* new_sclass_var(parser_state *p, node *obj, node *body);
-static node* new_asgn_var(parser_state *p, node *lhs, node *rhs);
-static node* new_masgn_var(parser_state *p, node *lhs, node *rhs);
-static node* new_op_asgn_var(parser_state *p, node *lhs, mrb_sym op, node *rhs);
-static node* new_and_var(parser_state *p, node *left, node *right);
-static node* new_or_var(parser_state *p, node *left, node *right);
-static node* new_return_var(parser_state *p, node *args);
-static node* new_float_var(parser_state *p, const char *value);
-
 /* (:if cond then else) */
 static node*
-new_if(parser_state *p, node *a, node *b, node *c)
+new_if(parser_state *p, node *condition, node *then_body, node *else_body)
 {
-  void_expr_error(p, a);
-  // If variable-sized nodes are enabled, use the specialized creation function
-  if (p->var_nodes_enabled) {
-    return new_if_var(p, a, b, c);
-  }
-  return list4((node*)NODE_IF, a, b, c);
-}
+  void_expr_error(p, condition);
 
-/* (:unless cond then else) */
-static node*
-new_unless(parser_state *p, node *a, node *b, node *c)
-{
-  void_expr_error(p, a);
-  return list4((node*)NODE_IF, a, c, b);
+  size_t total_size = sizeof(struct mrb_ast_if_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+  struct mrb_ast_if_node *n;
+
+  n = (struct mrb_ast_if_node*)parser_alloc_var(p, total_size, class);
+  init_var_header(&n->header, p, NODE_IF, class);
+  n->condition = condition;
+  n->then_body = then_body;
+  n->else_body = else_body;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:while cond body) */
 static node*
-new_while(parser_state *p, node *a, node *b)
+new_while(parser_state *p, node *condition, node *body)
 {
-  void_expr_error(p, a);
-  // If variable-sized nodes are enabled, use the specialized creation function
-  if (p->var_nodes_enabled) {
-    return new_while_var(p, a, b);
-  }
-  return cons_head((node*)NODE_WHILE, cons(a, b));
+  void_expr_error(p, condition);
+
+  size_t total_size = sizeof(struct mrb_ast_while_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+  struct mrb_ast_while_node *n;
+
+  n = (struct mrb_ast_while_node*)parser_alloc_var(p, total_size, class);
+  init_var_header(&n->header, p, NODE_WHILE, class);
+  n->condition = condition;
+  n->body = body;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:until cond body) */
 static node*
-new_until(parser_state *p, node *a, node *b)
+new_until(parser_state *p, node *condition, node *body)
 {
-  void_expr_error(p, a);
-  if (p->var_nodes_enabled) {
-    return new_until_var(p, a, b);
-  }
-  return cons_head((node*)NODE_UNTIL, cons(a, b));
+  void_expr_error(p, condition);
+
+  size_t total_size = sizeof(struct mrb_ast_until_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+  struct mrb_ast_until_node *n;
+
+  n = (struct mrb_ast_until_node*)parser_alloc_var(p, total_size, class);
+  init_var_header(&n->header, p, NODE_UNTIL, class);
+  n->condition = condition;
+  n->body = body;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:while_mod cond body) */
 static node*
-new_while_mod(parser_state *p, node *a, node *b)
+new_while_mod(parser_state *p, node *condition, node *body)
 {
-  void_expr_error(p, a);
-
-  size_t total_size = sizeof(struct mrb_ast_while_mod_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_while_mod_node *n = (struct mrb_ast_while_mod_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->hdr, p, NODE_WHILE_MOD, class);
-  n->condition = a;
-  n->body = b;
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  node *while_node = new_while(p, condition, body);
+  struct mrb_ast_while_node *n = (struct mrb_ast_while_node*)NODE_VAR_NODE_PTR(while_node);
+  n->header.node_type = NODE_WHILE_MOD;
+  return while_node;
 }
 
 /* (:until_mod cond body) */
 static node*
 new_until_mod(parser_state *p, node *a, node *b)
 {
-  void_expr_error(p, a);
-
-  size_t total_size = sizeof(struct mrb_ast_until_mod_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-  struct mrb_ast_until_mod_node *n = (struct mrb_ast_until_mod_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&n->hdr, p, NODE_UNTIL_MOD, class);
-  n->condition = a;
-  n->body = b;
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+  node *until_node = new_until(p, a, b);
+  struct mrb_ast_until_node *n = (struct mrb_ast_until_node*)NODE_VAR_NODE_PTR(until_node);
+  n->header.node_type = NODE_UNTIL_MOD;
+  return until_node;
 }
 
 /* (:for var obj body) */
@@ -691,30 +671,64 @@ static node*
 new_for(parser_state *p, node *v, node *o, node *b)
 {
   void_expr_error(p, o);
-  // If variable-sized nodes are enabled, use the specialized creation function
-  if (p->var_nodes_enabled) {
-    return new_for_var(p, v, o, b);
-  }
-  return list4((node*)NODE_FOR, v, o, b);
+
+  size_t total_size = sizeof(struct mrb_ast_for_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_for_node *n = (struct mrb_ast_for_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->header, p, NODE_FOR, class);
+  n->var = v;
+  n->iterable = o;
+  n->body = b;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:case a ((when ...) body) ((when...) body)) */
 static node*
 new_case(parser_state *p, node *a, node *b)
 {
-  // If variable-sized nodes are enabled, use the specialized creation function
-  if (p->var_nodes_enabled) {
-    return new_case_var(p, a, b);
-  }
-  node *n = list2((node*)NODE_CASE, a);
-  node *n2 = n;
+  uint16_t when_count = 0;
+  node *else_body = NULL;
+  node *current_when = b;
 
   void_expr_error(p, a);
-  while (n2->cdr) {
-    n2 = n2->cdr;
+
+  // First pass: count when clauses and identify else_body
+  // The when_list is a linked list where each element's car is a (condition . body) cons node.
+  // The last element's car might be 0, and its cdr is the else_body.
+  while (current_when) {
+    node *clause = current_when->car;
+    if (clause && node_to_int(clause->car) == 0) { // This is the else clause
+      else_body = clause->cdr;
+      break; // Else body is always the last
+    }
+    when_count++;
+    current_when = current_when->cdr;
   }
-  n2->cdr = b;
-  return n;
+
+  size_t base_size = sizeof(struct mrb_ast_case_node);
+  size_t when_clauses_size = when_count * sizeof(struct mrb_ast_node*);
+  size_t total_size = base_size + when_clauses_size;
+
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_case_node *n = (struct mrb_ast_case_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->header, p, NODE_CASE, class);
+  n->value = a;
+  n->when_count = when_count;
+  n->else_body = else_body;
+
+  // Second pass: copy when clauses into flexible array
+  current_when = b;
+  for (int i = 0; i < when_count; i++) {
+    n->when_clauses[i] = current_when->car; // Each car is a (condition . body) cons node
+    current_when = current_when->cdr;
+  }
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:postexe a) */
@@ -733,10 +747,14 @@ new_postexe(parser_state *p, node *a)
 static node*
 new_self(parser_state *p)
 {
-  if (p->var_nodes_enabled) {
-    return new_self_var(p);
-  }
-  return list1((node*)NODE_SELF);
+  size_t total_size = sizeof(struct mrb_ast_self_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_self_node *n = (struct mrb_ast_self_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->hdr, p, NODE_SELF, class);
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:call a b c) */
@@ -818,465 +836,6 @@ new_call_var(parser_state *p, node *receiver, mrb_sym method, node *args, int pa
 }
 #endif
 
-/* Variable-sized array node creation */
-static node*
-new_array_var(parser_state *p, node *a)
-{
-  /* Count array elements */
-  uint16_t len = 0;
-  node *elem_iter = a;
-  while (elem_iter) {
-    len++;
-    elem_iter = elem_iter->cdr;
-  }
-
-  /* Calculate total size needed */
-  size_t base_size = sizeof(struct mrb_ast_array_node);
-  size_t elems_size = len * sizeof(struct mrb_ast_node*);
-  size_t total_size = base_size + elems_size;
-
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_array_node *n = (struct mrb_ast_array_node*)
-    parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_ARRAY, class);
-  n->len = len;
-  n->flags = 0;
-
-  /* Copy elements into flexible array */
-  elem_iter = a;
-  for (int i = 0; i < len; i++) {
-    n->elements[i] = elem_iter->car;
-    elem_iter = elem_iter->cdr;
-  }
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized hash node creation */
-static node*
-new_hash_var(parser_state *p, node *a)
-{
-  /* Count hash key-value pairs */
-  uint16_t len = 0;
-  node *pair_iter = a;
-  while (pair_iter) {
-    len++;
-    pair_iter = pair_iter->cdr;
-  }
-
-  /* Calculate total size needed */
-  size_t base_size = sizeof(struct mrb_ast_hash_node);
-  size_t pairs_size = len * 2 * sizeof(struct mrb_ast_node*); /* key and value for each pair */
-  size_t total_size = base_size + pairs_size;
-
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_hash_node *n = (struct mrb_ast_hash_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_HASH, class);
-  n->len = len;
-  n->flags = 0;
-
-  /* Copy key-value pairs into flexible array */
-  pair_iter = a;
-  for (int i = 0; i < len; i++) {
-    if (pair_iter && pair_iter->car) {
-      /* Each pair is a cons (key . value) */
-      node *pair = pair_iter->car;
-      n->pairs[i * 2] = pair->car;     /* key */
-      n->pairs[i * 2 + 1] = pair->cdr; /* value */
-    }
-    pair_iter = pair_iter->cdr;
-  }
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized if node creation */
-static node*
-new_if_var(parser_state *p, node *condition, node *then_body, node *else_body)
-{
-  size_t total_size = sizeof(struct mrb_ast_if_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_if_node *n = (struct mrb_ast_if_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_IF, class);
-  n->condition = condition;
-  n->then_body = then_body;
-  n->else_body = else_body;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized while node creation */
-static node*
-new_while_var(parser_state *p, node *condition, node *body)
-{
-  size_t total_size = sizeof(struct mrb_ast_while_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_while_node *n = (struct mrb_ast_while_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_WHILE, class);
-  n->condition = condition;
-  n->body = body;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized until node creation */
-static node*
-new_until_var(parser_state *p, node *condition, node *body)
-{
-  size_t total_size = sizeof(struct mrb_ast_until_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_until_node *n = (struct mrb_ast_until_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_UNTIL, class);
-  n->condition = condition;
-  n->body = body;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized for node creation */
-static node*
-new_for_var(parser_state *p, node *var, node *iterable, node *body)
-{
-  size_t total_size = sizeof(struct mrb_ast_for_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_for_node *n = (struct mrb_ast_for_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_FOR, class);
-  n->var = var;
-  n->iterable = iterable;
-  n->body = body;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized method definition node creation */
-static node*
-new_def_var(parser_state *p, mrb_sym name, node *args, node *body)
-{
-  size_t total_size = sizeof(struct mrb_ast_def_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_def_node *n = (struct mrb_ast_def_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_DEF, class);
-  n->name = name;
-  n->args = args;
-  n->body = body;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized class definition node creation */
-static node*
-new_class_var(parser_state *p, node *name, node *superclass, node *body)
-{
-  size_t total_size = sizeof(struct mrb_ast_class_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_class_node *n = (struct mrb_ast_class_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_CLASS, class);
-  n->name = name;
-  n->superclass = superclass;
-  n->body = body;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized module definition node creation */
-static node*
-new_module_var(parser_state *p, node *name, node *body)
-{
-  size_t total_size = sizeof(struct mrb_ast_module_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_module_node *n = (struct mrb_ast_module_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_MODULE, class);
-  n->name = name;
-  n->body = body;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized singleton class definition node creation */
-static node*
-new_sclass_var(parser_state *p, node *obj, node *body)
-{
-  size_t total_size = sizeof(struct mrb_ast_sclass_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_sclass_node *n = (struct mrb_ast_sclass_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_SCLASS, class);
-  n->obj = obj;
-  n->body = body;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized case node creation */
-static node*
-new_case_var(parser_state *p, node *value, node *when_list)
-{
-  uint16_t when_count = 0;
-  node *else_body = NULL;
-  node *current_when = when_list;
-
-  // First pass: count when clauses and identify else_body
-  // The when_list is a linked list where each element's car is a (condition . body) cons node.
-  // The last element's car might be 0, and its cdr is the else_body.
-  while (current_when) {
-    node *clause = current_when->car;
-    if (clause && node_to_int(clause->car) == 0) { // This is the else clause
-      else_body = clause->cdr;
-      break; // Else body is always the last
-    }
-    when_count++;
-    current_when = current_when->cdr;
-  }
-
-  size_t base_size = sizeof(struct mrb_ast_case_node);
-  size_t when_clauses_size = when_count * sizeof(struct mrb_ast_node*);
-  size_t total_size = base_size + when_clauses_size;
-
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_case_node *n = (struct mrb_ast_case_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_CASE, class);
-  n->value = value;
-  n->when_count = when_count;
-  n->flags = 0; // No specific flags for now
-  n->else_body = else_body;
-
-  // Second pass: copy when clauses into flexible array
-  current_when = when_list;
-  for (int i = 0; i < when_count; i++) {
-    n->when_clauses[i] = current_when->car; // Each car is a (condition . body) cons node
-    current_when = current_when->cdr;
-  }
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized assignment node creation */
-static node*
-new_asgn_var(parser_state *p, node *lhs, node *rhs)
-{
-  size_t total_size = sizeof(struct mrb_ast_asgn_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_asgn_node *n = (struct mrb_ast_asgn_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_ASGN, class);
-  n->lhs = lhs;
-  n->rhs = rhs;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized multiple assignment node creation */
-static node*
-new_masgn_var(parser_state *p, node *lhs, node *rhs)
-{
-  size_t total_size = sizeof(struct mrb_ast_masgn_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_masgn_node *n = (struct mrb_ast_masgn_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_MASGN, class);
-  n->lhs = lhs;
-  n->rhs = rhs;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized operator assignment node creation */
-static node*
-new_op_asgn_var(parser_state *p, node *lhs, mrb_sym op, node *rhs)
-{
-  size_t total_size = sizeof(struct mrb_ast_op_asgn_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_op_asgn_node *n = (struct mrb_ast_op_asgn_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_OP_ASGN, class);
-  n->lhs = lhs;
-  n->operator = op;
-  n->rhs = rhs;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized expression node creation */
-static node*
-new_and_var(parser_state *p, node *left, node *right)
-{
-  size_t total_size = sizeof(struct mrb_ast_and_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_and_node *n = (struct mrb_ast_and_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_AND, class);
-  n->left = left;
-  n->right = right;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-static node*
-new_or_var(parser_state *p, node *left, node *right)
-{
-  size_t total_size = sizeof(struct mrb_ast_or_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_or_node *n = (struct mrb_ast_or_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_OR, class);
-  n->left = left;
-  n->right = right;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-static node*
-new_return_var(parser_state *p, node *args)
-{
-  size_t total_size = sizeof(struct mrb_ast_return_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_return_node *n = (struct mrb_ast_return_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->header, p, NODE_RETURN, class);
-  n->args = args;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-
-/* Variable-sized literal node creation functions */
-
-
-static node*
-new_float_var(parser_state *p, const char *value)
-{
-  size_t total_size = sizeof(struct mrb_ast_float_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_float_node *n = (struct mrb_ast_float_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_FLOAT, class);
-  n->value = strdup(value);
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized simple node creation functions */
-static node*
-new_self_var(parser_state *p)
-{
-  size_t total_size = sizeof(struct mrb_ast_self_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_self_node *n = (struct mrb_ast_self_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_SELF, class);
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-static node*
-new_nil_var(parser_state *p)
-{
-  size_t total_size = sizeof(struct mrb_ast_nil_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_nil_node *n = (struct mrb_ast_nil_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_NIL, class);
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-
-
-static node*
-new_const_var(parser_state *p, mrb_sym symbol)
-{
-  size_t total_size = sizeof(struct mrb_ast_const_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_const_node *n = (struct mrb_ast_const_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_CONST, class);
-  n->symbol = symbol;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-/* Variable-sized advanced node creation functions */
-static node*
-new_rescue_var(parser_state *p, node *body, node *rescue_clauses, node *else_clause)
-{
-  size_t total_size = sizeof(struct mrb_ast_rescue_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_rescue_node *n = (struct mrb_ast_rescue_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_RESCUE, class);
-  n->body = body;
-  n->rescue_clauses = rescue_clauses;
-  n->else_clause = else_clause;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-static node*
-new_block_var(parser_state *p, node *locals, node *args, node *body)
-{
-  size_t total_size = sizeof(struct mrb_ast_block_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_block_node *n = (struct mrb_ast_block_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_BLOCK, class);
-  n->locals = locals;
-  /* args might be modified by setup_numparams and could be corrupted */
-  /* Store it carefully to prevent memory corruption */
-  n->args = args;
-  n->body = body;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
-static node*
-new_args_tail_var(parser_state *p, node *keywords, node *kwrest, mrb_sym block)
-{
-  size_t total_size = sizeof(struct mrb_ast_args_tail_node);
-  enum mrb_ast_size_class class = size_to_class(total_size);
-
-  struct mrb_ast_args_tail_node *n = (struct mrb_ast_args_tail_node*)parser_alloc_var(p, total_size, class);
-
-  init_var_header(&n->hdr, p, NODE_ARGS_TAIL, class);
-  n->keywords = keywords;
-  n->kwrest = kwrest;
-  n->block = block;
-
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
-}
-
 /* (:fcall self mid args) */
 static node*
 new_fcall(parser_state *p, mrb_sym b, node *c)
@@ -1352,10 +911,15 @@ new_yield(parser_state *p, node *c)
 static node*
 new_return(parser_state *p, node *c)
 {
-  if (p->var_nodes_enabled) {
-    return new_return_var(p, c);
-  }
-  return cons_head((node*)NODE_RETURN, c);
+  size_t total_size = sizeof(struct mrb_ast_return_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_return_node *n = (struct mrb_ast_return_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->header, p, NODE_RETURN, class);
+  n->args = c;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:break . c) */
@@ -1441,9 +1005,6 @@ static node*
 new_colon2(parser_state *p, node *b, mrb_sym c)
 {
   void_expr_error(p, b);
-  if (!p->var_nodes_enabled) {
-    return cons_head((node*)NODE_COLON2, cons(b, sym_to_node(c)));
-  }
 
   size_t total_size = sizeof(struct mrb_ast_colon2_node);
   enum mrb_ast_size_class class = size_to_class(total_size);
@@ -1471,10 +1032,17 @@ static node*
 new_and(parser_state *p, node *a, node *b)
 {
   void_expr_error(p, a);
-  if (p->var_nodes_enabled) {
-    return new_and_var(p, a, b);
-  }
-  return cons_head((node*)NODE_AND, cons(a, b));
+
+  size_t total_size = sizeof(struct mrb_ast_and_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_and_node *n = (struct mrb_ast_and_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->header, p, NODE_AND, class);
+  n->left = a;
+  n->right = b;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:or a b) */
@@ -1482,20 +1050,53 @@ static node*
 new_or(parser_state *p, node *a, node *b)
 {
   void_expr_error(p, a);
-  if (p->var_nodes_enabled) {
-    return new_or_var(p, a, b);
-  }
-  return cons_head((node*)NODE_OR, cons(a, b));
+
+  size_t total_size = sizeof(struct mrb_ast_or_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_or_node *n = (struct mrb_ast_or_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->header, p, NODE_OR, class);
+  n->left = a;
+  n->right = b;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:array a...) */
 static node*
 new_array(parser_state *p, node *a)
 {
-  if (p->cxt && p->cxt->use_variable_nodes) {
-    return new_array_var(p, a);
+  /* Count array elements */
+  uint16_t len = 0;
+  node *elem_iter = a;
+  while (elem_iter) {
+    len++;
+    elem_iter = elem_iter->cdr;
   }
-  return cons_head((node*)NODE_ARRAY, a);
+
+  /* Calculate total size needed */
+  size_t base_size = sizeof(struct mrb_ast_array_node);
+  size_t elems_size = len * sizeof(struct mrb_ast_node*);
+  size_t total_size = base_size + elems_size;
+
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_array_node *n = (struct mrb_ast_array_node*)
+    parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->header, p, NODE_ARRAY, class);
+  n->len = len;
+  n->flags = 0;
+
+  /* Copy elements into flexible array */
+  elem_iter = a;
+  for (int i = 0; i < len; i++) {
+    n->elements[i] = elem_iter->car;
+    elem_iter = elem_iter->cdr;
+  }
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:splat . a) */
@@ -1503,9 +1104,6 @@ static node*
 new_splat(parser_state *p, node *a)
 {
   void_expr_error(p, a);
-  if (!p->var_nodes_enabled) {
-    return cons_head((node*)NODE_SPLAT, a);
-  }
 
   size_t total_size = sizeof(struct mrb_ast_splat_node);
   enum mrb_ast_size_class class = size_to_class(total_size);
@@ -1519,10 +1117,40 @@ new_splat(parser_state *p, node *a)
 static node*
 new_hash(parser_state *p, node *a)
 {
-  if (p->cxt && p->cxt->use_variable_nodes) {
-    return new_hash_var(p, a);
+  /* Count hash key-value pairs */
+  uint16_t len = 0;
+  node *pair_iter = a;
+  while (pair_iter) {
+    len++;
+    pair_iter = pair_iter->cdr;
   }
-  return cons_head((node*)NODE_HASH, a);
+
+  /* Calculate total size needed */
+  size_t base_size = sizeof(struct mrb_ast_hash_node);
+  size_t pairs_size = len * 2 * sizeof(struct mrb_ast_node*); /* key and value for each pair */
+  size_t total_size = base_size + pairs_size;
+
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_hash_node *n = (struct mrb_ast_hash_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->header, p, NODE_HASH, class);
+  n->len = len;
+  n->flags = 0;
+
+  /* Copy key-value pairs into flexible array */
+  pair_iter = a;
+  for (int i = 0; i < len; i++) {
+    if (pair_iter && pair_iter->car) {
+      /* Each pair is a cons (key . value) */
+      node *pair = pair_iter->car;
+      n->pairs[i * 2] = pair->car;     /* key */
+      n->pairs[i * 2 + 1] = pair->cdr; /* value */
+    }
+    pair_iter = pair_iter->cdr;
+  }
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:kw_hash (k . v) (k . v)...) */
@@ -1558,7 +1186,7 @@ new_sym(parser_state *p, mrb_sym sym)
 }
 
 static node*
-new_var_var(parser_state *p, mrb_sym sym, enum node_type type)
+new_xvar(parser_state *p, mrb_sym sym, enum node_type type)
 {
   size_t size = sizeof(struct mrb_ast_var_node);
   enum mrb_ast_size_class class = size_to_class(size);
@@ -1578,46 +1206,6 @@ new_strsym(parser_state *p, node* str)
   const char *s = (const char*)str->cdr;
 
   return mrb_intern(p->mrb, s, len);
-}
-
-/* (:lvar . a) */
-static node*
-new_lvar(parser_state *p, mrb_sym sym)
-{
-  if (p->var_nodes_enabled) {
-    return new_var_var(p, sym, NODE_LVAR);
-  }
-  return cons_head((node*)NODE_LVAR, sym_to_node(sym));
-}
-
-/* (:gvar . a) */
-static node*
-new_gvar(parser_state *p, mrb_sym sym)
-{
-  if (p->var_nodes_enabled) {
-    return new_var_var(p, sym, NODE_GVAR);
-  }
-  return cons_head((node*)NODE_GVAR, sym_to_node(sym));
-}
-
-/* (:ivar . a) */
-static node*
-new_ivar(parser_state *p, mrb_sym sym)
-{
-  if (p->var_nodes_enabled) {
-    return new_var_var(p, sym, NODE_IVAR);
-  }
-  return cons_head((node*)NODE_IVAR, sym_to_node(sym));
-}
-
-/* (:cvar . a) */
-static node*
-new_cvar(parser_state *p, mrb_sym sym)
-{
-  if (p->var_nodes_enabled) {
-    return new_var_var(p, sym, NODE_CVAR);
-  }
-  return cons_head((node*)NODE_CVAR, sym_to_node(sym));
 }
 
 /* (:nvar . a) */
@@ -1644,10 +1232,6 @@ new_nvar(parser_state *p, int num)
     p->nvars->car = int_to_node(nvar > num ? nvar : num);
   }
 
-  if (!p->var_nodes_enabled) {
-    return cons_head((node*)NODE_NVAR, int_to_node(num));
-  }
-
   size_t total_size = sizeof(struct mrb_ast_nvar_node);
   enum mrb_ast_size_class class = size_to_class(total_size);
   struct mrb_ast_nvar_node *n = (struct mrb_ast_nvar_node*)parser_alloc_var(p, total_size, class);
@@ -1660,10 +1244,15 @@ new_nvar(parser_state *p, int num)
 static node*
 new_const(parser_state *p, mrb_sym sym)
 {
-  if (p->var_nodes_enabled) {
-    return new_const_var(p, sym);
-  }
-  return cons_head((node*)NODE_CONST, sym_to_node(sym));
+  size_t total_size = sizeof(struct mrb_ast_const_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_const_node *n = (struct mrb_ast_const_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->hdr, p, NODE_CONST, class);
+  n->symbol = sym;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:undef a...) */
@@ -1683,10 +1272,18 @@ static node*
 new_class(parser_state *p, node *c, node *s, node *b)
 {
   void_expr_error(p, s);
-  if (p->var_nodes_enabled) {
-    return new_class_var(p, c, s, cons(locals_node(p), b));
-  }
-  return list4((node*)NODE_CLASS, c, s, cons(locals_node(p), b));
+
+  size_t total_size = sizeof(struct mrb_ast_class_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_class_node *n = (struct mrb_ast_class_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->header, p, NODE_CLASS, class);
+  n->name = c;
+  n->superclass = s;
+  n->body = cons(locals_node(p), b);
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:sclass obj body) */
@@ -1694,97 +1291,117 @@ static node*
 new_sclass(parser_state *p, node *o, node *b)
 {
   void_expr_error(p, o);
-  if (p->var_nodes_enabled) {
-    return new_sclass_var(p, o, cons(locals_node(p), b));
-  }
-  return list3((node*)NODE_SCLASS, o, cons(locals_node(p), b));
+
+  size_t total_size = sizeof(struct mrb_ast_sclass_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+  struct mrb_ast_sclass_node *n = (struct mrb_ast_sclass_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->header, p, NODE_SCLASS, class);
+  n->obj = o;
+  n->body = cons(locals_node(p), b);
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:module module body) */
 static node*
 new_module(parser_state *p, node *m, node *b)
 {
-  if (p->var_nodes_enabled) {
-    return new_module_var(p, m, cons(locals_node(p), b));
-  }
-  return list3((node*)NODE_MODULE, m, cons(locals_node(p), b));
+  size_t total_size = sizeof(struct mrb_ast_module_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_module_node *n = (struct mrb_ast_module_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->header, p, NODE_MODULE, class);
+  n->name = m;
+  n->body = cons(locals_node(p), b);
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:def m lv (arg . body)) */
 static node*
-new_def(parser_state *p, mrb_sym m, node *a, node *b)
+new_def(parser_state *p, mrb_sym name)
 {
-  if (p->var_nodes_enabled) {
-    return new_def_var(p, m, a, b);
-  }
-  return list5((node*)NODE_DEF, sym_to_node(m), 0, a, b);
+  size_t total_size = sizeof(struct mrb_ast_def_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_def_node *n = (struct mrb_ast_def_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->header, p, NODE_DEF, class);
+  n->name = name;
+  n->args = int_to_node(p->cmdarg_stack);
+  n->locals = local_switch(p);
+  n->body = NULL;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 static void
 defn_setup(parser_state *p, node *d, node *a, node *b)
 {
-  node *n = d->cdr->cdr;
+  struct mrb_ast_def_node *n = def_node(d->cdr);
+  node *locals = n->locals;
 
-  n->car = locals_node(p);
-  p->cmdarg_stack = node_to_int(n->cdr->car);
-  n->cdr->car = a;
-  local_resume(p, n->cdr->cdr->car);
-  n->cdr->cdr->car = b;
+  n->locals = locals_node(p);
+  p->cmdarg_stack = node_to_int(n->args);
+  n->args = a;
+  n->body = b;
+  local_resume(p, locals);
 }
 
 /* (:sdef obj m lv (arg . body)) */
 static node*
-new_sdef(parser_state *p, node *o, mrb_sym m, node *a, node *b)
+new_sdef(parser_state *p, node *o, mrb_sym name)
 {
   void_expr_error(p, o);
-  if (!p->var_nodes_enabled) {
-    return list6((node*)NODE_SDEF, o, sym_to_node(m), 0, a, b);
-  }
 
   size_t total_size = sizeof(struct mrb_ast_sdef_node);
   enum mrb_ast_size_class class = size_to_class(total_size);
   struct mrb_ast_sdef_node *sdef_node = (struct mrb_ast_sdef_node*)parser_alloc_var(p, total_size, class);
-  init_var_header(&sdef_node->hdr, p, NODE_SDEF, class);
+  init_var_header(&sdef_node->header, p, NODE_SDEF, class);
   sdef_node->obj = o;
-  sdef_node->name = m;
-  sdef_node->args = a;
-  sdef_node->body = b;
+  sdef_node->name = name;
+  sdef_node->args = int_to_node(p->cmdarg_stack);
+  sdef_node->locals = local_switch(p);
+  sdef_node->body = NULL;
   return cons_head((node*)NODE_VARIABLE, (node*)sdef_node);
-}
-
-static void
-defs_setup(parser_state *p, node *d, node *a, node *b)
-{
-  node *n = d->cdr->cdr->cdr;
-
-  n->car = locals_node(p);
-  p->cmdarg_stack = node_to_int(n->cdr->car);
-  n->cdr->car = a;
-  local_resume(p, n->cdr->cdr->car);
-  n->cdr->cdr->car = b;
 }
 
 /* (:arg . sym) */
 static node*
 new_arg(parser_state *p, mrb_sym sym)
 {
-  return cons_head((node*)NODE_ARG, sym_to_node(sym));
+  return new_xvar(p, sym, NODE_ARG);
 }
 
 static void
 local_add_margs(parser_state *p, node *n)
 {
   while (n) {
-    if (node_to_type(n->car->car) == NODE_MASGN) {
-      node *t = n->car->cdr->cdr;
+    if (node_to_type(n->car->car) == NODE_VARIABLE) {
+      if (VAR_NODE_TYPE(n->car->cdr) == NODE_MASGN) {
+        struct mrb_ast_masgn_node *masgn_n = (struct mrb_ast_masgn_node*)n->car->cdr;
+        node *lhs = masgn_n->lhs;
+        node *rhs = masgn_n->rhs;
 
-      n->car->cdr->cdr = NULL;
-      while (t) {
-        local_add_f(p, node_to_sym(t->car));
-        t = t->cdr;
+        /* For parameter destructuring, rhs contains the locals */
+        if (rhs) {
+          node *t = rhs;
+          while (t) {
+            local_add_f(p, node_to_sym(t->car));
+            t = t->cdr;
+          }
+        }
+
+        /* Process nested destructuring in lhs */
+        if (lhs && lhs->car) {
+          local_add_margs(p, lhs->car);
+        }
+        if (lhs && lhs->cdr && lhs->cdr->cdr && lhs->cdr->cdr->car) {
+          local_add_margs(p, lhs->cdr->cdr->car);
+        }
       }
-      local_add_margs(p, n->car->cdr->car->car);
-      local_add_margs(p, n->car->cdr->car->cdr->cdr->car);
     }
     n = n->cdr;
   }
@@ -1853,10 +1470,17 @@ new_args_tail(parser_state *p, node *kws, node *kwrest, mrb_sym blk)
     }
   }
 
-  if (p->var_nodes_enabled) {
-    return new_args_tail_var(p, kws, kwrest, blk);
-  }
-  return list4((node*)NODE_ARGS_TAIL, kws, kwrest, sym_to_node(blk));
+  size_t total_size = sizeof(struct mrb_ast_args_tail_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_args_tail_node *n = (struct mrb_ast_args_tail_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->hdr, p, NODE_ARGS_TAIL, class);
+  n->keywords = kws;
+  n->kwrest = kwrest;
+  n->block = blk;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:kw_arg kw_sym def_arg) */
@@ -1932,10 +1556,18 @@ static node*
 new_block(parser_state *p, node *a, node *b)
 {
   a = setup_numparams(p, a);
-  if (p->var_nodes_enabled) {
-    return new_block_var(p, locals_node(p), a, b);
-  }
-  return list4((node*)NODE_BLOCK, locals_node(p), a, b);
+
+  size_t total_size = sizeof(struct mrb_ast_block_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_block_node *n = (struct mrb_ast_block_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->hdr, p, NODE_BLOCK, class);
+  n->locals = locals_node(p);
+  n->args = a;
+  n->body = b;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:lambda arg body) */
@@ -1943,9 +1575,6 @@ static node*
 new_lambda(parser_state *p, node *a, node *b)
 {
   a = setup_numparams(p, a);
-  if (!p->var_nodes_enabled) {
-    return list4((node*)NODE_LAMBDA, locals_node(p), a, b);
-  }
 
   size_t total_size = sizeof(struct mrb_ast_lambda_node);
   enum mrb_ast_size_class class = size_to_class(total_size);
@@ -1962,10 +1591,17 @@ static node*
 new_asgn(parser_state *p, node *a, node *b)
 {
   void_expr_error(p, b);
-  if (p->var_nodes_enabled) {
-    return new_asgn_var(p, a, b);
-  }
-  return cons_head((node*)NODE_ASGN, cons(a, b));
+
+  size_t total_size = sizeof(struct mrb_ast_asgn_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_asgn_node *n = (struct mrb_ast_asgn_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->header, p, NODE_ASGN, class);
+  n->lhs = a;
+  n->rhs = b;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:masgn mlhs=(pre rest post)  mrhs) */
@@ -1973,17 +1609,33 @@ static node*
 new_masgn(parser_state *p, node *a, node *b)
 {
   void_expr_error(p, b);
-  if (p->var_nodes_enabled) {
-    return new_masgn_var(p, a, b);
-  }
-  return cons_head((node*)NODE_MASGN, cons(a, b));
+
+  size_t total_size = sizeof(struct mrb_ast_masgn_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_masgn_node *n = (struct mrb_ast_masgn_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->header, p, NODE_MASGN, class);
+  n->lhs = a;
+  n->rhs = b;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:masgn mlhs mrhs) no check */
 static node*
 new_masgn_param(parser_state *p, node *a, node *b)
 {
-  return cons_head((node*)NODE_MASGN, cons(a, b));
+  size_t total_size = sizeof(struct mrb_ast_masgn_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_masgn_node *n = (struct mrb_ast_masgn_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->header, p, NODE_MASGN, class);
+  n->lhs = a;
+  n->rhs = b;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 /* (:asgn lhs rhs) */
@@ -1991,17 +1643,35 @@ static node*
 new_op_asgn(parser_state *p, node *a, mrb_sym op, node *b)
 {
   void_expr_error(p, b);
-  if (p->var_nodes_enabled) {
-    return new_op_asgn_var(p, a, op, b);
-  }
-  return list4((node*)NODE_OP_ASGN, a, sym_to_node(op), b);
+
+  size_t total_size = sizeof(struct mrb_ast_op_asgn_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+  struct mrb_ast_op_asgn_node *n = (struct mrb_ast_op_asgn_node*)parser_alloc_var(p, total_size, class);
+  init_var_header(&n->header, p, NODE_OP_ASGN, class);
+  n->lhs = a;
+  n->operator = op;
+  n->rhs = b;
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
+}
+
+static node*
+new_int_n(parser_state *p, int32_t val)
+{
+  size_t size = sizeof(struct mrb_ast_int_node);
+  enum mrb_ast_size_class class = size_to_class(size);
+  struct mrb_ast_int_node *n = (struct mrb_ast_int_node*)parser_alloc_var(p, size, class);
+
+  init_var_header(&n->header, p, NODE_INT, class);
+  n->value = val;
+
+  return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
 static node*
 new_imaginary(parser_state *p, node *imaginary)
 {
   return new_fcall(p, MRB_SYM_2(p->mrb, Complex),
-                  new_callargs(p, list2(list3((node*)NODE_INT, (node*)strdup("0"), int_to_node(10)), imaginary), 0, 0));
+                   new_callargs(p, list2(new_int_n(p, 0), imaginary), 0, 0));
 }
 
 static node*
@@ -2010,55 +1680,112 @@ new_rational(parser_state *p, node *rational)
   return new_fcall(p, MRB_SYM_2(p->mrb, Rational), new_callargs(p, list1(rational), 0, 0));
 }
 
-/* (:int . i) */
-static node*
-new_int_original(parser_state *p, const char *s, int base)
+/* Read integer into int32_t with overflow detection */
+static mrb_bool
+read_int32(const char *p, int base, int32_t *result)
 {
-  return list3((node*)NODE_INT, (node*)strdup(s), int_to_node(base));
-}
+  const char *e = p + strlen(p);
+  int32_t value = 0;
+  mrb_bool neg = FALSE;
 
-static node*
-new_int_var(parser_state *p, int32_t value)
-{
-  size_t size = sizeof(struct mrb_ast_int_node);
-  enum mrb_ast_size_class class = size_to_class(size);
+  if (base < 2 || base > 16) {
+    return FALSE;
+  }
 
-  struct mrb_ast_int_node *n = (struct mrb_ast_int_node*)parser_alloc_var(p, size, class);
+  if (*p == '+') {
+    p++;
+  }
+  else if (*p == '-') {
+    neg = TRUE;
+    p++;
+  }
 
-  init_var_header(&n->header, p, NODE_INT, class);
-  n->value = value;
+  while (p < e) {
+    int n;
+    char c = *p;
 
-  return cons_head((node*)NODE_VARIABLE, (node*)n);
+    /* Skip underscores */
+    if (c == '_') {
+      p++;
+      continue;
+    }
+
+    /* Parse digit */
+    if (c >= '0' && c <= '9') {
+      n = c - '0';
+    }
+    else if (c >= 'a' && c <= 'f') {
+      n = c - 'a' + 10;
+    }
+    else if (c >= 'A' && c <= 'F') {
+      n = c - 'A' + 10;
+    }
+    else {
+      /* Invalid character */
+      return FALSE;
+    }
+
+    if (n >= base) {
+      /* Digit not valid for this base */
+      return FALSE;
+    }
+
+    /* Check for multiplication overflow */
+    if (value > INT32_MAX / base) {
+      return FALSE;
+    }
+
+    value *= base;
+
+    /* Check for addition overflow */
+    if (value > INT32_MAX - n) {
+      /* Special case: -INT32_MIN is valid */
+      if (neg && value == (INT32_MAX - n + 1) && p + 1 == e) {
+        *result = INT32_MIN;
+        return TRUE;
+      }
+      return FALSE;
+    }
+
+    value += n;
+    p++;
+  }
+
+  *result = neg ? -value : value;
+  return TRUE;
 }
 
 static node*
 new_int(parser_state *p, const char *s, int base, int suffix)
 {
+  int32_t val;
   node* result;
 
-  if (p->var_nodes_enabled && suffix == 0) {
-    char *e;
-    long long val;
-#ifdef MRB_INT64
-    val = strtoll(s, &e, base);
-#else
-    val = strtol(s, &e, base);
-#endif
-    if (*e == 0) { /* conversion successful */
-      if (val >= INT32_MIN && val <= INT32_MAX) {
-        return new_int_var(p, (int32_t)val);
-      }
-    }
-    /* fallback to original for large numbers or parse errors */
+  /* Try to parse as int32_t first */
+  if (read_int32(s, base, &val)) {
+    result = new_int_n(p, val);
+  }
+  else {
+    /* Big integer - create NODE_BIGINT */
+    size_t size = sizeof(struct mrb_ast_bigint_node);
+    enum mrb_ast_size_class class = size_to_class(size);
+    struct mrb_ast_bigint_node *n = (struct mrb_ast_bigint_node*)parser_alloc_var(p, size, class);
+
+    init_var_header(&n->header, p, NODE_BIGINT, class);
+    n->string = strdup(s);
+    n->base = base;
+
+    result = cons_head((node*)NODE_VARIABLE, (node*)n);
   }
 
-  result = new_int_original(p, s, base);
+  /* Handle suffix modifiers */
   if (suffix & NUM_SUFFIX_R) {
     result = new_rational(p, result);
   }
   if (suffix & NUM_SUFFIX_I) {
     result = new_imaginary(p, result);
   }
+
   return result;
 }
 
@@ -2067,13 +1794,16 @@ new_int(parser_state *p, const char *s, int base, int suffix)
 static node*
 new_float(parser_state *p, const char *s, int suffix)
 {
-  node* result;
-  if (p->var_nodes_enabled) {
-    result = new_float_var(p, s);
-  }
-  else {
-    result = cons((node*)NODE_FLOAT, (node*)strdup(s));
-  }
+  size_t total_size = sizeof(struct mrb_ast_float_node);
+  enum mrb_ast_size_class class = size_to_class(total_size);
+
+  struct mrb_ast_float_node *n = (struct mrb_ast_float_node*)parser_alloc_var(p, total_size, class);
+
+  init_var_header(&n->hdr, p, NODE_FLOAT, class);
+  n->value = strdup(s);
+
+  node* result = cons_head((node*)NODE_VARIABLE, (node*)n);
+
   if (suffix & NUM_SUFFIX_R) {
     result = new_rational(p, result);
   }
@@ -2083,9 +1813,6 @@ new_float(parser_state *p, const char *s, int suffix)
   return result;
 }
 #endif
-
-
-
 
 /* Create string node from cons list */
 /* (:str . a) */
@@ -2103,7 +1830,6 @@ new_str(parser_state *p, node *a)
   return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
-
 /* (:xstr . a) */
 static node*
 new_xstr(parser_state *p, node *a)
@@ -2116,7 +1842,6 @@ new_xstr(parser_state *p, node *a)
   return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
 
-
 /* (:dsym . a) */
 static node*
 new_dsym(parser_state *p, node *a)
@@ -2128,7 +1853,6 @@ new_dsym(parser_state *p, node *a)
   n->list = a;
   return cons_head((node*)NODE_VARIABLE, (node*)n);
 }
-
 
 /* (:dregx . (list . (flags . encoding))) */
 static node*
@@ -2319,6 +2043,27 @@ call_with_block(parser_state *p, node *a, node *b)
         yyerror(NULL, p, "block given to yield");
         return;
       }
+      else if (var_type == NODE_RETURN) {
+        /* Variable-sized return nodes - recursively call with args */
+        struct mrb_ast_return_node *return_n = return_node(a->cdr);
+        if (return_n->args == NULL) return;
+        call_with_block(p, return_n->args, b);
+        return;
+      }
+      else if (var_type == NODE_BREAK) {
+        /* Variable-sized break nodes - recursively call with value */
+        struct mrb_ast_break_node *break_n = (struct mrb_ast_break_node*)a->cdr;
+        if (break_n->value == NULL) return;
+        call_with_block(p, break_n->value, b);
+        return;
+      }
+      else if (var_type == NODE_NEXT) {
+        /* Variable-sized next nodes - recursively call with value */
+        struct mrb_ast_next_node *next_n = (struct mrb_ast_next_node*)a->cdr;
+        if (next_n->value == NULL) return;
+        call_with_block(p, next_n->value, b);
+        return;
+      }
     }
     /* For other variable-sized nodes, fall through to default */
     break;
@@ -2329,12 +2074,6 @@ call_with_block(parser_state *p, node *a, node *b)
     n = a->cdr->cdr->cdr; /* (args kw . blk) */
     if (!n->car) n->car = new_callargs(p, 0, 0, b);
     else args_with_block(p, n->car, b);
-    break;
-  case NODE_RETURN:
-  case NODE_BREAK:
-  case NODE_NEXT:
-    if (a->cdr == NULL) return;
-    call_with_block(p, a->cdr, b);
     break;
   default:
     break;
@@ -2351,7 +2090,6 @@ new_negate(parser_state *p, node *n)
   negate_node->operand = n;
   return cons_head((node*)NODE_VARIABLE, (node*)negate_node);
 }
-
 
 static node*
 cond(node *n)
@@ -2374,25 +2112,32 @@ ret_args(parser_state *p, node *n)
 static void
 assignable(parser_state *p, node *lhs)
 {
-  switch (node_to_int(lhs->car)) {
-  case NODE_LVAR:
-    local_add(p, node_to_sym(lhs->cdr));
-    break;
-  case NODE_CONST:
-    if (p->in_def)
-      yyerror(NULL, p, "dynamic constant assignment");
-    break;
+  if (node_to_int(lhs->car) == NODE_VARIABLE) {
+    node *var_node = lhs->cdr;
+    switch (VAR_NODE_TYPE(var_node)) {
+    case NODE_LVAR:
+      local_add(p, VAR_NODE_SYMBOL(var_node));
+      break;
+    case NODE_CONST:
+      if (p->in_def)
+        yyerror(NULL, p, "dynamic constant assignment");
+      break;
+    }
   }
 }
 
 static node*
 var_reference(parser_state *p, node *lhs)
 {
-  if (node_to_int(lhs->car) == NODE_LVAR) {
-    if (!local_var_p(p, node_to_sym(lhs->cdr))) {
-      node *n = new_fcall(p, node_to_sym(lhs->cdr), 0);
-      cons_free(lhs);
-      return n;
+  if (node_to_int(lhs->car) == NODE_VARIABLE) {
+    node *var_node = lhs->cdr;
+    if (VAR_NODE_TYPE(var_node) == NODE_LVAR) {
+      mrb_sym sym = VAR_NODE_SYMBOL(var_node);
+      if (!local_var_p(p, sym)) {
+        node *n = new_fcall(p, sym, 0);
+        /* Don't free variable-sized nodes - they're managed by the parser allocator */
+        return n;
+      }
     }
   }
   return lhs;
@@ -2404,7 +2149,7 @@ label_reference(parser_state *p, mrb_sym sym)
   const char *name = mrb_sym_name(p->mrb, sym);
 
   if (local_var_p(p, sym)) {
-    return new_lvar(p, sym);
+    return new_xvar(p, sym, NODE_LVAR);
   }
   else if (ISUPPER(name[0])) {
     return new_const(p, sym);
@@ -2795,7 +2540,9 @@ stmts           : none
                     }
                 | stmts terms stmt
                     {
-                      $$ = push($1, newline_node($3));
+                      /* Update the cons-list inside the existing variable-sized node */
+                      STMTS_NODE_STMTS($1->cdr) = push(STMTS_NODE_STMTS($1->cdr), newline_node($3));
+                      $$ = $1;
                     }
                 | error stmt
                     {
@@ -2817,11 +2564,11 @@ stmt            : keyword_alias fsym {p->lstate = EXPR_FNAME;} fsym
                     }
                 | stmt modifier_unless expr_value
                     {
-                      $$ = new_unless(p, cond($3), $1, 0);
+                      $$ = new_if(p, cond($3), 0, $1);
                     }
                 | stmt modifier_while expr_value
                     {
-                      if ($1 && node_to_type($1->car) == NODE_BEGIN) {
+                      if ($1 && node_type_p($1, NODE_BEGIN)) {
                         $$ = new_while_mod(p, cond($3), $1);
                       }
                       else {
@@ -2830,7 +2577,7 @@ stmt            : keyword_alias fsym {p->lstate = EXPR_FNAME;} fsym
                     }
                 | stmt modifier_until expr_value
                     {
-                      if ($1 && node_to_type($1->car) == NODE_BEGIN) {
+                      if ($1 && node_type_p($1, NODE_BEGIN)) {
                         $$ = new_until_mod(p, cond($3), $1);
                       }
                       else {
@@ -2865,7 +2612,7 @@ stmt            : keyword_alias fsym {p->lstate = EXPR_FNAME;} fsym
                     }
                 | arg tASSOC tIDENTIFIER
                     {
-                      node *lhs = new_lvar(p, $3);
+                      node *lhs = new_xvar(p, $3, NODE_LVAR);
                       assignable(p, lhs);
                       $$ = new_asgn(p, lhs, $1);
                     }
@@ -2923,7 +2670,7 @@ command_asgn    : lhs '=' command_rhs
                     {
                       $$ = $1;
                       void_expr_error(p, $4);
-                      defs_setup(p, $$, $2, $4);
+                      defn_setup(p, $$, $2, $4);
                       nvars_unnest(p);
                       p->in_def--;
                       p->in_single--;
@@ -2932,7 +2679,7 @@ command_asgn    : lhs '=' command_rhs
                     {
                       $$ = $1;
                       void_expr_error(p, $4);
-                      defs_setup(p, $$, $2, new_mod_rescue(p, $4, $6));
+                      defn_setup(p, $$, $2, new_mod_rescue(p, $4, $6));
                       nvars_unnest(p);
                       p->in_def--;
                       p->in_single--;
@@ -2951,7 +2698,6 @@ command_rhs     : command_call   %prec tOP_ASGN
                     }
                 | command_asgn
                 ;
-
 
 expr            : command_call
                 | expr keyword_and expr
@@ -2973,10 +2719,9 @@ expr            : command_call
                 | arg
                 ;
 
-
 defn_head       : keyword_def fname
                     {
-                      $$ = new_def(p, $2, int_to_node(p->cmdarg_stack), local_switch(p));
+                      $$ = new_def(p, $2);
                       p->cmdarg_stack = 0;
                       p->in_def++;
                       nvars_block(p);
@@ -2989,7 +2734,7 @@ defs_head       : keyword_def singleton dot_or_colon
                     }
                     fname
                     {
-                      $$ = new_sdef(p, $2, $5, int_to_node(p->cmdarg_stack), local_switch(p));
+                      $$ = new_sdef(p, $2, $5);
                       p->cmdarg_stack = 0;
                       p->in_def++;
                       p->in_single++;
@@ -3556,7 +3301,7 @@ arg             : lhs '=' arg_rhs
                     {
                       $$ = $1;
                       void_expr_error(p, $4);
-                      defs_setup(p, $$, $2, $4);
+                      defn_setup(p, $$, $2, $4);
                       nvars_unnest(p);
                       p->in_def--;
                       p->in_single--;
@@ -3565,7 +3310,7 @@ arg             : lhs '=' arg_rhs
                     {
                       $$ = $1;
                       void_expr_error(p, $4);
-                      defs_setup(p, $$, $2, new_mod_rescue(p, $4, $6));
+                      defn_setup(p, $$, $2, new_mod_rescue(p, $4, $6));
                       nvars_unnest(p);
                       p->in_def--;
                       p->in_single--;
@@ -3611,9 +3356,9 @@ paren_args      : '(' opt_call_args ')'
                       mrb_sym r = intern_op(mul);
                       mrb_sym k = intern_op(pow);
                       mrb_sym b = intern_op(and);
-                      $$ = new_callargs(p, push($2, new_splat(p, new_lvar(p, r))),
-                                        new_kw_hash(p, list1(cons(new_kw_rest_args(p, 0), new_lvar(p, k)))),
-                                        new_block_arg(p, new_lvar(p, b)));
+                      $$ = new_callargs(p, push($2, new_splat(p, new_xvar(p, r, NODE_LVAR))),
+                                        new_kw_hash(p, list1(cons(new_kw_rest_args(p, 0), new_xvar(p, k, NODE_LVAR)))),
+                                        new_block_arg(p, new_xvar(p, b, NODE_LVAR)));
                     }
                 | '(' tBDOT3 rparen
                     {
@@ -3621,9 +3366,9 @@ paren_args      : '(' opt_call_args ')'
                       mrb_sym k = intern_op(pow);
                       mrb_sym b = intern_op(and);
                       if (local_var_p(p, r) && local_var_p(p, k) && local_var_p(p, b)) {
-                        $$ = new_callargs(p, list1(new_splat(p, new_lvar(p, r))),
-                                          new_kw_hash(p, list1(cons(new_kw_rest_args(p, 0), new_lvar(p, k)))),
-                                          new_block_arg(p, new_lvar(p, b)));
+                        $$ = new_callargs(p, list1(new_splat(p, new_xvar(p, r, NODE_LVAR))),
+                                          new_kw_hash(p, list1(cons(new_kw_rest_args(p, 0), new_xvar(p, k, NODE_LVAR)))),
+                                          new_block_arg(p, new_xvar(p, b, NODE_LVAR)));
                       }
                       else {
                         yyerror(&@1, p, "unexpected argument forwarding ...");
@@ -3716,7 +3461,7 @@ args            : arg
                     }
                 | tSTAR
                     {
-                      $$ = list1(new_splat(p, new_lvar(p, intern_op(mul))));
+                      $$ = list1(new_splat(p, new_xvar(p, intern_op(mul), NODE_LVAR)));
                     }
                 | tSTAR arg
                     {
@@ -3729,7 +3474,7 @@ args            : arg
                     }
                 | args comma tSTAR
                     {
-                      $$ = push($1, new_splat(p, new_lvar(p, intern_op(mul))));
+                      $$ = push($1, new_splat(p, new_xvar(p, intern_op(mul), NODE_LVAR)));
                     }
                 | args comma tSTAR arg
                     {
@@ -3874,7 +3619,7 @@ primary         : literal
                   opt_else
                   keyword_end
                     {
-                      $$ = new_unless(p, cond($2), $4, $5);
+                      $$ = new_if(p, cond($2), $5, $4);
                       SET_LINENO($$, $1);
                     }
                 | keyword_while {COND_PUSH(1);} expr_value do {COND_POP();}
@@ -3981,7 +3726,7 @@ primary         : literal
                   keyword_end
                     {
                       $$ = $1;
-                      defs_setup(p, $$, $2, $3);
+                      defn_setup(p, $$, $2, $3);
                       nvars_unnest(p);
                       p->in_def--;
                       p->in_single--;
@@ -4203,7 +3948,6 @@ block_param_def : '|' {local_add_blk(p);} opt_bv_decl '|'
                       $$ = $2;
                     }
                 ;
-
 
 opt_bv_decl     : opt_nl
                     {
@@ -4559,7 +4303,6 @@ words           : tWORDS_BEG tSTRING
                     }
                 ;
 
-
 symbol          : basic_symbol
                     {
                       $$ = new_sym(p, $1);
@@ -4630,19 +4373,19 @@ numeric         : tINTEGER
 
 variable        : tIDENTIFIER
                     {
-                      $$ = new_lvar(p, $1);
+                      $$ = new_xvar(p, $1, NODE_LVAR);
                     }
                 | tIVAR
                     {
-                      $$ = new_ivar(p, $1);
+                      $$ = new_xvar(p, $1, NODE_IVAR);
                     }
                 | tGVAR
                     {
-                      $$ = new_gvar(p, $1);
+                      $$ = new_xvar(p, $1, NODE_GVAR);
                     }
                 | tCVAR
                     {
-                      $$ = new_cvar(p, $1);
+                      $$ = new_xvar(p, $1, NODE_CVAR);
                     }
                 | tCONSTANT
                     {
@@ -5152,7 +4895,7 @@ assoc           : arg tASSOC arg
                     }
                 | tDSTAR
                     {
-                      $$ = cons(new_kw_rest_args(p, 0), new_lvar(p, intern_op(pow)));
+                      $$ = cons(new_kw_rest_args(p, 0), new_xvar(p, intern_op(pow), NODE_LVAR));
                     }
                 ;
 
@@ -5338,18 +5081,26 @@ void_expr_error(parser_state *p, node *n)
   if (n == NULL) return;
   c = node_to_int(n->car);
   switch (c) {
-  case NODE_BREAK:
-  case NODE_RETURN:
-  case NODE_NEXT:
-  case NODE_REDO:
-  case NODE_RETRY:
-    yyerror(NULL, p, "void value expression");
-    break;
-  case NODE_AND:
-  case NODE_OR:
-    if (n->cdr) {
-      void_expr_error(p, n->cdr->car);
-      void_expr_error(p, n->cdr->cdr);
+  case NODE_VARIABLE:
+    /* Handle variable-sized nodes */
+    switch (VAR_NODE_TYPE(n->cdr)) {
+    case NODE_BREAK:
+    case NODE_RETURN:
+    case NODE_NEXT:
+    case NODE_REDO:
+    case NODE_RETRY:
+      yyerror(NULL, p, "void value expression");
+      break;
+    case NODE_AND:
+    case NODE_OR:
+      {
+        struct mrb_ast_and_node *and_n = (struct mrb_ast_and_node*)n->cdr;
+        void_expr_error(p, (node*)and_n->left);
+        void_expr_error(p, (node*)and_n->right);
+      }
+      break;
+    default:
+      break;
     }
     break;
   case NODE_STMTS:
@@ -5531,7 +5282,6 @@ skips(parser_state *p, const char *s)
   }
   return FALSE;
 }
-
 
 static int
 newtok(parser_state *p)
@@ -7674,8 +7424,11 @@ parser_update_cxt(parser_state *p, mrb_ccontext *cxt)
 
   if (!cxt) return;
   if (!p->tree) return;
-  if (node_to_int(p->tree->car) != NODE_SCOPE) return;
-  n0 = n = p->tree->cdr->car;
+  if (!node_type_p(p->tree, NODE_SCOPE)) return;
+
+  /* Extract locals from variable-sized NODE_SCOPE */
+  struct mrb_ast_scope_node *scope = scope_node(p->tree->cdr);
+  n0 = n = scope->locals;
   while (n) {
     i++;
     n = n->cdr;
@@ -7773,7 +7526,7 @@ mrb_parser_new(mrb_state *mrb)
     p->var_alloc_counts[i] = 0;
   }
   p->var_total_allocated = 0;
-  p->var_nodes_enabled = TRUE;   /* Enable variable-sized nodes by default */
+  p->var_nodes_enabled = FALSE;
 
   return p;
 }
@@ -8919,6 +8672,44 @@ mrb_parser_dump(mrb_state *mrb, node *tree, int offset)
       printf("NODE_KW_REST_ARGS\n");
     break;
 
+  case NODE_VARIABLE:
+    /* Handle variable-sized nodes wrapped in NODE_VARIABLE */
+    {
+      enum node_type var_type = VAR_NODE_TYPE(tree);
+      switch (var_type) {
+      case NODE_SCOPE:
+        printf("NODE_SCOPE:\n");
+        {
+          struct mrb_ast_scope_node *scope = scope_node(tree);
+          node *n2 = scope->locals;
+          mrb_bool first_lval = TRUE;
+
+          if (n2 && (n2->car || n2->cdr)) {
+            dump_prefix(tree, offset+1);
+            printf("local variables:\n");
+            dump_prefix(tree, offset+2);
+            while (n2) {
+              if (n2->car) {
+                if (!first_lval) printf(", ");
+                printf("%s", mrb_sym_name(mrb, node_to_sym(n2->car)));
+                first_lval = FALSE;
+              }
+              n2 = n2->cdr;
+            }
+            printf("\n");
+          }
+        }
+        tree = scope_node(tree)->body;
+        offset++;
+        goto again;
+
+      default:
+        printf("NODE_VARIABLE (unsupported type: %d)\n", var_type);
+        break;
+      }
+    }
+    break;
+
   default:
     printf("node type: %d (0x%x)\n", nodetype, (unsigned)nodetype);
     break;
@@ -8933,11 +8724,15 @@ void
 mrb_parser_foreach_top_variable(mrb_state *mrb, struct mrb_parser_state *p, mrb_parser_foreach_top_variable_func *func, void *user)
 {
   const mrb_ast_node *n = p->tree;
-  if ((intptr_t)n->car == NODE_SCOPE) {
-    n = n->cdr->car;
+  if (node_type_p((node*)n, NODE_SCOPE)) {
+    /* Extract locals from variable-sized NODE_SCOPE */
+    struct mrb_ast_scope_node *scope = scope_node(n->cdr);
+    n = scope->locals;
     for (; n; n = n->cdr) {
       mrb_sym sym = node_to_sym(n->car);
-      if (sym && !func(mrb, sym, user)) break;
+      if (sym != 0) {
+        if (!func(mrb, sym, user)) break;
+      }
     }
   }
 }

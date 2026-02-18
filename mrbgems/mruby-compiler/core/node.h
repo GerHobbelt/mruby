@@ -53,6 +53,7 @@ enum node_type {
   NODE_BACK_REF,
   NODE_MATCH,
   NODE_INT,
+  NODE_BIGINT,
   NODE_FLOAT,
   NODE_NEGATE,
   NODE_LAMBDA,
@@ -195,6 +196,13 @@ struct mrb_ast_int_node {
   int32_t value;                     /* Direct 32-bit integer storage */
 };
 
+/* Variable-sized big integer node */
+struct mrb_ast_bigint_node {
+  struct mrb_ast_var_header header;  /* 8 bytes */
+  char *string;                      /* String representation of big number */
+  int base;                          /* Number base (8, 10, 16) */
+};
+
 /* Variable-sized node for variables (lvar, ivar, etc.) */
 struct mrb_ast_var_node {
   struct mrb_ast_var_header header;
@@ -244,11 +252,22 @@ struct mrb_ast_hash_node {
 struct mrb_ast_def_node {
   struct mrb_ast_var_header header;  /* 8 bytes */
   mrb_sym name;                      /* Method name */
-  struct mrb_ast_node *args;         /* Arguments node */
+  struct mrb_ast_node *args;         /* Method arguments */
   struct mrb_ast_node *body;         /* Method body */
+  struct mrb_ast_node *locals;       /* Local Variables */
+} ;
+
+/* Variable-sized singleton method definition node */
+struct mrb_ast_sdef_node {
+  struct mrb_ast_var_header header;  /* 8 bytes */
+  mrb_sym name;                      /* Method name */
+  struct mrb_ast_node *args;         /* Method arguments */
+  struct mrb_ast_node *body;         /* Method body */
+  struct mrb_ast_node *locals;       /* Local Variables */
+  struct mrb_ast_node *obj;          /* receiver */
 };
 
-/* Variable-sized class definition node */
+/* variable-sized class definition node */
 struct mrb_ast_class_node {
   struct mrb_ast_var_header header;  /* 8 bytes */
   struct mrb_ast_node *name;         /* Class name (NODE_CONST or NODE_COLON2) */
@@ -297,9 +316,9 @@ struct mrb_ast_case_node {
   struct mrb_ast_var_header header;  /* 8 bytes */
   struct mrb_ast_node *value;        /* Case value expression */
   uint16_t when_count;               /* Number of when clauses */
-  uint16_t flags;                    /* Case-specific flags */
+  uint16_t padding;                  /* Padding for alignment */
   struct mrb_ast_node *else_body;    /* Else clause (can be NULL) */
-  struct mrb_ast_node *when_clauses[]; /* Flexible array for when clauses */
+  struct mrb_ast_node *when_clauses[1]; /* Variable array for when clauses */
 };
 
 /* Variable-sized for node */
@@ -395,6 +414,7 @@ struct mrb_ast_super_node {
 #define sym_node(n) ((struct mrb_ast_sym_node*)(n))
 #define str_node(n) ((struct mrb_ast_str_node*)(n))
 #define int_node(n) ((struct mrb_ast_int_node*)(n))
+#define bigint_node(n) ((struct mrb_ast_bigint_node*)(n))
 #define var_node(n) ((struct mrb_ast_var_node*)(n))
 
 /* Phase 2 node casting macros */
@@ -410,7 +430,7 @@ struct mrb_ast_super_node {
 #define if_node(n) ((struct mrb_ast_if_node*)(n))
 #define while_node(n) ((struct mrb_ast_while_node*)(n))
 #define until_node(n) ((struct mrb_ast_until_node*)(n))
-#define case_node_ctrl(n) ((struct mrb_ast_case_node*)(n))
+#define case_node(n) ((struct mrb_ast_case_node*)(n))
 #define for_node(n) ((struct mrb_ast_for_node*)(n))
 #define asgn_node(n) ((struct mrb_ast_asgn_node*)(n))
 #define masgn_node(n) ((struct mrb_ast_masgn_node*)(n))
@@ -427,6 +447,8 @@ struct mrb_ast_super_node {
 #define STR_NODE_LEN(n) (str_node(n)->len)
 #define STR_NODE_INLINE_P(n) (var_header(n)->flags & VAR_NODE_FLAG_INLINE_DATA)
 #define INT_NODE_VALUE(n) (int_node(n)->value)
+#define BIGINT_NODE_STRING(n) (bigint_node(n)->string)
+#define BIGINT_NODE_BASE(n) (bigint_node(n)->base)
 #define VAR_NODE_SYMBOL(n) (var_node(n)->symbol)
 
 /* Phase 2 value access macros */
@@ -455,10 +477,10 @@ struct mrb_ast_super_node {
 #define UNTIL_NODE_CONDITION(n) (until_node(n)->condition)
 #define UNTIL_NODE_BODY(n) (until_node(n)->body)
 
-#define CASE_NODE_VALUE(n) (case_node_ctrl(n)->value)
-#define CASE_NODE_WHEN_COUNT(n) (case_node_ctrl(n)->when_count)
-#define CASE_NODE_ELSE(n) (case_node_ctrl(n)->else_body)
-#define CASE_NODE_WHENS(n) (case_node_ctrl(n)->when_clauses)
+#define CASE_NODE_VALUE(n) (case_node(n)->value)
+#define CASE_NODE_WHEN_COUNT(n) (case_node(n)->when_count)
+#define CASE_NODE_ELSE(n) (case_node(n)->else_body)
+#define CASE_NODE_WHENS(n) (case_node(n)->when_clauses)
 
 #define FOR_NODE_VAR(n) (for_node(n)->var)
 #define FOR_NODE_ITERABLE(n) (for_node(n)->iterable)
@@ -658,31 +680,13 @@ struct mrb_ast_retry_node {
   struct mrb_ast_var_header hdr;
 };
 
-struct mrb_ast_while_mod_node {
-  struct mrb_ast_var_header hdr;
-  struct mrb_ast_node *condition;
-  struct mrb_ast_node *body;
-};
-
-struct mrb_ast_until_mod_node {
-  struct mrb_ast_var_header hdr;
-  struct mrb_ast_node *condition;
-  struct mrb_ast_node *body;
-};
 
 #define break_node(n) ((struct mrb_ast_break_node*)(n))
 #define next_node(n) ((struct mrb_ast_next_node*)(n))
 #define redo_node(n) ((struct mrb_ast_redo_node*)(n))
 #define retry_node(n) ((struct mrb_ast_retry_node*)(n))
-#define while_mod_node(n) ((struct mrb_ast_while_mod_node*)(n))
-#define until_mod_node(n) ((struct mrb_ast_until_mod_node*)(n))
-
 #define BREAK_NODE_VALUE(n) (break_node(n)->value)
 #define NEXT_NODE_VALUE(n) (next_node(n)->value)
-#define WHILE_MOD_NODE_CONDITION(n) (while_mod_node(n)->condition)
-#define WHILE_MOD_NODE_BODY(n) (while_mod_node(n)->body)
-#define UNTIL_MOD_NODE_CONDITION(n) (until_mod_node(n)->condition)
-#define UNTIL_MOD_NODE_BODY(n) (until_mod_node(n)->body)
 
 // Group 9: String and Regex Variants
 struct mrb_ast_xstr_node {
@@ -877,6 +881,11 @@ struct mrb_ast_ensure_node {
   struct mrb_ast_node *ensure_clause;
 };
 
+struct mrb_ast_stmts_node {
+  struct mrb_ast_var_header hdr;
+  struct mrb_ast_node *stmts;        /* Cons-list of statements */
+};
+
 struct mrb_ast_iter_node {
   struct mrb_ast_var_header hdr;
   struct mrb_ast_node *vars;
@@ -908,14 +917,6 @@ struct mrb_ast_postexe_node {
   struct mrb_ast_node *body;
 };
 
-struct mrb_ast_sdef_node {
-  struct mrb_ast_var_header hdr;
-  struct mrb_ast_node *obj;
-  mrb_sym name;
-  struct mrb_ast_node *args;
-  struct mrb_ast_node *body;
-};
-
 #define fcall_node(n) ((struct mrb_ast_fcall_node*)(n))
 #define zsuper_node(n) ((struct mrb_ast_super_node*)(n))
 #define lambda_node(n) ((struct mrb_ast_lambda_node*)(n))
@@ -931,6 +932,7 @@ struct mrb_ast_sdef_node {
 #define scope_node(n) ((struct mrb_ast_scope_node*)(n))
 #define begin_node(n) ((struct mrb_ast_begin_node*)(n))
 #define ensure_node(n) ((struct mrb_ast_ensure_node*)(n))
+#define stmts_node(n) ((struct mrb_ast_stmts_node*)(n))
 #define iter_node(n) ((struct mrb_ast_iter_node*)(n))
 #define when_node(n) ((struct mrb_ast_when_node*)(n))
 #define alias_node(n) ((struct mrb_ast_alias_node*)(n))
