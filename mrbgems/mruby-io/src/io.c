@@ -13,6 +13,7 @@
 #include <mruby/error.h>
 #include <mruby/internal.h>
 #include <mruby/presym.h>
+#include "io_hal.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -260,48 +261,6 @@ io_fd_cloexec(mrb_state *mrb, int fd)
 #endif
 }
 
-#if !defined(_WIN32) && !(defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE)
-static int
-io_cloexec_pipe(mrb_state *mrb, int fildes[2])
-{
-  int ret = pipe(fildes);
-  if (ret == -1)
-    return -1;
-  io_fd_cloexec(mrb, fildes[0]);
-  io_fd_cloexec(mrb, fildes[1]);
-  return ret;
-}
-
-static int
-io_pipe(mrb_state *mrb, int pipes[2])
-{
-  int ret = io_cloexec_pipe(mrb, pipes);
-  if (ret == -1) {
-    if (errno == EMFILE || errno == ENFILE) {
-      mrb_garbage_collect(mrb);
-      ret = io_cloexec_pipe(mrb, pipes);
-    }
-  }
-  return ret;
-}
-
-static int
-io_process_exec(const char *pname)
-{
-  const char *s = pname;
-
-  while (*s == ' ' || *s == '\t' || *s == '\n')
-    s++;
-
-  if (!*s) {
-    errno = ENOENT;
-    return -1;
-  }
-
-  execl("/bin/sh", "sh", "-c", pname, (char*)NULL);
-  return -1;
-}
-#endif
 
 static void
 io_free(mrb_state *mrb, void *ptr)
@@ -396,153 +355,92 @@ parse_popen_args(mrb_state *mrb, struct popen_params *p)
   p->opt_err = option_to_fd(mrb, kv.opt_err);
 }
 
-#if defined(_WIN32)
 static mrb_value
 io_s_popen(mrb_state *mrb, mrb_value klass)
 {
   struct popen_params p;
   p.klass = klass;
-
-  parse_popen_args(mrb, &p);
-
-  struct mrb_io *fptr;
   int pid = 0;
-  STARTUPINFO si;
-  PROCESS_INFORMATION pi;
-
-  HANDLE ifd[2];
-  HANDLE ofd[2];
-
-  ifd[0] = INVALID_HANDLE_VALUE;
-  ifd[1] = INVALID_HANDLE_VALUE;
-  ofd[0] = INVALID_HANDLE_VALUE;
-  ofd[1] = INVALID_HANDLE_VALUE;
+  int pr[2] = { -1, -1 };  /* read pipe: parent reads, child writes */
+  int pw[2] = { -1, -1 };  /* write pipe: parent writes, child reads */
+  int readable, writable;
+  int stdin_fd = -1, stdout_fd = -1, stderr_fd = -1;
 
   mrb->c->ci->mid = 0;
+  parse_popen_args(mrb, &p);
 
-  SECURITY_ATTRIBUTES saAttr;
-  saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
-  saAttr.bInheritHandle = TRUE;
-  saAttr.lpSecurityDescriptor = NULL;
+  readable = OPEN_READABLE_P(p.flags);
+  writable = OPEN_WRITABLE_P(p.flags);
 
-  if (OPEN_READABLE_P(p.flags)) {
-    if (!CreatePipe(&ofd[0], &ofd[1], &saAttr, 0)
-        || !SetHandleInformation(ofd[0], HANDLE_FLAG_INHERIT, 0)) {
+  /* Create pipes for communication */
+  if (readable) {
+    if (mrb_hal_io_pipe(mrb, pr) == -1) {
       mrb_sys_fail(mrb, "pipe");
     }
   }
 
-  if (OPEN_WRITABLE_P(p.flags)) {
-    if (!CreatePipe(&ifd[0], &ifd[1], &saAttr, 0)
-        || !SetHandleInformation(ifd[1], HANDLE_FLAG_INHERIT, 0)) {
+  if (writable) {
+    if (mrb_hal_io_pipe(mrb, pw) == -1) {
+      if (pr[0] != -1) {
+        mrb_hal_io_close(mrb, pr[0]);
+        mrb_hal_io_close(mrb, pr[1]);
+      }
       mrb_sys_fail(mrb, "pipe");
     }
   }
 
+  /* Set up child process file descriptors */
   if (p.doexec) {
-    ZeroMemory(&pi, sizeof(pi));
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags |= STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    si.dwFlags |= STARTF_USESTDHANDLES;
-    if (OPEN_READABLE_P(p.flags)) {
-      si.hStdOutput = ofd[1];
-      si.hStdError = ofd[1];
-    }
-    if (OPEN_WRITABLE_P(p.flags)) {
-      si.hStdInput = ifd[0];
-    }
-    if (!CreateProcess(
-        NULL, (char*)p.cmd, NULL, NULL,
-        TRUE, CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi)) {
-      CloseHandle(ifd[0]);
-      CloseHandle(ifd[1]);
-      CloseHandle(ofd[0]);
-      CloseHandle(ofd[1]);
+    /* Child stdin: either write pipe read end or opt_in */
+    stdin_fd = (p.opt_in != -1) ? p.opt_in : (writable ? pw[0] : -1);
+
+    /* Child stdout: either read pipe write end or opt_out */
+    stdout_fd = (p.opt_out != -1) ? p.opt_out : (readable ? pr[1] : -1);
+
+    /* Child stderr: opt_err or stdout */
+    stderr_fd = (p.opt_err != -1) ? p.opt_err : stdout_fd;
+
+    /* Spawn child process using HAL */
+    if (mrb_hal_io_spawn_process(mrb, p.cmd, stdin_fd, stdout_fd, stderr_fd, &pid) == -1) {
+      int saved_errno = errno;
+      if (readable) {
+        mrb_hal_io_close(mrb, pr[0]);
+        mrb_hal_io_close(mrb, pr[1]);
+      }
+      if (writable) {
+        mrb_hal_io_close(mrb, pw[0]);
+        mrb_hal_io_close(mrb, pw[1]);
+      }
+      errno = saved_errno;
       mrb_raisef(mrb, E_IO_ERROR, "command not found: %s", p.cmd);
     }
-    CloseHandle(pi.hThread);
-    CloseHandle(ifd[0]);
-    CloseHandle(ofd[1]);
-    pid = pi.dwProcessId;
+
+    /* Close child ends of pipes in parent */
+    if (readable) {
+      mrb_hal_io_close(mrb, pr[1]);  /* close write end */
+    }
+    if (writable) {
+      mrb_hal_io_close(mrb, pw[0]);  /* close read end */
+    }
   }
 
+  /* Set up parent IO object */
   mrb_value io = mrb_obj_value(mrb_data_object_alloc(mrb, mrb_class_ptr(klass), NULL, &mrb_io_type));
-  fptr = io_alloc(mrb);
-  fptr->fd = _open_osfhandle((intptr_t)ofd[0], 0);
-  fptr->fd2 = _open_osfhandle((intptr_t)ifd[1], 0);
-  fptr->pid = pid;
-  fptr->readable = OPEN_READABLE_P(p.flags);
-  fptr->writable = OPEN_WRITABLE_P(p.flags);
-  io_init_buf(mrb, fptr);
-
-  DATA_TYPE(io) = &mrb_io_type;
-  DATA_PTR(io)  = fptr;
-  return io;
-}
-#else
-
-static void
-popen_child_setup(mrb_state *mrb, int readable, int writable, int *pr, int *pw, struct popen_params *p)
-{
-  if (p->opt_in != -1) {
-    dup2(p->opt_in, 0);
-  }
-  if (p->opt_out != -1) {
-    dup2(p->opt_out, 1);
-  }
-  if (p->opt_err != -1) {
-    dup2(p->opt_err, 2);
-  }
-  if (readable) {
-    close(pr[0]);
-    if (pr[1] != 1) {
-      dup2(pr[1], 1);
-      close(pr[1]);
-    }
-  }
-  if (writable) {
-    close(pw[1]);
-    if (pw[0] != 0) {
-      dup2(pw[0], 0);
-      close(pw[0]);
-    }
-  }
-  if (p->doexec) {
-    for (int fd = 3; fd < NOFILE; fd++) {
-      close(fd);
-    }
-    io_process_exec(p->cmd);
-    mrb_raisef(mrb, E_IO_ERROR, "command not found: %s", p->cmd);
-    _exit(127);
-  }
-}
-
-static mrb_value
-popen_parent_setup(mrb_state *mrb, int readable, int writable, int *pr, int *pw, int pid, struct popen_params *p)
-{
-  int fd, write_fd = -1;
+  struct mrb_io *fptr = io_alloc(mrb);
 
   if (readable && writable) {
-    close(pr[1]);
-    fd = pr[0];
-    close(pw[0]);
-    write_fd = pw[1];
+    fptr->fd = pr[0];      /* parent reads from here */
+    fptr->fd2 = pw[1];     /* parent writes to here */
   }
   else if (readable) {
-    close(pr[1]);
-    fd = pr[0];
+    fptr->fd = pr[0];      /* parent reads from here */
+    fptr->fd2 = -1;
   }
   else {
-    close(pw[0]);
-    fd = pw[1];
+    fptr->fd = pw[1];      /* parent writes to here */
+    fptr->fd2 = -1;
   }
 
-  mrb_value io = mrb_obj_value(mrb_data_object_alloc(mrb, mrb_class_ptr(p->klass), NULL, &mrb_io_type));
-  struct mrb_io *fptr = io_alloc(mrb);
-  fptr->fd = fd;
-  fptr->fd2 = write_fd;
   fptr->pid = pid;
   fptr->readable = readable;
   fptr->writable = writable;
@@ -552,73 +450,7 @@ popen_parent_setup(mrb_state *mrb, int readable, int writable, int *pr, int *pw,
   DATA_PTR(io)  = fptr;
   return io;
 }
-
-static mrb_value
-io_s_popen(mrb_state *mrb, mrb_value klass)
-{
-  struct popen_params p;
-  p.klass = klass;
-  int pid;
-  int pr[2] = { -1, -1 };
-  int pw[2] = { -1, -1 };
-
-  mrb->c->ci->mid = 0;
-  parse_popen_args(mrb, &p);
-
-  int readable = OPEN_READABLE_P(p.flags);
-  int writable = OPEN_WRITABLE_P(p.flags);
-
-  if (readable) {
-    if (pipe(pr) == -1) {
-      mrb_sys_fail(mrb, "pipe");
-    }
-    io_fd_cloexec(mrb, pr[0]);
-    io_fd_cloexec(mrb, pr[1]);
-  }
-
-  if (writable) {
-    if (pipe(pw) == -1) {
-      if (pr[0] != -1) close(pr[0]);
-      if (pr[1] != -1) close(pr[1]);
-      mrb_sys_fail(mrb, "pipe");
-    }
-    io_fd_cloexec(mrb, pw[0]);
-    io_fd_cloexec(mrb, pw[1]);
-  }
-
-  if (!p.doexec) {
-    fflush(stdout);
-    fflush(stderr);
-  }
-
-  switch (pid = fork()) {
-    case 0: /* child */
-      popen_child_setup(mrb, readable, writable, pr, pw, &p);
-      return mrb_nil_value();
-
-    default: /* parent */
-      return popen_parent_setup(mrb, readable, writable, pr, pw, pid, &p);
-
-    case -1: /* error */
-      {
-        int saved_errno = errno;
-        if (readable) {
-          close(pr[0]);
-          close(pr[1]);
-        }
-        if (writable) {
-        close(pw[0]);
-        close(pw[1]);
-        }
-        errno = saved_errno;
-        mrb_sys_fail(mrb, "pipe_open failed");
-      }
-      break;
-  }
-  return mrb_nil_value(); /* not reached */
-}
-#endif /* _WIN32 */
-#endif /* TARGET_OS_IPHONE */
+#endif /* MRB_NO_IO_POPEN */
 
 static int
 symdup(mrb_state *mrb, int fd, mrb_bool *failed)
@@ -1367,21 +1199,21 @@ io_pid(mrb_state *mrb, mrb_value io)
   return mrb_nil_value();
 }
 
-static struct timeval
+static mrb_io_timeval
 time2timeval(mrb_state *mrb, mrb_value time)
 {
-  struct timeval t = { 0, 0 };
+  mrb_io_timeval t = { 0, 0 };
 
   switch (mrb_type(time)) {
     case MRB_TT_INTEGER:
-      t.tv_sec = (ftime_t)mrb_integer(time);
+      t.tv_sec = (int64_t)mrb_integer(time);
       t.tv_usec = 0;
       break;
 
 #ifndef MRB_NO_FLOAT
     case MRB_TT_FLOAT:
-      t.tv_sec = (ftime_t)mrb_float(time);
-      t.tv_usec = (fsuseconds_t)((mrb_float(time) - t.tv_sec) * 1000000.0);
+      t.tv_sec = (int64_t)mrb_float(time);
+      t.tv_usec = (int64_t)((mrb_float(time) - t.tv_sec) * 1000000.0);
       break;
 #endif
 
@@ -1409,7 +1241,7 @@ io_s_pipe(mrb_state *mrb, mrb_value klass)
 {
   int pipes[2];
 
-  if (io_pipe(mrb, pipes) == -1) {
+  if (mrb_hal_io_pipe(mrb, pipes) == -1) {
     mrb_sys_fail(mrb, "pipe");
   }
 
@@ -1487,7 +1319,7 @@ io_s_select(mrb_state *mrb, mrb_value klass)
     write = argv[1];
   mrb_value read = argv[0];
 
-  struct timeval *tp, timerec;
+  mrb_io_timeval *tp, timerec;
   if (mrb_nil_p(timeout)) {
     tp = NULL;
   }
@@ -1496,20 +1328,22 @@ io_s_select(mrb_state *mrb, mrb_value klass)
     tp = &timerec;
   }
 
-  fd_set pset, rset, *rp;
-  FD_ZERO(&pset);
+  mrb_io_fdset *pset = mrb_hal_io_fdset_alloc(mrb);
+  mrb_io_fdset *rset = NULL;
+  mrb_io_fdset *rp = NULL;
+  mrb_hal_io_fdset_zero(mrb, pset);
   if (!mrb_nil_p(read)) {
     mrb_check_type(mrb, read, MRB_TT_ARRAY);
-    rp = &rset;
-    FD_ZERO(rp);
+    rset = mrb_hal_io_fdset_alloc(mrb);
+    rp = rset;
+    mrb_hal_io_fdset_zero(mrb, rp);
     for (int i = 0; i < RARRAY_LEN(read); i++) {
       read_io = RARRAY_PTR(read)[i];
       fptr = io_get_open_fptr(mrb, read_io);
-      if (fptr->fd >= FD_SETSIZE) continue;
-      FD_SET(fptr->fd, rp);
+      mrb_hal_io_fdset_set(mrb, fptr->fd, rp);
       if (mrb_io_read_data_pending(mrb, fptr)) {
         pending++;
-        FD_SET(fptr->fd, &pset);
+        mrb_hal_io_fdset_set(mrb, fptr->fd, pset);
       }
       if (max < fptr->fd)
         max = fptr->fd;
@@ -1519,75 +1353,72 @@ io_s_select(mrb_state *mrb, mrb_value klass)
       tp = &timerec;
     }
   }
-  else {
-    rp = NULL;
-  }
 
-  fd_set wset, *wp;
+  mrb_io_fdset *wset = NULL;
+  mrb_io_fdset *wp = NULL;
   if (!mrb_nil_p(write)) {
     mrb_check_type(mrb, write, MRB_TT_ARRAY);
-    wp = &wset;
-    FD_ZERO(wp);
+    wset = mrb_hal_io_fdset_alloc(mrb);
+    wp = wset;
+    mrb_hal_io_fdset_zero(mrb, wp);
     for (int i = 0; i < RARRAY_LEN(write); i++) {
       fptr = io_get_open_fptr(mrb, RARRAY_PTR(write)[i]);
-      if (fptr->fd >= FD_SETSIZE) continue;
-      FD_SET(fptr->fd, wp);
+      mrb_hal_io_fdset_set(mrb, fptr->fd, wp);
       if (max < fptr->fd)
         max = fptr->fd;
       if (fptr->fd2 >= 0) {
-        FD_SET(fptr->fd2, wp);
+        mrb_hal_io_fdset_set(mrb, fptr->fd2, wp);
         if (max < fptr->fd2)
           max = fptr->fd2;
       }
     }
-  }
-  else {
-    wp = NULL;
   }
 
-  fd_set eset, *ep;
+  mrb_io_fdset *eset = NULL;
+  mrb_io_fdset *ep = NULL;
   if (!mrb_nil_p(except)) {
     mrb_check_type(mrb, except, MRB_TT_ARRAY);
-    ep = &eset;
-    FD_ZERO(ep);
+    eset = mrb_hal_io_fdset_alloc(mrb);
+    ep = eset;
+    mrb_hal_io_fdset_zero(mrb, ep);
     for (int i = 0; i < RARRAY_LEN(except); i++) {
       fptr = io_get_open_fptr(mrb, RARRAY_PTR(except)[i]);
-      if (fptr->fd >= FD_SETSIZE) continue;
-      FD_SET(fptr->fd, ep);
+      mrb_hal_io_fdset_set(mrb, fptr->fd, ep);
       if (max < fptr->fd)
         max = fptr->fd;
       if (fptr->fd2 >= 0) {
-        FD_SET(fptr->fd2, ep);
+        mrb_hal_io_fdset_set(mrb, fptr->fd2, ep);
         if (max < fptr->fd2)
           max = fptr->fd2;
       }
     }
-  }
-  else {
-    ep = NULL;
   }
 
   max++;
 
   int n;
 retry:
-  n = select(max, rp, wp, ep, tp);
+  n = mrb_hal_io_select(mrb, max, rp, wp, ep, tp);
   if (n < 0) {
-#ifdef _WIN32
-    errno = WSAGetLastError();
-    if (errno != WSAEINTR)
+    if (errno != EINTR) {
+      mrb_hal_io_fdset_free(mrb, pset);
+      mrb_hal_io_fdset_free(mrb, rset);
+      mrb_hal_io_fdset_free(mrb, wset);
+      mrb_hal_io_fdset_free(mrb, eset);
       mrb_sys_fail(mrb, "select failed");
-#else
-    if (errno != EINTR)
-      mrb_sys_fail(mrb, "select failed");
-#endif
+    }
     if (tp == NULL)
       goto retry;
     interrupt_flag = 1;
   }
 
-  if (!pending && n == 0)
+  if (!pending && n == 0) {
+    mrb_hal_io_fdset_free(mrb, pset);
+    mrb_hal_io_fdset_free(mrb, rset);
+    mrb_hal_io_fdset_free(mrb, wset);
+    mrb_hal_io_fdset_free(mrb, eset);
     return mrb_nil_value();
+  }
 
   result = mrb_ary_new_capa(mrb, 3);
   mrb_ary_push(mrb, result, rp ? mrb_ary_new(mrb) : mrb_ary_new_capa(mrb, 0));
@@ -1599,8 +1430,8 @@ retry:
       list = RARRAY_PTR(result)[0];
       for (int i = 0; i < RARRAY_LEN(read); i++) {
         fptr = io_get_open_fptr(mrb, RARRAY_PTR(read)[i]);
-        if (FD_ISSET(fptr->fd, rp) ||
-            FD_ISSET(fptr->fd, &pset)) {
+        if (mrb_hal_io_fdset_isset(mrb, fptr->fd, rp) ||
+            mrb_hal_io_fdset_isset(mrb, fptr->fd, pset)) {
           mrb_ary_push(mrb, list, RARRAY_PTR(read)[i]);
         }
       }
@@ -1610,10 +1441,10 @@ retry:
       list = RARRAY_PTR(result)[1];
       for (int i = 0; i < RARRAY_LEN(write); i++) {
         fptr = io_get_open_fptr(mrb, RARRAY_PTR(write)[i]);
-        if (FD_ISSET(fptr->fd, wp)) {
+        if (mrb_hal_io_fdset_isset(mrb, fptr->fd, wp)) {
           mrb_ary_push(mrb, list, RARRAY_PTR(write)[i]);
         }
-        else if (fptr->fd2 >= 0 && FD_ISSET(fptr->fd2, wp)) {
+        else if (fptr->fd2 >= 0 && mrb_hal_io_fdset_isset(mrb, fptr->fd2, wp)) {
           mrb_ary_push(mrb, list, RARRAY_PTR(write)[i]);
         }
       }
@@ -1623,15 +1454,20 @@ retry:
       list = RARRAY_PTR(result)[2];
       for (int i = 0; i < RARRAY_LEN(except); i++) {
         fptr = io_get_open_fptr(mrb, RARRAY_PTR(except)[i]);
-        if (FD_ISSET(fptr->fd, ep)) {
+        if (mrb_hal_io_fdset_isset(mrb, fptr->fd, ep)) {
           mrb_ary_push(mrb, list, RARRAY_PTR(except)[i]);
         }
-        else if (fptr->fd2 >= 0 && FD_ISSET(fptr->fd2, ep)) {
+        else if (fptr->fd2 >= 0 && mrb_hal_io_fdset_isset(mrb, fptr->fd2, ep)) {
           mrb_ary_push(mrb, list, RARRAY_PTR(except)[i]);
         }
       }
     }
   }
+
+  mrb_hal_io_fdset_free(mrb, pset);
+  mrb_hal_io_fdset_free(mrb, rset);
+  mrb_hal_io_fdset_free(mrb, wset);
+  mrb_hal_io_fdset_free(mrb, eset);
 
   return result;
 }

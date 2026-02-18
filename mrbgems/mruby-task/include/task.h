@@ -9,27 +9,25 @@
 
 #include <mruby.h>
 
-#ifdef MRB_USE_TASK_SCHEDULER
-
 /*
  * Task status values (bit-mapped)
  */
 enum {
-  MRB_TASKSTATUS_DORMANT   = 0x00,  /* Not started or finished */
-  MRB_TASKSTATUS_READY     = 0x02,  /* Ready to run */
-  MRB_TASKSTATUS_RUNNING   = 0x03,  /* Currently executing */
-  MRB_TASKSTATUS_WAITING   = 0x04,  /* Waiting for condition */
-  MRB_TASKSTATUS_SUSPENDED = 0x08,  /* Manually suspended */
+  MRB_TASK_STATUS_DORMANT   = 0x00,  /* Not started or finished */
+  MRB_TASK_STATUS_READY     = 0x02,  /* Ready to run */
+  MRB_TASK_STATUS_RUNNING   = 0x03,  /* Currently executing */
+  MRB_TASK_STATUS_WAITING   = 0x04,  /* Waiting for condition */
+  MRB_TASK_STATUS_SUSPENDED = 0x08,  /* Manually suspended */
 };
 
 /*
  * Task wait reason
  */
 enum {
-  MRB_TASKREASON_NONE  = 0x00,  /* No specific reason */
-  MRB_TASKREASON_SLEEP = 0x01,  /* Sleeping for time */
-  MRB_TASKREASON_MUTEX = 0x02,  /* Waiting for mutex (reserved) */
-  MRB_TASKREASON_JOIN  = 0x04,  /* Waiting for another task */
+  MRB_TASK_REASON_NONE  = 0x00,  /* No specific reason */
+  MRB_TASK_REASON_SLEEP = 0x01,  /* Sleeping for time */
+  MRB_TASK_REASON_MUTEX = 0x02,  /* Waiting for mutex (reserved) */
+  MRB_TASK_REASON_JOIN  = 0x04,  /* Waiting for another task */
 };
 
 /*
@@ -53,6 +51,7 @@ typedef struct mrb_task {
 
   mrb_value self;                  /* Ruby Task object reference */
   mrb_value result;                /* Task return value */
+  mrb_value proc;                  /* Proc containing task code */
   struct mrb_context c;            /* Execution context (stack, callinfo, etc) */
 } mrb_task;
 
@@ -94,14 +93,7 @@ void mrb_task_hal_idle_cpu(mrb_state *mrb);
  * Core task scheduler API
  */
 void mrb_tick(mrb_state *mrb);
-mrb_value mrb_tasks_run(mrb_state *mrb);
-
-/*
- * Task context status values (extends mrb_fiber_state)
- */
-#define MRB_TASK_CREATED  (MRB_FIBER_TRANSFERRED + 1)
-#define MRB_TASK_STOPPED  (MRB_FIBER_TRANSFERRED + 2)
-
-#endif /* MRB_USE_TASK_SCHEDULER */
+mrb_value mrb_task_run(mrb_state *mrb);
+void mrb_task_mark_all(mrb_state *mrb);
 
 #endif /* MRUBY_TASK_H */

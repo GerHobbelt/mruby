@@ -65,7 +65,7 @@ Task.run
 
 ### Task Class Methods
 
-- **`Task.new(name: nil, priority: 128) { block }`**: Creates and starts a new task. Lower priority values run first (0 is highest priority).
+- **`Task.new(name: nil, priority: 128) { block }`**: Creates and starts a new task. Lower priority values run first (0 is highest priority). The `name` parameter must be a String if provided. The `priority` must be an Integer between 0-255.
 
   ```ruby
   task = Task.new(name: "background", priority: 200) do
@@ -104,11 +104,18 @@ Task.run
   worker.suspend if worker
   ```
 
-- **`Task.stat`**: Returns scheduler statistics (tick count, wakeup time, task list).
+- **`Task.stat`**: Returns a hash containing scheduler statistics:
+  - `:tick` (Integer): Current tick count
+  - `:wakeup_tick` (Integer): Next scheduled wakeup tick
+  - `:dormant`, `:ready`, `:waiting`, `:suspended`: Each is a hash with:
+    - `:count` (Integer): Number of tasks in this queue
+    - `:tasks` (Array): Array of task objects in this queue
 
   ```ruby
   stats = Task.stat
-  puts "Tick: #{stats.tick}"
+  puts "Tick: #{stats[:tick]}"
+  puts "Ready tasks: #{stats[:ready][:count]}"
+  stats[:ready][:tasks].each { |t| puts t.name }
   ```
 
 - **`Task.run`**: Starts the scheduler main loop. Blocks until no tasks remain ready or waiting.
@@ -126,11 +133,14 @@ Task.run
   puts task.status  # => :READY
   ```
 
-- **`#name`** / **`#name=`**: Get or set the task name.
+- **`#name`** / **`#name=`**: Get or set the task name. Returns `"(noname)"` for unnamed tasks. Note: `name=` accepts any value, but `Task.new` requires a String.
 
   ```ruby
   task.name = "worker-1"
   puts task.name  # => "worker-1"
+
+  task = Task.new { }
+  puts task.name  # => "(noname)"
   ```
 
 - **`#priority`** / **`#priority=`**: Get or set the task priority (0-255). Changing priority requeues the task.
@@ -241,41 +251,179 @@ These grow automatically as needed, similar to Fiber.
 
 ### HAL (Hardware Abstraction Layer)
 
-The task scheduler requires platform-specific timer and interrupt support via four HAL functions:
+The task scheduler uses a Hardware Abstraction Layer (HAL) to support different platforms. Platform-specific timer and interrupt handling is provided by separate HAL gems.
 
-```c
-void mrb_task_hal_init(mrb_state *mrb);      // Initialize timer
-void mrb_task_enable_irq(void);               // Enable timer interrupts
-void mrb_task_disable_irq(void);              // Disable timer interrupts
-void mrb_task_hal_idle_cpu(mrb_state *mrb);   // Idle when no tasks ready
+#### Built-in HAL Gems
+
+**hal-posix-task** - For POSIX systems (Linux, macOS, BSD, Unix)
+
+- Uses `SIGALRM` and `setitimer()` for timer
+- Uses `sigprocmask()` for interrupt protection
+- Uses `SA_RESTART` to prevent `EINTR` on system calls
+- Supports multiple VMs per process
+
+**hal-win-task** - For Windows
+
+- Uses multimedia timer API (`timeSetEvent`/`timeKillEvent`)
+- Uses `CRITICAL_SECTION` for interrupt protection
+- Supports multiple VMs per process
+
+#### HAL Selection
+
+The task scheduler will automatically select an appropriate HAL gem based on your platform. For explicit control, you can specify the HAL gem in your build configuration:
+
+```ruby
+MRuby::Build.new do |conf|
+  # Option 1: Explicit HAL selection (recommended)
+  conf.gem core: 'hal-posix-task'   # For Linux/macOS/BSD
+  # or
+  conf.gem core: 'hal-win-task'     # For Windows
+
+  # mruby-task automatically loads if HAL is loaded
+  # But you can also specify it explicitly:
+  conf.gem core: 'mruby-task'
+end
 ```
 
-### POSIX Platform
+**Auto-detection behavior:**
 
-On POSIX systems (Linux, macOS, BSD), the implementation uses:
+- If you include `mruby-task` but no HAL gem, it will automatically load the appropriate HAL
+- On Linux/macOS/BSD: loads `hal-posix-task`
+- On Windows: loads `hal-win-task`
+- On unknown platforms: fails with helpful error message
 
-- `SIGALRM` signal for timer interrupts
-- `setitimer()` for periodic tick generation
-- `sigprocmask()` for interrupt enable/disable
-- `SA_RESTART` flag to prevent `EINTR` on system calls
+**Multi-VM support:**
 
-### Other Platforms
+- Both HAL implementations support multiple `mrb_state` instances
+- A single system timer ticks all registered VMs
+- Maximum VMs: configurable via `MRB_TASK_MAX_VMS` (default: 8)
 
-For embedded or non-POSIX platforms, you must implement the HAL functions. See
-the POSIX implementation in `src/task.c` as a reference.
+#### Custom HAL Implementation
 
-Example for a hypothetical embedded platform:
+For embedded systems or unsupported platforms, you can create a custom HAL gem. The HAL must provide five functions defined in `mruby-task/include/task_hal.h`:
 
 ```c
-void mrb_task_hal_init(mrb_state *mrb) {
-  // Setup hardware timer to call mrb_tick() every MRB_TICK_UNIT ms
-  hardware_timer_init(MRB_TICK_UNIT, timer_irq_handler);
+/**
+ * Initialize timer and register VM
+ * Called during gem initialization
+ * Must set up periodic timer to call mrb_tick(mrb) every MRB_TICK_UNIT ms
+ */
+void mrb_task_hal_init(mrb_state *mrb);
+
+/**
+ * Cleanup timer and unregister VM
+ * Called during gem finalization
+ */
+void mrb_task_hal_final(mrb_state *mrb);
+
+/**
+ * Enable timer interrupts (exit critical section)
+ * Must be reentrant for nested calls
+ */
+void mrb_task_enable_irq(void);
+
+/**
+ * Disable timer interrupts (enter critical section)
+ * Must be reentrant for nested calls
+ */
+void mrb_task_disable_irq(void);
+
+/**
+ * Put CPU in low-power/idle mode
+ * Called when no tasks are ready but some are waiting
+ * Should sleep ~MRB_TICK_UNIT milliseconds
+ */
+void mrb_task_hal_idle_cpu(mrb_state *mrb);
+```
+
+**Example custom HAL gem structure:**
+
+```
+mrbgems/hal-myplatform-task/
+├── mrbgem.rake              # Gem specification
+├── include/
+│   └── task_hal.h          # Symlink to mruby-task/include/task_hal.h
+└── src/
+    └── task_hal.c          # Platform implementation
+```
+
+**mrbgem.rake:**
+
+```ruby
+MRuby::Gem::Specification.new('hal-myplatform-task') do |spec|
+  spec.license = 'MIT'
+  spec.authors = 'Your Name'
+  spec.summary = 'My Platform HAL for mruby-task'
+
+  # HAL gem depends on feature gem (important for build order)
+  spec.add_dependency 'mruby-task', core: 'mruby-task'
+
+  # Add any platform-specific libraries or flags
+  # spec.linker.libraries << 'myplatform_timer'
+end
+```
+
+**task_hal.c example for embedded system:**
+
+```c
+#include <mruby.h>
+#include "task_hal.h"
+#include "myplatform_hardware.h"
+
+static mrb_state *registered_vm = NULL;
+
+void mrb_task_hal_init(mrb_state *mrb)
+{
+  registered_vm = mrb;
+
+  // Setup hardware timer to fire every MRB_TICK_UNIT milliseconds
+  hardware_timer_init(MRB_TICK_UNIT, timer_isr);
+  hardware_timer_start();
 }
 
-void timer_irq_handler(void) {
-  mrb_tick(global_mrb);  // Must be called from timer interrupt
+void mrb_task_hal_final(mrb_state *mrb)
+{
+  hardware_timer_stop();
+  registered_vm = NULL;
+}
+
+void mrb_task_enable_irq(void)
+{
+  hardware_enable_interrupts();
+}
+
+void mrb_task_disable_irq(void)
+{
+  hardware_disable_interrupts();
+}
+
+void mrb_task_hal_idle_cpu(mrb_state *mrb)
+{
+  (void)mrb;
+  hardware_sleep_mode();  // Enter low-power mode until interrupt
+}
+
+// Timer ISR - must call mrb_tick() for scheduler
+void timer_isr(void)
+{
+  if (registered_vm) {
+    mrb_tick(registered_vm);
+  }
+}
+
+// Gem initialization (required but can be empty)
+void mrb_hal_myplatform_task_gem_init(mrb_state *mrb)
+{
+  (void)mrb;
+}
+
+void mrb_hal_myplatform_task_gem_final(mrb_state *mrb)
+{
+  (void)mrb;
 }
 ```
+
+See `hal-posix-task` and `hal-win-task` source code for complete reference implementations.
 
 ## Examples
 

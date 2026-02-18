@@ -28,6 +28,11 @@
 #include <stdlib.h>
 #endif
 
+#ifdef MRB_USE_TASK_SCHEDULER
+/* Forward declaration - actual implementation in task.c */
+void mrb_task_mark_all(mrb_state *mrb);
+#endif
+
 /*
   = Tri-color Incremental Garbage Collection
 
@@ -956,6 +961,11 @@ root_scan_phase(mrb_state *mrb, mrb_gc *gc)
   if (mrb->root_c != mrb->c) {
     mark_context(mrb, mrb->root_c);
   }
+
+#ifdef MRB_USE_TASK_SCHEDULER
+  /* mark tasks - calls into task.c to mark all task queues */
+  mrb_task_mark_all(mrb);
+#endif
 }
 
 static void

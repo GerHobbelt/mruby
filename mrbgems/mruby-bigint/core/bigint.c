@@ -51,7 +51,7 @@ typedef struct mpz_context {
 
 /* Convenience macros for context creation */
 #define MPZ_CTX_INIT(mrb_ptr, ctx, pool_ptr) \
-  mpz_pool_t pool ## _storage = {0};\
+  mpz_pool_t pool ## _storage = {{0}};\
   mpz_pool_t *pool_ptr = &pool ## _storage;\
   mpz_ctx_t ctx ## _struct = ((mpz_ctx_t){.mrb = (mrb_ptr), .pool = (pool_ptr)}); \
   mpz_ctx_t *ctx = &(ctx ## _struct);
@@ -295,10 +295,10 @@ mpz_clear(mpz_ctx_t *ctx, mpz_t *s)
       /* Pool memory - don't free, just mark as unused */
     }
     else {
-#endif
       mrb_free(MPZ_MRB(ctx), s->p);
-#if MRB_BIGINT_POOL_SIZE > 0
     }
+#else
+    mrb_free(MPZ_MRB(ctx), s->p);
 #endif
     s->p = NULL;
   }
@@ -2749,10 +2749,10 @@ bint_as_mpz(struct RBigint *b, mpz_t *x)
   x->sn = RBIGINT_SIGN(b);
 }
 
-static struct RBigint*
-bint_new(mpz_ctx_t *ctx, mpz_t *x)
+/* Transfer mpz_t data to RBigint structure */
+static void
+bint_set(mpz_ctx_t *ctx, struct RBigint *b, mpz_t *x)
 {
-  struct RBigint *b = MRB_OBJ_ALLOC(MPZ_MRB(ctx), MRB_TT_BIGINT, MPZ_MRB(ctx)->integer_class);
   if (x->sz <= RBIGINT_EMBED_SIZE_MAX) {
     RBIGINT_SET_EMBED_SIZE(b, x->sz);
     RBIGINT_SET_EMBED_SIGN(b, x->sn);
@@ -2769,6 +2769,13 @@ bint_new(mpz_ctx_t *ctx, mpz_t *x)
     RBIGINT_SET_HEAP(b);
     mpz_move(ctx, &b->as.heap, x);
   }
+}
+
+static struct RBigint*
+bint_new(mpz_ctx_t *ctx, mpz_t *x)
+{
+  struct RBigint *b = MRB_OBJ_ALLOC(MPZ_MRB(ctx), MRB_TT_BIGINT, MPZ_MRB(ctx)->integer_class);
+  bint_set(ctx, b, x);
   return b;
 }
 
@@ -3457,7 +3464,13 @@ mrb_bint_xor(mrb_state *mrb, mrb_value x, mrb_value y)
     if (z == 0) return x;
     if (0 < z && (mp_dbl_limb)z < DIG_BASE) {
       mpz_init_set(ctx, &c, &a);
-      c.p[0] ^= z;
+      if (a.sz == 0) {
+        mpz_realloc(ctx, &c, 1);
+        c.p[0] = z;
+      }
+      else {
+        c.p[0] ^= z;
+      }
       return bint_norm(mrb, bint_new(ctx, &c));
     }
   }
@@ -3534,12 +3547,12 @@ mrb_bint_rshift(mrb_state *mrb, mrb_value x, mrb_int width)
 void
 mrb_bint_copy(mrb_state *mrb, mrb_value x, mrb_value y)
 {
-  mpz_t a, b;
+  mpz_t b, temp;
   MPZ_CTX_INIT(mrb, ctx, pool);
 
-  bint_as_mpz(RBIGINT(x), &a);
   bint_as_mpz(RBIGINT(y), &b);
-  mpz_init_set(ctx, &a, &b);
+  mpz_init_set(ctx, &temp, &b);
+  bint_set(ctx, RBIGINT(x), &temp);
 }
 
 size_t
