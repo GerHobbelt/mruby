@@ -29,6 +29,7 @@ enum node_type {
   NODE_OR,
   NODE_NOT,
   NODE_MASGN,
+  NODE_MARG,
   NODE_ASGN,
   NODE_OP_ASGN,
   NODE_CALL,
@@ -127,7 +128,7 @@ struct mrb_ast_node {
   /* No location fields - saves 4 bytes per structure node */
 };
 
-/* Variable-sized AST nodes - Phase 1 Infrastructure */
+/* Variable-sized AST nodes */
 
 /* Variable node header - common to all variable-sized nodes */
 struct mrb_ast_var_header {
@@ -137,7 +138,7 @@ struct mrb_ast_var_header {
   /* Total: 6 bytes header for all variable nodes */
 };
 
-/* Phase 1 Variable Node Structures */
+/* Literal value nodes */
 
 /* Variable-sized symbol node */
 struct mrb_ast_sym_node {
@@ -171,7 +172,7 @@ struct mrb_ast_var_node {
   mrb_sym symbol;
 };
 
-/* Phase 2 Variable Node Structures */
+/* Expression and operation nodes */
 
 /* Variable-sized call node with inline argument storage */
 struct mrb_ast_call_node {
@@ -182,19 +183,19 @@ struct mrb_ast_call_node {
   struct mrb_ast_node *args;         /* Arguments Information */
 };
 
-/* Variable-sized array node - revert to original cons list approach */
+/* Variable-sized array node */
 struct mrb_ast_array_node {
   struct mrb_ast_var_header header;    /* 8 bytes */
-  struct mrb_ast_node *elements;       /* Original elements list */
+  struct mrb_ast_node *elements;       /* Elements list (cons list) */
 };
 
-/* Variable-sized hash node - revert to original cons list approach */
+/* Variable-sized hash node */
 struct mrb_ast_hash_node {
   struct mrb_ast_var_header header;    /* 8 bytes */
-  struct mrb_ast_node *pairs;          /* Original pairs list */
+  struct mrb_ast_node *pairs;          /* Key-value pairs (cons list) */
 };
 
-/* Phase 3 Variable Node Structures - Control Flow */
+/* Control flow and definition nodes */
 
 /* Variable-sized method definition node */
 struct mrb_ast_def_node {
@@ -259,11 +260,11 @@ struct mrb_ast_until_node {
   struct mrb_ast_node *body;         /* Loop body */
 };
 
-/* Variable-sized case node - revert to original cons list approach */
+/* Variable-sized case node */
 struct mrb_ast_case_node {
   struct mrb_ast_var_header header;    /* 8 bytes */
   struct mrb_ast_node *value;          /* Case value expression */
-  struct mrb_ast_node *body;           /* Original when/else body list */
+  struct mrb_ast_node *body;           /* When/else clauses (cons list) */
 };
 
 /* Variable-sized for node */
@@ -286,7 +287,9 @@ struct mrb_ast_asgn_node {
 /* Variable-sized multiple assignment node */
 struct mrb_ast_masgn_node {
   struct mrb_ast_var_header header;  /* 8 bytes */
-  struct mrb_ast_node *lhs;          /* Left-hand side (multiple targets) */
+  struct mrb_ast_node *pre;          /* Pre-splat variables (cons list) */
+  struct mrb_ast_node *rest;         /* Splat variable (single node or -1) */
+  struct mrb_ast_node *post;         /* Post-splat variables (cons list) */
   struct mrb_ast_node *rhs;          /* Right-hand side (values) */
 };
 
@@ -332,10 +335,6 @@ struct mrb_ast_super_node {
   struct mrb_ast_node *args;         /* Super arguments (can be NULL) */
 };
 
-/* String storage strategy thresholds */
-#define STR_INLINE_THRESHOLD  48   /* Inline strings <= 48 bytes */
-#define STR_SMALL_THRESHOLD   128  /* Small strings <= 128 bytes */
-
 #define VAR_NODE_TYPE(n) ((enum node_type)(((struct mrb_ast_var_header*)(n))->node_type))
 
 /* Type-safe casting macros */
@@ -349,19 +348,19 @@ struct mrb_ast_super_node {
 #define node_to_type(x) ((enum node_type)(intptr_t)(x))
 #define node_to_char(x) ((char)(intptr_t)(x))
 
-/* Phase 1 node casting macros */
+/* Literal value node casting macros */
 #define sym_node(n) ((struct mrb_ast_sym_node*)(n))
 #define str_node(n) ((struct mrb_ast_str_node*)(n))
 #define int_node(n) ((struct mrb_ast_int_node*)(n))
 #define bigint_node(n) ((struct mrb_ast_bigint_node*)(n))
 #define var_node(n) ((struct mrb_ast_var_node*)(n))
 
-/* Phase 2 node casting macros */
+/* Expression and operation node casting macros */
 #define call_node(n) ((struct mrb_ast_call_node*)(n))
 #define array_node(n) ((struct mrb_ast_array_node*)(n))
 #define hash_node(n) ((struct mrb_ast_hash_node*)(n))
 
-/* Phase 3 node casting macros */
+/* Control flow and definition node casting macros */
 #define def_node(n) ((struct mrb_ast_def_node*)(n))
 #define class_node(n) ((struct mrb_ast_class_node*)(n))
 #define module_node(n) ((struct mrb_ast_module_node*)(n))
@@ -379,85 +378,6 @@ struct mrb_ast_super_node {
 #define return_node(n) ((struct mrb_ast_return_node*)(n))
 #define yield_node(n) ((struct mrb_ast_yield_node*)(n))
 #define super_node(n) ((struct mrb_ast_super_node*)(n))
-
-/* Phase 1 value access macros */
-#define SYM_NODE_VALUE(n) (sym_node(n)->symbol)
-#define STR_NODE_PTR(n) (str_node(n)->data)
-#define STR_NODE_LEN(n) (str_node(n)->len)
-#define INT_NODE_VALUE(n) (int_node(n)->value)
-#define BIGINT_NODE_STRING(n) (bigint_node(n)->string)
-#define BIGINT_NODE_BASE(n) (bigint_node(n)->base)
-#define VAR_NODE_SYMBOL(n) (var_node(n)->symbol)
-
-/* Phase 2 value access macros */
-#define CALL_NODE_RECEIVER(n) (call_node(n)->receiver)
-#define CALL_NODE_METHOD(n) (call_node(n)->method_name)
-#define CALL_NODE_ARGS(n) (call_node(n)->args)
-#define CALL_NODE_SAFE(n) (call_node(n)->safe_call)
-
-#define ARRAY_NODE_ELEMENTS(n) (array_node(n)->elements)
-
-#define HASH_NODE_PAIRS(n) (hash_node(n)->pairs)
-
-/* Phase 3 value access macros */
-#define IF_NODE_CONDITION(n) (if_node(n)->condition)
-#define IF_NODE_THEN(n) (if_node(n)->then_body)
-#define IF_NODE_ELSE(n) (if_node(n)->else_body)
-
-#define WHILE_NODE_CONDITION(n) (while_node(n)->condition)
-#define WHILE_NODE_BODY(n) (while_node(n)->body)
-
-#define UNTIL_NODE_CONDITION(n) (until_node(n)->condition)
-#define UNTIL_NODE_BODY(n) (until_node(n)->body)
-
-#define CASE_NODE_VALUE(n) (case_node(n)->value)
-#define CASE_NODE_BODY(n) (case_node(n)->body)
-
-#define FOR_NODE_VAR(n) (for_node(n)->var)
-#define FOR_NODE_ITERABLE(n) (for_node(n)->iterable)
-#define FOR_NODE_BODY(n) (for_node(n)->body)
-
-/* Definition node value access macros */
-#define DEF_NODE_NAME(n) (def_node(n)->name)
-#define DEF_NODE_ARGS(n) (def_node(n)->args)
-#define DEF_NODE_BODY(n) (def_node(n)->body)
-#define DEF_NODE_LOCALS(n) (def_node(n)->locals)
-#define SDEF_NODE_NAME(n) (sdef_node(n)->name)
-#define SDEF_NODE_ARGS(n) (sdef_node(n)->args)
-#define SDEF_NODE_BODY(n) (sdef_node(n)->body)
-#define SDEF_NODE_LOCALS(n) (sdef_node(n)->locals)
-#define SDEF_NODE_OBJ(n) (sdef_node(n)->body)
-#define CLASS_NODE_NAME(n) (class_node(n)->name)
-#define CLASS_NODE_SUPERCLASS(n) (class_node(n)->superclass)
-#define CLASS_NODE_BODY(n) (class_node(n)->body)
-
-#define MODULE_NODE_NAME(n) (module_node(n)->name)
-#define MODULE_NODE_BODY(n) (module_node(n)->body)
-
-#define SCLASS_NODE_OBJ(n) (sclass_node(n)->obj)
-#define SCLASS_NODE_BODY(n) (sclass_node(n)->body)
-
-/* Assignment node value access macros */
-#define ASGN_NODE_LHS(n) (asgn_node(n)->lhs)
-#define ASGN_NODE_RHS(n) (asgn_node(n)->rhs)
-
-#define MASGN_NODE_LHS(n) (masgn_node(n)->lhs)
-#define MASGN_NODE_RHS(n) (masgn_node(n)->rhs)
-
-#define OP_ASGN_NODE_LHS(n) (op_asgn_node(n)->lhs)
-#define OP_ASGN_NODE_OP(n) (op_asgn_node(n)->op)
-#define OP_ASGN_NODE_RHS(n) (op_asgn_node(n)->rhs)
-
-/* Expression node value access macros */
-#define AND_NODE_LEFT(n) (and_node(n)->left)
-#define AND_NODE_RIGHT(n) (and_node(n)->right)
-
-#define OR_NODE_LEFT(n) (or_node(n)->left)
-#define OR_NODE_RIGHT(n) (or_node(n)->right)
-
-#define RETURN_NODE_ARGS(n) (return_node(n)->args)
-#define YIELD_NODE_ARGS(n) (yield_node(n)->args)
-#define SUPER_NODE_ARGS(n) (super_node(n)->args)
 
 /* Variable-sized literal node structures */
 
@@ -482,17 +402,6 @@ struct mrb_ast_float_node {
 #define dot2_node(n) ((struct mrb_ast_dot2_node*)(n))
 #define dot3_node(n) ((struct mrb_ast_dot3_node*)(n))
 #define float_node(n) ((struct mrb_ast_float_node*)(n))
-
-/* Literal node value access macros */
-#define STR_NODE_LIST(n) (str_node(n)->list)
-
-#define DOT2_NODE_LEFT(n) (dot2_node(n)->left)
-#define DOT2_NODE_RIGHT(n) (dot2_node(n)->right)
-
-#define DOT3_NODE_LEFT(n) (dot3_node(n)->left)
-#define DOT3_NODE_RIGHT(n) (dot3_node(n)->right)
-
-#define FLOAT_NODE_VALUE(n) (float_node(n)->value)
 
 /* Variable-sized simple node structures */
 struct mrb_ast_self_node {
@@ -522,9 +431,6 @@ struct mrb_ast_const_node {
 #define true_node(n) ((struct mrb_ast_true_node*)(n))
 #define false_node(n) ((struct mrb_ast_false_node*)(n))
 #define const_node(n) ((struct mrb_ast_const_node*)(n))
-
-/* Simple node value access macros */
-#define CONST_NODE_SYMBOL(n) (const_node(n)->symbol)
 
 /* Variable-sized advanced node structures */
 struct mrb_ast_rescue_node {
@@ -567,30 +473,7 @@ struct mrb_ast_callargs {
 #define block_node(n) ((struct mrb_ast_block_node*)(n))
 #define callargs_node(n) ((struct mrb_ast_callargs*)(n))
 
-/* Advanced node value access macros */
-#define RESCUE_NODE_BODY(n) (rescue_node(n)->body)
-#define RESCUE_NODE_RESCUE_CLAUSES(n) (rescue_node(n)->rescue_clauses)
-#define RESCUE_NODE_ELSE_CLAUSE(n) (rescue_node(n)->else_clause)
-
-#define BLOCK_NODE_LOCALS(n) (block_node(n)->locals)
-#define BLOCK_NODE_ARGS(n) (block_node(n)->args)
-#define BLOCK_NODE_BODY(n) (block_node(n)->body)
-
-#define ARGS_NODE_MANDATORY(n) (args_node(n)->mandatory)
-#define ARGS_NODE_OPTIONAL(n) (args_node(n)->optional)
-#define ARGS_NODE_REST(n) (args_node(n)->rest)
-#define ARGS_NODE_MANDATORY_AFTER_REST(n) (args_node(n)->mandatory_after_rest)
-#define ARGS_NODE_TAIL(n) (args_node(n)->tail)
-
-#define ARGS_TAIL_NODE_KEYWORDS(n) (args_tail_node(n)->keywords)
-#define ARGS_TAIL_NODE_KWREST(n) (args_tail_node(n)->kwrest)
-#define ARGS_TAIL_NODE_BLOCK(n) (args_tail_node(n)->block)
-
-#define CALLARGS_NODE_REGULAR(n) (callargs_node(n)->regular_args)
-#define CALLARGS_NODE_KEYWORDS(n) (callargs_node(n)->keyword_args)
-#define CALLARGS_NODE_BLOCK(n) (callargs_node(n)->block_arg)
-
-// Group 8: Control Flow Statements
+/* Control flow statement nodes */
 struct mrb_ast_break_node {
   struct mrb_ast_var_header header;
   struct mrb_ast_node *value;
@@ -613,10 +496,8 @@ struct mrb_ast_retry_node {
 #define next_node(n) ((struct mrb_ast_next_node*)(n))
 #define redo_node(n) ((struct mrb_ast_redo_node*)(n))
 #define retry_node(n) ((struct mrb_ast_retry_node*)(n))
-#define BREAK_NODE_VALUE(n) (break_node(n)->value)
-#define NEXT_NODE_VALUE(n) (next_node(n)->value)
 
-// Group 9: String and Regex Variants
+/* String and regex variant nodes */
 struct mrb_ast_xstr_node {
   struct mrb_ast_var_header header;
   struct mrb_ast_node *list;
@@ -634,24 +515,12 @@ struct mrb_ast_heredoc_node {
   struct mrb_parser_heredoc_info info;
 };
 
-struct mrb_ast_dsym_node {
-  struct mrb_ast_var_header header;
-  struct mrb_ast_node *list;
-};
-
 #define xstr_node(n) ((struct mrb_ast_xstr_node*)(n))
 #define regx_node(n) ((struct mrb_ast_regx_node*)(n))
 #define heredoc_node(n) ((struct mrb_ast_heredoc_node*)(n))
-#define dsym_node(n) ((struct mrb_ast_dsym_node*)(n))
+#define dsym_node(n) ((struct mrb_ast_str_node*)(n))
 
-#define XSTR_NODE_LIST(n) (xstr_node(n)->list)
-#define REGX_NODE_LIST(n) (regx_node(n)->list)
-#define REGX_NODE_FLAGS(n) (regx_node(n)->flags)
-#define REGX_NODE_ENCODING(n) (regx_node(n)->encoding)
-#define HEREDOC_NODE_NAME(n) (heredoc_node(n)->name)
-#define DSYM_NODE_LIST(n) (dsym_node(n)->list)
-
-// Group 10: References and Variables
+/* Reference and special variable nodes */
 struct mrb_ast_nth_ref_node {
   struct mrb_ast_var_header header;
   int nth;
@@ -677,13 +546,7 @@ struct mrb_ast_dvar_node {
 #define nvar_node(n) ((struct mrb_ast_nvar_node*)(n))
 #define dvar_node(n) ((struct mrb_ast_dvar_node*)(n))
 
-#define NTH_REF_NODE_NTH(n) (nth_ref_node(n)->nth)
-#define BACK_REF_NODE_TYPE(n) (back_ref_node(n)->type)
-#define NVAR_NODE_NUM(n) (nvar_node(n)->num)
-#define DVAR_NODE_NAME(n) (dvar_node(n)->name)
-#define MATCH_NODE_PATTERN(n) (match_node(n)->pattern)
-
-// Group 11: Operators and Expressions
+/* Unary operator and scope resolution nodes */
 struct mrb_ast_not_node {
   struct mrb_ast_var_header header;
   struct mrb_ast_node *operand;
@@ -716,14 +579,7 @@ struct mrb_ast_defined_node {
 #define colon3_node(n) ((struct mrb_ast_colon3_node*)(n))
 #define defined_node(n) ((struct mrb_ast_defined_node*)(n))
 
-#define NOT_NODE_OPERAND(n) (not_node(n)->operand)
-#define NEGATE_NODE_OPERAND(n) (negate_node(n)->operand)
-#define COLON2_NODE_BASE(n) (colon2_node(n)->base)
-#define COLON2_NODE_NAME(n) (colon2_node(n)->name)
-#define COLON3_NODE_NAME(n) (colon3_node(n)->name)
-#define DEFINED_NODE_EXPR(n) (defined_node(n)->expr)
-
-// Group 12: Function Calls and Special Forms
+/* Lambda nodes */
 struct mrb_ast_lambda_node {
   struct mrb_ast_var_header header;
   struct mrb_ast_node *locals;
@@ -731,7 +587,7 @@ struct mrb_ast_lambda_node {
   struct mrb_ast_node *body;
 };
 
-// Group 13: Containers and Collections
+/* Array literal variant nodes */
 struct mrb_ast_zarray_node {
   struct mrb_ast_var_header header;
 };
@@ -746,7 +602,7 @@ struct mrb_ast_symbols_node {
   struct mrb_ast_node *args;
 };
 
-// Group 14: Arguments and Parameters
+/* Argument and parameter nodes */
 
 struct mrb_ast_splat_node {
   struct mrb_ast_var_header header;
@@ -758,7 +614,7 @@ struct mrb_ast_block_arg_node {
   struct mrb_ast_node *value;
 };
 
-// Group 15: Structural Nodes
+/* Structural and block nodes */
 
 struct mrb_ast_scope_node {
   struct mrb_ast_var_header header;
@@ -788,14 +644,7 @@ struct mrb_ast_iter_node {
   struct mrb_ast_node *body;
 };
 
-struct mrb_ast_when_node {
-  struct mrb_ast_var_header header;
-  struct mrb_ast_node *cond;
-  struct mrb_ast_node *body;
-  struct mrb_ast_node *next_when;
-};
-
-// Group 16: Declarations and Definitions
+/* Declaration nodes */
 
 struct mrb_ast_alias_node {
   struct mrb_ast_var_header header;
@@ -825,29 +674,9 @@ struct mrb_ast_postexe_node {
 #define ensure_node(n) ((struct mrb_ast_ensure_node*)(n))
 #define stmts_node(n) ((struct mrb_ast_stmts_node*)(n))
 #define iter_node(n) ((struct mrb_ast_iter_node*)(n))
-#define when_node(n) ((struct mrb_ast_when_node*)(n))
 #define alias_node(n) ((struct mrb_ast_alias_node*)(n))
 #define undef_node(n) ((struct mrb_ast_undef_node*)(n))
 #define postexe_node(n) ((struct mrb_ast_postexe_node*)(n))
 #define sdef_node(n) ((struct mrb_ast_sdef_node*)(n))
-
-#define LAMBDA_NODE_LOCALS(n) (lambda_node(n)->locals)
-#define LAMBDA_NODE_ARGS(n) (lambda_node(n)->args)
-#define LAMBDA_NODE_BODY(n) (lambda_node(n)->body)
-#define WORDS_NODE_ARGS(n) (words_node(n)->args)
-#define SYMBOLS_NODE_ARGS(n) (symbols_node(n)->args)
-#define SPLAT_NODE_VALUE(n) (splat_node(n)->value)
-#define BLOCK_ARG_NODE_VALUE(n) (block_arg_node(n)->value)
-#define SCOPE_NODE_LOCALS(n) (scope_node(n)->locals)
-#define SCOPE_NODE_BODY(n) (scope_node(n)->body)
-#define STMTS_NODE_STMTS(n) (stmts_node(n)->stmts)
-#define BEGIN_NODE_BODY(n) (begin_node(n)->body)
-#define ENSURE_NODE_BODY(n) (ensure_node(n)->body)
-#define ENSURE_NODE_ENSURE_CLAUSE(n) (ensure_node(n)->ensure_clause)
-#define ITER_NODE_VARS(n) (iter_node(n)->vars)
-#define ITER_NODE_BODY(n) (iter_node(n)->body)
-#define WHEN_NODE_COND(n) (when_node(n)->cond)
-#define WHEN_NODE_BODY(n) (when_node(n)->body)
-#define WHEN_NODE_NEXT_WHEN(n) (when_node(n)->next_when)
 
 #endif  /* MRUBY_COMPILER_NODE_H */
