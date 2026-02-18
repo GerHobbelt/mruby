@@ -1271,6 +1271,39 @@ MRB_API void mrb_close(mrb_state *mrb);
 MRB_API void mrb_method_cache_clear(mrb_state *mrb);
 
 /**
+ * Check if mrb_open() failed
+ *
+ * @param mrb
+ *      Pointer returned from mrb_open() or mrb_open_core().
+ * @return
+ *      Non-zero if initialization failed, 0 if succeeded.
+ * @note
+ *      mrb_open() may return non-NULL even on failure (with mrb->exc set).
+ *      Use this macro to check for failure:
+ *      @code
+ *      mrb_state *mrb = mrb_open();
+ *      if (MRB_OPEN_FAILURE(mrb)) {
+ *        if (mrb) {
+ *          // Inspect mrb->exc for error details
+ *          mrb_close(mrb);
+ *        }
+ *        return EXIT_FAILURE;
+ *      }
+ *      @endcode
+ */
+#define MRB_OPEN_FAILURE(mrb) (!(mrb) || (mrb)->exc)
+
+/**
+ * Check if mrb_open() succeeded
+ *
+ * @param mrb
+ *      Pointer returned from mrb_open() or mrb_open_core().
+ * @return
+ *      Non-zero if initialization succeeded, 0 if failed.
+ */
+#define MRB_OPEN_SUCCESS(mrb) (!MRB_OPEN_FAILURE(mrb))
+
+/**
  * The memory allocation function. You can redefine this function for your own allocator.
  *
  */
@@ -1327,6 +1360,7 @@ MRB_API mrb_int mrb_cmp(mrb_state *mrb, mrb_value obj1, mrb_value obj2);
 
 /* recursion detection */
 MRB_API mrb_bool mrb_recursive_method_p(mrb_state *mrb, mrb_sym mid, mrb_value obj1, mrb_value obj2);
+MRB_API mrb_bool mrb_recursive_func_p(mrb_state *mrb, mrb_sym mid, mrb_value obj1, mrb_value obj2);
 
 #define MRB_RECURSIVE_P(mrb, mid, obj1, obj2) \
   mrb_recursive_method_p(mrb, mid, obj1, obj2)
@@ -1336,6 +1370,12 @@ MRB_API mrb_bool mrb_recursive_method_p(mrb_state *mrb, mrb_sym mid, mrb_value o
 
 #define MRB_RECURSIVE_BINARY_P(mrb, mid, obj1, obj2) \
   mrb_recursive_method_p(mrb, mid, obj1, obj2)
+
+#define MRB_RECURSIVE_FUNC_P(mrb, mid, obj) \
+  mrb_recursive_func_p(mrb, mid, obj, mrb_nil_value())
+
+#define MRB_RECURSIVE_BINARY_FUNC_P(mrb, mid, obj1, obj2) \
+  mrb_recursive_func_p(mrb, mid, obj1, obj2)
 
 #define mrb_gc_arena_save(mrb) ((mrb)->gc.arena_idx)
 #define mrb_gc_arena_restore(mrb, idx) ((mrb)->gc.arena_idx = (idx))

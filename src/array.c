@@ -252,6 +252,44 @@ ary_make_shared(mrb_state *mrb, struct RArray *a)
   }
 }
 
+/* Creates a shared copy of array for temporary GC protection.
+ * Frozen arrays are returned as-is (cannot be modified).
+ * Embedded arrays get full copy (cannot be shared).
+ * Heap arrays get zero-copy shared reference.
+ */
+MRB_API mrb_value
+mrb_ary_make_shared_copy(mrb_state *mrb, mrb_value ary)
+{
+  struct RArray *orig = mrb_ary_ptr(ary);
+
+  // Frozen arrays don't need protection
+  if (mrb_frozen_p(orig)) {
+    return ary;
+  }
+
+  // Embedded arrays can't be shared - make full copy
+  if (ARY_EMBED_P(orig)) {
+    return mrb_ary_dup(mrb, ary);
+  }
+
+  // Make original array shared if not already
+  if (!ARY_SHARED_P(orig)) {
+    ary_make_shared(mrb, orig);
+  }
+
+  // Create new array that shares the buffer
+  struct RArray *shared = (struct RArray*)mrb_obj_alloc(mrb, MRB_TT_ARRAY, mrb->array_class);
+
+  shared->as.heap.ptr = orig->as.heap.ptr;
+  shared->as.heap.len = orig->as.heap.len;
+  shared->as.heap.aux.shared = orig->as.heap.aux.shared;
+  shared->as.heap.aux.shared->refcnt++;
+  ARY_SET_SHARED_FLAG(shared);
+  mrb_write_barrier(mrb, (struct RBasic*)shared);
+
+  return mrb_obj_value(shared);
+}
+
 /* Expands array capacity to accommodate at least len elements */
 static void
 ary_expand_capa(mrb_state *mrb, struct RArray *a, mrb_int len)
@@ -1890,7 +1928,7 @@ mrb_ary_eq(mrb_state *mrb, mrb_value ary1)
   if (n == 0) return mrb_false_value();
 
   /* Check for recursion */
-  if (MRB_RECURSIVE_BINARY_P(mrb, MRB_OPSYM(eq), ary1, ary2)) {
+  if (MRB_RECURSIVE_BINARY_FUNC_P(mrb, MRB_OPSYM(eq), ary1, ary2)) {
     return mrb_false_value();
   }
 
@@ -1921,7 +1959,7 @@ mrb_ary_eql(mrb_state *mrb, mrb_value ary1)
   if (n == 0) return mrb_false_value();
 
   /* Check for recursion */
-  if (MRB_RECURSIVE_BINARY_P(mrb, MRB_SYM_Q(eql), ary1, ary2)) {
+  if (MRB_RECURSIVE_BINARY_FUNC_P(mrb, MRB_SYM_Q(eql), ary1, ary2)) {
     return mrb_false_value();
   }
 

@@ -167,6 +167,30 @@ mrb_recursive_method_p(mrb_state *mrb, mrb_sym mid, mrb_value obj1, mrb_value ob
   return FALSE;
 }
 
+/**
+ * Check if a C function call is recursive.
+ *
+ * Like mrb_recursive_method_p, but starts from ci[-2] to skip the immediate
+ * parent frame. Use this from C functions implementing Ruby methods that can
+ * be overridden with super calls.
+ */
+MRB_API mrb_bool
+mrb_recursive_func_p(mrb_state *mrb, mrb_sym mid, mrb_value obj1, mrb_value obj2)
+{
+  /* Start from ci[-2] to skip immediate parent frame which may be a
+     Ruby override calling super */
+  for (mrb_callinfo *ci=&mrb->c->ci[-2]; ci>=mrb->c->cibase; ci--) {
+    if (ci->mid == mid && mrb_obj_eq(mrb, obj1, ci->stack[0])) {
+      /* For unary methods, only check first argument */
+      if (mrb_nil_p(obj2)) return TRUE;
+
+      /* For binary methods, check both arguments */
+      if (mrb_obj_eq(mrb, obj2, ci->stack[1])) return TRUE;
+    }
+  }
+  return FALSE;
+}
+
 static mrb_value
 mrb_obj_method_recursive_p(mrb_state *mrb, mrb_value obj)
 {
@@ -537,11 +561,10 @@ static mrb_value
 mrb_obj_remove_instance_variable(mrb_state *mrb, mrb_value self)
 {
   mrb_sym sym;
-  mrb_value val;
 
   mrb_get_args(mrb, "n", &sym);
   mrb_iv_name_sym_check(mrb, sym);
-  val = mrb_iv_remove(mrb, self, sym);
+  mrb_value val = mrb_iv_remove(mrb, self, sym);
   if (mrb_undef_p(val)) {
     mrb_name_error(mrb, sym, "instance variable %n not defined", sym);
   }
@@ -575,8 +598,7 @@ obj_respond_to(mrb_state *mrb, mrb_value self)
   if (!respond_to_p) {
     mrb_sym rtm_id = MRB_SYM_Q(respond_to_missing);
     if (!mrb_func_basic_p(mrb, self, rtm_id, mrb_false)) {
-      mrb_value v;
-      v = mrb_funcall_id(mrb, self, rtm_id, 2, mrb_symbol_value(id), mrb_bool_value(priv));
+      mrb_value v = mrb_funcall_id(mrb, self, rtm_id, 2, mrb_symbol_value(id), mrb_bool_value(priv));
       return mrb_bool_value(mrb_bool(v));
     }
   }
@@ -587,7 +609,6 @@ static mrb_value
 mrb_obj_ceqq(mrb_state *mrb, mrb_value self)
 {
   mrb_value v = mrb_get_arg1(mrb);
-  mrb_int i, len;
   mrb_sym eqq = MRB_OPSYM(eqq);
   mrb_value ary;
 
@@ -610,8 +631,8 @@ mrb_obj_ceqq(mrb_state *mrb, mrb_value self)
     }
     mrb_ensure_array_type(mrb, ary);
   }
-  len = RARRAY_LEN(ary);
-  for (i=0; i<len; i++) {
+  mrb_int len = RARRAY_LEN(ary);
+  for (mrb_int i=0; i<len; i++) {
     mrb_value c = mrb_funcall_argv(mrb, RARRAY_PTR(ary)[i], eqq, 1, &v);
     if (mrb_test(c)) return mrb_true_value();
   }

@@ -149,6 +149,12 @@ mrb_f_callee(mrb_state *mrb, mrb_value self)
  *     Integer("111", 2)   #=> 7
  *     Integer(nil)        #=> TypeError
  */
+static mrb_noreturn void
+arg_error(mrb_state *mrb)
+{
+  mrb_raise(mrb, E_ARGUMENT_ERROR, "base specified for non string value");
+}
+
 static mrb_value
 mrb_f_integer(mrb_state *mrb, mrb_value self)
 {
@@ -157,18 +163,18 @@ mrb_f_integer(mrb_state *mrb, mrb_value self)
 
   mrb_get_args(mrb, "o|i", &val, &base);
   if (mrb_nil_p(val)) {
-    if (base != 0) goto arg_error;
+    if (base != 0) arg_error(mrb);
     mrb_raise(mrb, E_TYPE_ERROR, "can't convert nil into Integer");
   }
   switch (mrb_type(val)) {
 #ifndef MRB_NO_FLOAT
     case MRB_TT_FLOAT:
-      if (base != 0) goto arg_error;
+      if (base != 0) arg_error(mrb);
       return mrb_float_to_integer(mrb, val);
 #endif
 
     case MRB_TT_INTEGER:
-      if (base != 0) goto arg_error;
+      if (base != 0) arg_error(mrb);
       return val;
 
     case MRB_TT_STRING:
@@ -184,8 +190,7 @@ mrb_f_integer(mrb_state *mrb, mrb_value self)
       val = tmp;
       goto string_conv;
     }
-arg_error:
-    mrb_raise(mrb, E_ARGUMENT_ERROR, "base specified for non string value");
+    arg_error(mrb);
   }
   /* to raise TypeError */
   return mrb_ensure_integer_type(mrb, val);
@@ -231,9 +236,7 @@ static mrb_value
 mrb_f_string(mrb_state *mrb, mrb_value self)
 {
   mrb_value arg = mrb_get_arg1(mrb);
-  mrb_value tmp;
-
-  tmp = mrb_type_convert(mrb, arg, MRB_TT_STRING, MRB_SYM(to_s));
+  mrb_value tmp = mrb_type_convert(mrb, arg, MRB_TT_STRING, MRB_SYM(to_s));
   return tmp;
 }
 
@@ -250,9 +253,7 @@ static mrb_value
 mrb_f_array(mrb_state *mrb, mrb_value self)
 {
   mrb_value arg = mrb_get_arg1(mrb);
-  mrb_value tmp;
-
-  tmp = mrb_type_convert_check(mrb, arg, MRB_TT_ARRAY, MRB_SYM(to_a));
+  mrb_value tmp = mrb_type_convert_check(mrb, arg, MRB_TT_ARRAY, MRB_SYM(to_a));
   if (mrb_nil_p(tmp)) {
     return mrb_ary_new_from_values(mrb, 1, &arg);
   }
