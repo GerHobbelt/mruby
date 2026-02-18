@@ -73,6 +73,12 @@ size_t mirb_buffer_total_len(mirb_buffer *buf);
 char *mirb_buffer_to_string(mirb_buffer *buf);
 
 /*
+ * Get buffer content up to and including a specific line
+ * Caller must free the returned string
+ */
+char *mirb_buffer_to_string_upto_line(mirb_buffer *buf, size_t up_to_line);
+
+/*
  * Set buffer content from string
  * String may contain newlines
  */
@@ -104,6 +110,11 @@ mrb_bool mirb_buffer_delete_forward(mirb_buffer *buf);
  * Insert newline at cursor position (split current line)
  */
 mrb_bool mirb_buffer_newline(mirb_buffer *buf);
+
+/*
+ * Delete a line at the given index
+ */
+void mirb_buffer_delete_line(mirb_buffer *buf, size_t line_idx);
 
 /*
  * Cursor movement functions

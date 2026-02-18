@@ -41,6 +41,43 @@ leading_spaces(const char *line)
 }
 
 /*
+ * Check if content starts with a dedenting keyword
+ * (end, else, elsif, when, in, rescue, ensure) or '}'
+ */
+static mrb_bool
+is_dedent_keyword(const char *content)
+{
+  if (content[0] == '}') return TRUE;
+  if (strncmp(content, "end", 3) == 0 &&
+      (content[3] == '\0' || content[3] == ' ' || content[3] == '\t' ||
+       content[3] == '.' || content[3] == ')')) return TRUE;
+  if (strncmp(content, "else", 4) == 0 &&
+      (content[4] == '\0' || content[4] == ' ' || content[4] == '\t')) return TRUE;
+  if (strncmp(content, "elsif", 5) == 0 && content[5] == ' ') return TRUE;
+  if (strncmp(content, "when", 4) == 0 && content[4] == ' ') return TRUE;
+  if (strncmp(content, "in", 2) == 0 && content[2] == ' ') return TRUE;
+  if (strncmp(content, "rescue", 6) == 0 &&
+      (content[6] == '\0' || content[6] == ' ' || content[6] == '\t')) return TRUE;
+  if (strncmp(content, "ensure", 6) == 0 &&
+      (content[6] == '\0' || content[6] == ' ' || content[6] == '\t')) return TRUE;
+  return FALSE;
+}
+
+/*
+ * Check if a line contains only whitespace (or is empty)
+ */
+static mrb_bool
+is_line_blank(const mirb_line *line)
+{
+  for (size_t i = 0; i < line->len; i++) {
+    if (line->data[i] != ' ' && line->data[i] != '\t') {
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+/*
  * Calculate indent level by counting open blocks in code
  */
 static int
@@ -125,6 +162,7 @@ should_dedent(mirb_buffer *buf, char last_char)
 {
   const char *line = mirb_buffer_current_line(buf);
   size_t col = buf->cursor_col;
+  size_t line_len = buf->lines[buf->cursor_line].len;
 
   /* Check for '}' - dedent immediately when typed at line start */
   if (last_char == '}') {
@@ -133,21 +171,42 @@ should_dedent(mirb_buffer *buf, char last_char)
     }
   }
 
-  /* Check for 'end' - dedent when 'd' completes "end" */
-  if (last_char == 'd' && col >= 3) {
-    /* Check if we just completed "end" */
-    if (line[col - 3] == 'e' && line[col - 2] == 'n' && line[col - 1] == 'd') {
-      /* Verify only whitespace before "end" */
-      if (col == 3 || line_is_blank_before(line, col - 3)) {
-        /* Verify "end" is not part of a longer word */
-        if (col == buf->lines[buf->cursor_line].len ||
-            line[col] == ' ' || line[col] == '\t' || line[col] == '\0' ||
-            line[col] == '\n' || line[col] == '.' || line[col] == ')') {
-          return TRUE;
-        }
-      }
+  /* Helper macro: check keyword completion */
+  #define CHECK_KEYWORD(keyword, len, trigger_char) \
+    if (last_char == trigger_char && col >= len) { \
+      if (strncmp(line + col - len, keyword, len) == 0) { \
+        if (col == len || line_is_blank_before(line, col - len)) { \
+          if (col == line_len || \
+              line[col] == ' ' || line[col] == '\t' || line[col] == '\0' || \
+              line[col] == '\n' || line[col] == '.' || line[col] == ')') { \
+            return TRUE; \
+          } \
+        } \
+      } \
     }
-  }
+
+  /* Check for 'end' - dedent when 'd' completes "end" */
+  CHECK_KEYWORD("end", 3, 'd');
+
+  /* Check for 'else' - dedent when 'e' completes "else" */
+  CHECK_KEYWORD("else", 4, 'e');
+
+  /* Check for 'elsif' - dedent when 'f' completes "elsif" */
+  CHECK_KEYWORD("elsif", 5, 'f');
+
+  /* Check for 'when' - dedent when 'n' completes "when" */
+  CHECK_KEYWORD("when", 4, 'n');
+
+  /* Check for 'in' - dedent when 'n' completes "in" (pattern matching) */
+  CHECK_KEYWORD("in", 2, 'n');
+
+  /* Check for 'rescue' - dedent when 'e' completes "rescue" */
+  CHECK_KEYWORD("rescue", 6, 'e');
+
+  /* Check for 'ensure' - dedent when 'e' completes "ensure" */
+  CHECK_KEYWORD("ensure", 6, 'e');
+
+  #undef CHECK_KEYWORD
 
   return FALSE;
 }
@@ -159,11 +218,26 @@ static void
 perform_dedent(mirb_buffer *buf)
 {
   const char *line = mirb_buffer_current_line(buf);
-  size_t spaces = leading_spaces(line);
+  size_t current_spaces = leading_spaces(line);
+  int expected_indent = 0;
 
-  /* Remove up to 2 spaces */
-  size_t to_remove = (spaces >= 2) ? 2 : spaces;
-  if (to_remove > 0) {
+  /* Calculate expected indent from code up to previous line */
+  if (buf->cursor_line > 0) {
+    char *partial = mirb_buffer_to_string_upto_line(buf, buf->cursor_line - 1);
+    if (partial) {
+      expected_indent = calc_indent_level(partial);
+      free(partial);
+    }
+  }
+
+  /* Dedent one level for keywords like end, else, etc. */
+  if (expected_indent > 0) expected_indent--;
+
+  size_t target_spaces = (size_t)(expected_indent * 2);
+
+  /* Only dedent if we have more spaces than target */
+  if (current_spaces > target_spaces) {
+    size_t to_remove = current_spaces - target_spaces;
     size_t saved_col = buf->cursor_col;
     /* Move cursor to start of line and delete leading spaces */
     buf->cursor_col = 0;
@@ -172,6 +246,66 @@ perform_dedent(mirb_buffer *buf)
     }
     /* Restore cursor position, adjusted for removed spaces */
     buf->cursor_col = (saved_col > to_remove) ? (saved_col - to_remove) : 0;
+  }
+}
+
+
+/*
+ * Re-indent current line to match expected indent level
+ * Used before inserting newline to fix any misaligned indentation
+ */
+static void
+reindent_line(mirb_buffer *buf)
+{
+  mirb_line *line = &buf->lines[buf->cursor_line];
+  size_t current_spaces = 0;
+  int expected_indent = 0;
+  const char *content;
+
+  /* Count current leading whitespace */
+  for (size_t i = 0; i < line->len && (line->data[i] == ' ' || line->data[i] == '\t'); i++) {
+    current_spaces++;
+  }
+
+  /* Calculate expected indent from code up to previous line */
+  if (buf->cursor_line > 0) {
+    char *partial = mirb_buffer_to_string_upto_line(buf, buf->cursor_line - 1);
+    if (partial) {
+      expected_indent = calc_indent_level(partial);
+      free(partial);
+    }
+  }
+
+  /* Check if line content starts with dedenting keyword */
+  content = line->data + current_spaces;
+  if (is_dedent_keyword(content)) {
+    if (expected_indent > 0) expected_indent--;
+  }
+
+  size_t target_spaces = (size_t)(expected_indent * 2);
+
+  /* Adjust indentation if needed */
+  if (target_spaces != current_spaces) {
+    size_t saved_col = buf->cursor_col;
+
+    if (target_spaces > current_spaces) {
+      /* Need to add spaces */
+      size_t add = target_spaces - current_spaces;
+      buf->cursor_col = 0;
+      for (size_t i = 0; i < add; i++) {
+        mirb_buffer_insert_char(buf, ' ');
+      }
+      buf->cursor_col = saved_col + add;
+    }
+    else {
+      /* Need to remove spaces */
+      size_t remove = current_spaces - target_spaces;
+      buf->cursor_col = current_spaces;
+      for (size_t i = 0; i < remove; i++) {
+        mirb_buffer_delete_back(buf);
+      }
+      buf->cursor_col = (saved_col > remove) ? (saved_col - remove) : 0;
+    }
   }
 }
 
@@ -192,10 +326,19 @@ mirb_editor_init(mirb_editor *ed)
     return FALSE;
   }
 
+  if (!mirb_history_init(&ed->hist, MIRB_HISTORY_SIZE)) {
+    mirb_buffer_free(&ed->buf);
+    mirb_term_cleanup(&ed->term);
+    return FALSE;
+  }
+
   ed->prompt = "> ";
   ed->prompt_cont = "* ";
   ed->prompt_len = 2;
   ed->prompt_cont_len = 2;
+  ed->prompt_fmt = NULL;
+  ed->prompt_cont_fmt = NULL;
+  ed->line_num_base = 1;
   ed->use_color = FALSE;
   ed->initialized = TRUE;
 
@@ -210,13 +353,14 @@ mirb_editor_cleanup(mirb_editor *ed)
 {
   if (!ed->initialized) return;
 
+  mirb_history_free(&ed->hist);
   mirb_buffer_free(&ed->buf);
   mirb_term_cleanup(&ed->term);
   ed->initialized = FALSE;
 }
 
 /*
- * Set prompts
+ * Set prompts (fixed strings)
  */
 void
 mirb_editor_set_prompts(mirb_editor *ed, const char *prompt, const char *prompt_cont)
@@ -225,6 +369,23 @@ mirb_editor_set_prompts(mirb_editor *ed, const char *prompt, const char *prompt_
   ed->prompt_cont = prompt_cont;
   ed->prompt_len = strlen(prompt);
   ed->prompt_cont_len = strlen(prompt_cont);
+  ed->prompt_fmt = NULL;
+  ed->prompt_cont_fmt = NULL;
+}
+
+/*
+ * Set prompt format strings for line-numbered prompts
+ */
+void
+mirb_editor_set_prompt_format(mirb_editor *ed, const char *prompt_fmt,
+                               const char *prompt_cont_fmt, int line_num)
+{
+  ed->prompt_fmt = prompt_fmt;
+  ed->prompt_cont_fmt = prompt_cont_fmt;
+  ed->line_num_base = line_num;
+  /* Estimate prompt length (assuming line numbers up to 999) */
+  ed->prompt_len = strlen(prompt_fmt) + 2;  /* %d -> up to 3 digits, minus 2 for %d */
+  ed->prompt_cont_len = strlen(prompt_cont_fmt) + 2;
 }
 
 /*
@@ -235,6 +396,174 @@ mirb_editor_set_check_complete(mirb_editor *ed, mirb_check_complete_fn *fn, void
 {
   ed->check_complete = fn;
   ed->check_complete_data = user_data;
+}
+
+/*
+ * Set tab completion callbacks
+ */
+void
+mirb_editor_set_tab_complete(mirb_editor *ed,
+                              mirb_tab_complete_fn *complete_fn,
+                              mirb_tab_complete_free_fn *free_fn,
+                              void *user_data)
+{
+  ed->tab_complete = complete_fn;
+  ed->tab_complete_free = free_fn;
+  ed->tab_complete_data = user_data;
+}
+
+/*
+ * Handle tab completion
+ * Returns TRUE if completion was performed
+ */
+
+/*
+ * Handle tab auto-indent
+ * Adjusts current line's indentation to match the expected level
+ */
+static void
+handle_tab_indent(mirb_editor *ed)
+{
+  mirb_line *line = &ed->buf.lines[ed->buf.cursor_line];
+  int expected_indent = 0;
+  size_t current_spaces = 0;
+  size_t i;
+  const char *content;
+  size_t saved_cursor_col = ed->buf.cursor_col;
+
+  /* Calculate expected indent from code up to previous line */
+  if (ed->buf.cursor_line > 0) {
+    char *partial = mirb_buffer_to_string_upto_line(&ed->buf, ed->buf.cursor_line - 1);
+    if (partial) {
+      expected_indent = calc_indent_level(partial);
+      free(partial);
+    }
+  }
+
+  /* Count current leading whitespace */
+  for (i = 0; i < line->len && (line->data[i] == ' ' || line->data[i] == '\t'); i++) {
+    current_spaces++;
+  }
+
+  /* Check if line content starts with dedenting keyword */
+  content = line->data + current_spaces;
+  if (is_dedent_keyword(content)) {
+    if (expected_indent > 0) expected_indent--;
+  }
+
+  /* Calculate target spaces (2 spaces per indent level) */
+  size_t target_spaces = (size_t)(expected_indent * 2);
+
+  /* Adjust indentation */
+  if (target_spaces > current_spaces) {
+    /* Need to add spaces - insert at beginning */
+    size_t add = target_spaces - current_spaces;
+    ed->buf.cursor_col = 0;
+    for (i = 0; i < add; i++) {
+      mirb_buffer_insert_char(&ed->buf, ' ');
+    }
+  }
+  else if (target_spaces < current_spaces) {
+    /* Need to remove spaces */
+    size_t remove = current_spaces - target_spaces;
+    ed->buf.cursor_col = current_spaces;
+    for (i = 0; i < remove; i++) {
+      mirb_buffer_delete_back(&ed->buf);
+    }
+  }
+
+  /* Restore cursor position adjusted for indent change */
+  if (target_spaces >= current_spaces) {
+    ed->buf.cursor_col = saved_cursor_col + (target_spaces - current_spaces);
+  }
+  else {
+    size_t removed = current_spaces - target_spaces;
+    if (saved_cursor_col >= removed) {
+      ed->buf.cursor_col = saved_cursor_col - removed;
+    }
+    else {
+      ed->buf.cursor_col = 0;
+    }
+  }
+}
+
+static mrb_bool
+handle_tab_completion(mirb_editor *ed)
+{
+  char **completions = NULL;
+  int count, prefix_len;
+  const char *current_line;
+  int cursor_col;
+
+  if (!ed->tab_complete) return FALSE;
+
+  /* Get current line and cursor position */
+  current_line = ed->buf.lines[ed->buf.cursor_line].data;
+  cursor_col = (int)ed->buf.cursor_col;
+
+  /* Get completions */
+  count = ed->tab_complete(current_line, cursor_col, &completions, &prefix_len,
+                           ed->tab_complete_data);
+
+  if (count == 0 || !completions) {
+    return FALSE;
+  }
+
+  if (count == 1) {
+    /* Single completion - insert it */
+    const char *completion = completions[0];
+    int i;
+
+    /* Delete the prefix we're replacing */
+    for (i = 0; i < prefix_len; i++) {
+      mirb_buffer_delete_back(&ed->buf);
+    }
+
+    /* Insert completion */
+    mirb_buffer_insert_string(&ed->buf, completion, strlen(completion));
+  }
+  else {
+    /* Multiple completions - find common prefix and show options */
+    int common_len = (int)strlen(completions[0]);
+    int i, j;
+
+    /* Find longest common prefix */
+    for (i = 1; i < count; i++) {
+      for (j = 0; j < common_len && completions[i][j]; j++) {
+        if (completions[0][j] != completions[i][j]) {
+          common_len = j;
+          break;
+        }
+      }
+      if (j < common_len) common_len = j;
+    }
+
+    if (common_len > prefix_len) {
+      /* Extend with common prefix */
+      for (i = 0; i < prefix_len; i++) {
+        mirb_buffer_delete_back(&ed->buf);
+      }
+      mirb_buffer_insert_string(&ed->buf, completions[0], common_len);
+    }
+    else {
+      /* Show all completions */
+      printf("\r\n");
+      for (i = 0; i < count; i++) {
+        printf("%s  ", completions[i]);
+        if ((i + 1) % 4 == 0 && i + 1 < count) printf("\r\n");
+      }
+      printf("\r\n");
+      /* Force full redraw */
+      ed->prev_line_count = 0;
+    }
+  }
+
+  /* Free completions */
+  if (ed->tab_complete_free) {
+    ed->tab_complete_free(completions, count, ed->tab_complete_data);
+  }
+
+  return TRUE;
 }
 
 /*
@@ -256,18 +585,48 @@ mirb_editor_supported(mirb_editor *ed)
 }
 
 /*
+ * Calculate prompt length for given line
+ */
+static size_t
+calc_prompt_len(mirb_editor *ed, size_t line_idx)
+{
+  if (ed->prompt_fmt != NULL) {
+    /* Format string: calculate actual length */
+    int line_num = ed->line_num_base + (int)line_idx;
+    const char *fmt = (line_idx == 0) ? ed->prompt_fmt : ed->prompt_cont_fmt;
+    return (size_t)snprintf(NULL, 0, fmt, line_num);
+  }
+  else {
+    /* Fixed prompt string */
+    return (line_idx == 0) ? ed->prompt_len : ed->prompt_cont_len;
+  }
+}
+
+/*
  * Print prompt for given line
  */
 static void
 print_prompt(mirb_editor *ed, size_t line_idx)
 {
-  const char *p = (line_idx == 0) ? ed->prompt : ed->prompt_cont;
+  int line_num = ed->line_num_base + (int)line_idx;
 
   if (ed->use_color) {
-    printf("%s%s%s", COLOR_GREEN, p, COLOR_RESET);
+    printf("%s", COLOR_GREEN);
+  }
+
+  if (ed->prompt_fmt != NULL) {
+    /* Use format string with line number */
+    const char *fmt = (line_idx == 0) ? ed->prompt_fmt : ed->prompt_cont_fmt;
+    printf(fmt, line_num);
   }
   else {
+    /* Use fixed prompt string */
+    const char *p = (line_idx == 0) ? ed->prompt : ed->prompt_cont;
     printf("%s", p);
+  }
+
+  if (ed->use_color) {
+    printf("%s", COLOR_RESET);
   }
 }
 
@@ -282,7 +641,6 @@ print_prompt(mirb_editor *ed, size_t line_idx)
 static void
 refresh_display(mirb_editor *ed)
 {
-  size_t prompt_len;
   size_t lines_to_go_up;
 
   /* Calculate how many lines up we need to go to reach start of input */
@@ -316,8 +674,8 @@ refresh_display(mirb_editor *ed)
     mirb_term_cursor_up((int)lines_up_from_end);
   }
 
-  /* Position column on cursor line */
-  prompt_len = (ed->buf.cursor_line == 0) ? ed->prompt_len : ed->prompt_cont_len;
+  /* Position column on cursor line (calculate actual prompt length) */
+  size_t prompt_len = calc_prompt_len(ed, ed->buf.cursor_line);
   mirb_term_cursor_col((int)(prompt_len + ed->buf.cursor_col + 1));
 
   /* Update tracking */
@@ -336,28 +694,100 @@ handle_key(mirb_editor *ed, int key, mirb_edit_result *result)
 {
   switch (key) {
   case MIRB_KEY_ENTER:
-    /* Check if input is complete */
-    if (ed->check_complete) {
-      char *code = mirb_buffer_to_string(&ed->buf);
-      if (code) {
-        mrb_bool complete = ed->check_complete(code, ed->check_complete_data);
-        if (!complete) {
-          /* Calculate indent level before adding newline */
+    /* Stop history browsing */
+    mirb_history_browse_stop(&ed->hist);
+    /* Re-indent current line before inserting newline */
+    reindent_line(&ed->buf);
+    {
+      /*
+       * Smart Enter behavior:
+       * - Only evaluate when cursor is at end of last line and code is complete
+       * - If cursor is not at end of last line, always insert/split (no evaluation)
+       * - If next line is blank last line and cursor at end, move to it
+       */
+      mrb_bool at_last_line = (ed->buf.cursor_line == ed->buf.line_count - 1);
+      mirb_line *current_line = &ed->buf.lines[ed->buf.cursor_line];
+      mrb_bool at_end_of_line = (ed->buf.cursor_col == current_line->len);
+      mrb_bool can_evaluate = at_last_line && at_end_of_line;
+
+      /* Check for smart navigation to existing blank last line */
+      if (!at_last_line && at_end_of_line) {
+        size_t next_line_idx = ed->buf.cursor_line + 1;
+        mrb_bool next_is_last = (next_line_idx == ed->buf.line_count - 1);
+
+        if (next_is_last) {
+          mirb_line *next_line = &ed->buf.lines[next_line_idx];
+          if (is_line_blank(next_line)) {
+            /* Move to existing blank last line with proper indentation */
+            char *code = mirb_buffer_to_string(&ed->buf);
+            int indent = code ? calc_indent_level(code) : 0;
+            free(code);
+
+            mirb_buffer_cursor_down(&ed->buf);
+            /* Clear existing whitespace and set correct indent */
+            mirb_line *line = &ed->buf.lines[ed->buf.cursor_line];
+            line->len = 0;
+            line->data[0] = '\0';
+            ed->buf.cursor_col = 0;
+            for (int i = 0; i < indent * 2; i++) {
+              mirb_buffer_insert_char(&ed->buf, ' ');
+            }
+            return TRUE;
+          }
+        }
+      }
+
+      /* If cursor in middle of line and next is blank last, remove it before split */
+      if (!at_last_line && !at_end_of_line) {
+        size_t next_line_idx = ed->buf.cursor_line + 1;
+        if (next_line_idx == ed->buf.line_count - 1) {
+          mirb_line *next_line = &ed->buf.lines[next_line_idx];
+          if (is_line_blank(next_line)) {
+            mirb_buffer_delete_line(&ed->buf, next_line_idx);
+          }
+        }
+      }
+
+      /* Check if input is complete - only when cursor at end of last line */
+      if (can_evaluate && ed->check_complete) {
+        char *code = mirb_buffer_to_string(&ed->buf);
+        if (code) {
+          mrb_bool complete = ed->check_complete(code, ed->check_complete_data);
+          if (complete) {
+            free(code);
+            *result = MIRB_EDIT_OK;
+            return FALSE;
+          }
+          /* Code not complete - add new line with indentation */
           int indent = calc_indent_level(code);
           free(code);
-          /* Add newline and continue editing */
           mirb_buffer_newline(&ed->buf);
-          /* Insert indentation spaces (2 spaces per level) */
           for (int i = 0; i < indent * 2; i++) {
             mirb_buffer_insert_char(&ed->buf, ' ');
           }
           return TRUE;
         }
-        free(code);
+      }
+
+      /* Not at end of last line - just insert/split with appropriate indent */
+      {
+        char *partial = mirb_buffer_to_string_upto_line(&ed->buf, ed->buf.cursor_line);
+        int indent = partial ? calc_indent_level(partial) : 0;
+        free(partial);
+        mirb_buffer_newline(&ed->buf);
+
+        /* Check if new line starts with dedenting keyword */
+        mirb_line *new_line = &ed->buf.lines[ed->buf.cursor_line];
+        if (is_dedent_keyword(new_line->data)) {
+          if (indent > 0) indent--;
+        }
+
+        for (int i = 0; i < indent * 2; i++) {
+          mirb_buffer_insert_char(&ed->buf, ' ');
+        }
+        return TRUE;
       }
     }
-    *result = MIRB_EDIT_OK;
-    return FALSE;
 
   case MIRB_KEY_CTRL_C:
     *result = MIRB_EDIT_INTERRUPT;
@@ -392,12 +822,40 @@ handle_key(mirb_editor *ed, int key, mirb_edit_result *result)
 
   case MIRB_KEY_UP:
   case MIRB_KEY_CTRL_P:
-    mirb_buffer_cursor_up(&ed->buf);
+    /* If on first line, navigate history; otherwise move cursor up */
+    if (ed->buf.cursor_line == 0) {
+      /* Start history browsing if not already */
+      if (!ed->hist.browsing) {
+        char *current = mirb_buffer_to_string(&ed->buf);
+        mirb_history_browse_start(&ed->hist, current);
+        free(current);
+      }
+      const char *prev = mirb_history_prev(&ed->hist);
+      if (prev) {
+        mirb_buffer_set_string(&ed->buf, prev);
+        mirb_buffer_cursor_finish(&ed->buf);
+      }
+    }
+    else {
+      mirb_buffer_cursor_up(&ed->buf);
+    }
     return TRUE;
 
   case MIRB_KEY_DOWN:
   case MIRB_KEY_CTRL_N:
-    mirb_buffer_cursor_down(&ed->buf);
+    /* If on last line, navigate history; otherwise move cursor down */
+    if (ed->buf.cursor_line == ed->buf.line_count - 1) {
+      if (ed->hist.browsing) {
+        const char *next = mirb_history_next(&ed->hist);
+        if (next) {
+          mirb_buffer_set_string(&ed->buf, next);
+          mirb_buffer_cursor_finish(&ed->buf);
+        }
+      }
+    }
+    else {
+      mirb_buffer_cursor_down(&ed->buf);
+    }
     return TRUE;
 
   case MIRB_KEY_HOME:
@@ -444,9 +902,40 @@ handle_key(mirb_editor *ed, int key, mirb_edit_result *result)
     ed->prev_line_count = 0;
     return TRUE;
 
+  case MIRB_KEY_TAB:
+    /* Auto-indent if at start/end of line or preceded by whitespace */
+    {
+      mirb_line *line = &ed->buf.lines[ed->buf.cursor_line];
+      mrb_bool do_indent = FALSE;
+
+      if (ed->buf.cursor_col == 0) {
+        do_indent = TRUE;
+      }
+      else if (ed->buf.cursor_col == line->len) {
+        /* At end of line */
+        do_indent = TRUE;
+      }
+      else {
+        char prev_char = line->data[ed->buf.cursor_col - 1];
+        if (prev_char == ' ' || prev_char == '\t') {
+          do_indent = TRUE;
+        }
+      }
+
+      if (do_indent) {
+        handle_tab_indent(ed);
+      }
+      else {
+        handle_tab_completion(ed);
+      }
+    }
+    return TRUE;
+
   default:
     /* Insert printable characters */
     if (key >= 32 && key < 127) {
+      /* Stop history browsing when user types */
+      mirb_history_browse_stop(&ed->hist);
       mirb_buffer_insert_char(&ed->buf, (char)key);
       /* Check for auto-dedent after typing 'end' or '}' */
       if (should_dedent(&ed->buf, (char)key)) {
@@ -604,4 +1093,13 @@ mirb_editor_read_simple(mirb_editor *ed, char **out_str)
 
   *out_str = total;
   return MIRB_EDIT_OK;
+}
+
+/*
+ * Add entry to history
+ */
+void
+mirb_editor_history_add(mirb_editor *ed, const char *entry)
+{
+  mirb_history_add(&ed->hist, entry);
 }

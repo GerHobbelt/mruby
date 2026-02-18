@@ -193,24 +193,41 @@ mirb_buffer_total_len(mirb_buffer *buf)
 }
 
 /*
+ * Get buffer content up to and including a specific line as string
+ * Caller must free the returned string
+ */
+char *
+mirb_buffer_to_string_upto_line(mirb_buffer *buf, size_t up_to_line)
+{
+  size_t total = 0;
+  size_t lines_to_include = (up_to_line < buf->line_count) ? up_to_line + 1 : buf->line_count;
+
+  for (size_t i = 0; i < lines_to_include; i++) {
+    total += buf->lines[i].len;
+    if (i < lines_to_include - 1) total++;  /* newline */
+  }
+
+  char *str = (char*)malloc(total + 1);
+  if (str == NULL) return NULL;
+
+  char *p = str;
+  for (size_t i = 0; i < lines_to_include; i++) {
+    memcpy(p, buf->lines[i].data, buf->lines[i].len);
+    p += buf->lines[i].len;
+    if (i < lines_to_include - 1) *p++ = '\n';
+  }
+  *p = '\0';
+
+  return str;
+}
+
+/*
  * Get buffer as string
  */
 char *
 mirb_buffer_to_string(mirb_buffer *buf)
 {
-  size_t total = mirb_buffer_total_len(buf);
-  char *str = (char*)malloc(total + 1);
-  if (str == NULL) return NULL;
-
-  char *p = str;
-  for (size_t i = 0; i < buf->line_count; i++) {
-    memcpy(p, buf->lines[i].data, buf->lines[i].len);
-    p += buf->lines[i].len;
-    if (i < buf->line_count - 1) *p++ = '\n';
-  }
-  *p = '\0';
-
-  return str;
+  return mirb_buffer_to_string_upto_line(buf, buf->line_count - 1);
 }
 
 /*
@@ -443,6 +460,36 @@ mirb_buffer_newline(mirb_buffer *buf)
   return TRUE;
 }
 
+/* Delete a line at the given index */
+void
+mirb_buffer_delete_line(mirb_buffer *buf, size_t line_idx)
+{
+  if (line_idx >= buf->line_count) return;
+  if (buf->line_count <= 1) return;  /* Keep at least one line */
+
+  /* Free the line's data */
+  line_free(&buf->lines[line_idx]);
+
+  /* Shift remaining lines down */
+  if (line_idx < buf->line_count - 1) {
+    memmove(&buf->lines[line_idx],
+            &buf->lines[line_idx + 1],
+            sizeof(mirb_line) * (buf->line_count - line_idx - 1));
+  }
+
+  buf->line_count--;
+
+  /* Adjust cursor if needed */
+  if (buf->cursor_line >= buf->line_count) {
+    buf->cursor_line = buf->line_count - 1;
+  }
+  if (buf->cursor_col > buf->lines[buf->cursor_line].len) {
+    buf->cursor_col = buf->lines[buf->cursor_line].len;
+  }
+
+  buf->modified = TRUE;
+}
+
 /*
  * Move cursor left
  */
@@ -659,8 +706,18 @@ mirb_buffer_kill_to_end(mirb_buffer *buf)
     line->len = buf->cursor_col;
     buf->modified = TRUE;
   }
+  else if (line->len == 0 && buf->line_count > 1) {
+    /* Empty line: delete the entire line */
+    save_to_kill(buf, "\n", 1);
+    mirb_buffer_delete_line(buf, buf->cursor_line);
+    /* Adjust cursor to end of previous line if we deleted from middle */
+    if (buf->cursor_line > 0 && buf->cursor_line >= buf->line_count) {
+      buf->cursor_line = buf->line_count - 1;
+    }
+    buf->cursor_col = 0;
+  }
   else if (buf->cursor_line < buf->line_count - 1) {
-    /* At end of line: kill newline (join with next line) */
+    /* At end of non-empty line: kill newline (join with next line) */
     save_to_kill(buf, "\n", 1);
     mirb_buffer_delete_forward(buf);
   }

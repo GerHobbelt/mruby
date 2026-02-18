@@ -11,24 +11,6 @@
 #define ENC_BINARY     "BINARY"
 #define ENC_UTF8       "UTF-8"
 
-#define ENC_COMP_P(enc, enc_lit) \
-  casecmp_p(RSTRING_PTR(enc), RSTRING_LEN(enc), enc_lit, sizeof(enc_lit"")-1)
-
-static mrb_bool
-casecmp_p(const char *s1, mrb_int len1, const char *s2, mrb_int len2)
-{
-  if (len1 != len2) return FALSE;
-
-  const char *e1 = s1 + len1;
-  const char *e2 = s2 + len2;
-  while (s1 < e1 && s2 < e2) {
-    if (*s1 != *s2 && TOUPPER(*s1) != TOUPPER(*s2)) return FALSE;
-    s1++;
-    s2++;
-  }
-  return TRUE;
-}
-
 static mrb_value
 int_chr_binary(mrb_state *mrb, mrb_value num)
 {
@@ -51,36 +33,15 @@ int_chr_utf8(mrb_state *mrb, mrb_value num)
   char utf8[4];
   mrb_int len;
   mrb_value str;
-  uint32_t sb_flag = 0;
 
   if (cp < 0 || 0x10FFFF < cp) {
     mrb_raisef(mrb, E_RANGE_ERROR, "%v out of char range", num);
   }
-  if (cp < 0x80) {
-    utf8[0] = (char)cp;
-    len = 1;
-    sb_flag = MRB_STR_SINGLE_BYTE;
-  }
-  else if (cp < 0x800) {
-    utf8[0] = (char)(0xC0 | (cp >> 6));
-    utf8[1] = (char)(0x80 | (cp & 0x3F));
-    len = 2;
-  }
-  else if (cp < 0x10000) {
-    utf8[0] = (char)(0xE0 |  (cp >> 12));
-    utf8[1] = (char)(0x80 | ((cp >>  6) & 0x3F));
-    utf8[2] = (char)(0x80 | ( cp        & 0x3F));
-    len = 3;
-  }
-  else {
-    utf8[0] = (char)(0xF0 |  (cp >> 18));
-    utf8[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
-    utf8[2] = (char)(0x80 | ((cp >>  6) & 0x3F));
-    utf8[3] = (char)(0x80 | ( cp        & 0x3F));
-    len = 4;
-  }
+  len = mrb_utf8_to_buf(utf8, (uint32_t)cp);
   str = mrb_str_new(mrb, utf8, len);
-  mrb_str_ptr(str)->flags |= sb_flag;
+  if (len == 1) {
+    RSTR_SET_ASCII_FLAG(mrb_str_ptr(str));
+  }
   return str;
 }
 #endif
@@ -894,12 +855,12 @@ int_chr(mrb_state *mrb, mrb_value num)
 
   mrb_get_args(mrb, "|S?", &enc, &enc_given);
   if (!enc_given ||
-      ENC_COMP_P(enc, ENC_ASCII_8BIT) ||
-      ENC_COMP_P(enc, ENC_BINARY)) {
+      MRB_STR_CASECMP_P(enc, ENC_ASCII_8BIT) ||
+      MRB_STR_CASECMP_P(enc, ENC_BINARY)) {
     return int_chr_binary(mrb, num);
   }
 #ifdef MRB_UTF8_STRING
-  else if (ENC_COMP_P(enc, ENC_UTF8)) {
+  else if (MRB_STR_CASECMP_P(enc, ENC_UTF8)) {
     return int_chr_utf8(mrb, num);
   }
 #endif

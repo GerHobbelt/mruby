@@ -50,6 +50,20 @@ str_check_length(mrb_state *mrb, mrb_int len)
 #endif
 }
 
+mrb_bool
+mrb_strcasecmp_p(const char *s1, mrb_int len1, const char *s2, mrb_int len2)
+{
+  if (len1 != len2) return FALSE;
+
+  const char *e1 = s1 + len1;
+  while (s1 < e1) {
+    if (*s1 != *s2 && TOUPPER(*s1) != TOUPPER(*s2)) return FALSE;
+    s1++;
+    s2++;
+  }
+  return TRUE;
+}
+
 static struct RString*
 str_init_normal_capa(mrb_state *mrb, struct RString *s,
                      const char *p, mrb_int len, mrb_int capa)
@@ -315,6 +329,39 @@ mrb_gc_free_str(mrb_state *mrb, struct RString *str)
 #define bitint uint32_t
 #define MASK01 0x01010101ul
 #endif
+
+/*
+ * Encode a Unicode codepoint to UTF-8 bytes.
+ * buf must have at least 4 bytes of space.
+ * Returns the number of bytes written (1-4), or 0 for invalid codepoint.
+ */
+mrb_int
+mrb_utf8_to_buf(char *buf, uint32_t cp)
+{
+  if (cp < 0x80) {
+    buf[0] = (char)cp;
+    return 1;
+  }
+  else if (cp < 0x800) {
+    buf[0] = (char)(0xC0 | (cp >> 6));
+    buf[1] = (char)(0x80 | (cp & 0x3F));
+    return 2;
+  }
+  else if (cp < 0x10000) {
+    buf[0] = (char)(0xE0 | (cp >> 12));
+    buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    buf[2] = (char)(0x80 | (cp & 0x3F));
+    return 3;
+  }
+  else if (cp <= 0x10FFFF) {
+    buf[0] = (char)(0xF0 | (cp >> 18));
+    buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    buf[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+  }
+  return 0;  /* invalid codepoint */
+}
 
 #ifdef MRB_UTF8_STRING
 

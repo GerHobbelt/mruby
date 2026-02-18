@@ -36,6 +36,7 @@
 #endif
 
 #include "mirb_editor.h"
+#include "mirb_completion.h"
 
 /* obsolete configuration */
 #ifdef DISABLE_MIRB_UNDERSCORE
@@ -425,6 +426,24 @@ mirb_check_code_complete(const char *code, void *user_data)
   return complete;
 }
 
+/* Tab completion callback for editor */
+static int
+mirb_tab_complete(const char *line, int cursor_pos,
+                  char ***completions_out, int *prefix_len_out,
+                  void *user_data)
+{
+  (void)user_data;
+  return mirb_get_completions(line, cursor_pos, completions_out, prefix_len_out);
+}
+
+/* Free tab completions */
+static void
+mirb_tab_complete_free(char **completions, int count, void *user_data)
+{
+  (void)user_data;
+  mirb_free_completions(completions, count);
+}
+
 static void
 ctrl_c_handler(int signo)
 {
@@ -534,6 +553,9 @@ main(int argc, char **argv)
     check_data.mrb = mrb;
     check_data.cxt = cxt;
     mirb_editor_set_check_complete(&editor, mirb_check_code_complete, &check_data);
+    /* Setup tab completion */
+    mirb_setup_editor_completion(mrb, cxt);
+    mirb_editor_set_tab_complete(&editor, mirb_tab_complete, mirb_tab_complete_free, NULL);
     /* Enable colored prompts if terminal supports it */
     if (isatty(fileno(stdout))) {
       const char *term = getenv("TERM");
@@ -557,12 +579,9 @@ main(int argc, char **argv)
     if (use_editor && mirb_editor_supported(&editor)) {
       /* Use multi-line editor */
       char *input;
-      char prompt[16], prompt_cont[16];
       mirb_edit_result res;
 
-      snprintf(prompt, sizeof(prompt), "%d> ", line_num);
-      snprintf(prompt_cont, sizeof(prompt_cont), "%d* ", line_num);
-      mirb_editor_set_prompts(&editor, prompt, prompt_cont);
+      mirb_editor_set_prompt_format(&editor, "%d> ", "%d* ", line_num);
 
       res = mirb_editor_read(&editor, &input);
 
@@ -750,6 +769,10 @@ main(int argc, char **argv)
           *(mrb->c->ci->stack + 1) = result;
 #endif
         }
+        /* Add to history after evaluation (success or error) */
+        if (use_editor) {
+          mirb_editor_history_add(&editor, ruby_code);
+        }
       }
       ruby_code[0] = '\0';
       last_code_line[0] = '\0';
@@ -772,6 +795,7 @@ main(int argc, char **argv)
 
   /* Cleanup editor */
   if (use_editor) {
+    mirb_cleanup_editor_completion();
     mirb_editor_cleanup(&editor);
   }
 

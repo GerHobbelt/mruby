@@ -23,6 +23,7 @@ enum mirb_key {
   MIRB_KEY_CTRL_D = 4,
   MIRB_KEY_CTRL_E = 5,
   MIRB_KEY_CTRL_F = 6,
+  MIRB_KEY_TAB = 9,
   MIRB_KEY_CTRL_K = 11,
   MIRB_KEY_CTRL_L = 12,
   MIRB_KEY_ENTER = 13,
@@ -106,12 +107,6 @@ void mirb_term_clear_line(void);     /* clear entire current line */
 void mirb_term_clear_to_end(void);   /* clear from cursor to end of line */
 void mirb_term_clear_screen(void);   /* clear entire screen */
 void mirb_term_clear_below(void);    /* clear from cursor to end of screen */
-
-/*
- * Cursor position save/restore
- */
-void mirb_term_save_cursor(void);
-void mirb_term_restore_cursor(void);
 
 /*
  * Update terminal size information

@@ -368,7 +368,7 @@ node_type_p(node *n, enum node_type type)
 
 /* Helper functions for variable-sized node detection */
 static enum node_type
-get_node_type(node *n)
+node_type(node *n)
 {
   if (!n) return (enum node_type)0;
 
@@ -594,6 +594,127 @@ new_case(parser_state *p, node *a, node *b)
   n->value = a;
   n->body = b;
 
+  return (node*)n;
+}
+
+/* Pattern matching case/in expression */
+static node*
+new_case_match(parser_state *p, node *val, node *in_clauses)
+{
+  void_expr_error(p, val);
+
+  struct mrb_ast_case_match_node *n = NEW_NODE(case_match, NODE_CASE_MATCH);
+  n->value = val;
+  n->in_clauses = in_clauses;
+
+  return (node*)n;
+}
+
+/* Create value pattern node */
+static node*
+new_pat_value(parser_state *p, node *val)
+{
+  struct mrb_ast_pat_value_node *n = NEW_NODE(pat_value, NODE_PAT_VALUE);
+  n->value = val;
+  return (node*)n;
+}
+
+/* Create variable pattern node */
+static node*
+new_pat_var(parser_state *p, mrb_sym name)
+{
+  struct mrb_ast_pat_var_node *n = NEW_NODE(pat_var, NODE_PAT_VAR);
+  n->name = name;
+  /* Register as local variable if not wildcard */
+  if (name) {
+    local_add(p, name);
+  }
+  return (node*)n;
+}
+
+/* Create pin pattern node (^var) */
+static node*
+new_pat_pin(parser_state *p, mrb_sym name)
+{
+  struct mrb_ast_pat_pin_node *n = NEW_NODE(pat_pin, NODE_PAT_PIN);
+  n->name = name;
+  /* Pin operator references existing variable, does not create new binding */
+  return (node*)n;
+}
+
+/* Create as pattern node (pattern => var) */
+static node*
+new_pat_as(parser_state *p, node *pattern, mrb_sym name)
+{
+  struct mrb_ast_pat_as_node *n = NEW_NODE(pat_as, NODE_PAT_AS);
+  n->pattern = pattern;
+  n->name = name;
+  local_add(p, name);
+  return (node*)n;
+}
+
+/* Create alternative pattern node (pat1 | pat2) */
+static node*
+new_pat_alt(parser_state *p, node *left, node *right)
+{
+  struct mrb_ast_pat_alt_node *n = NEW_NODE(pat_alt, NODE_PAT_ALT);
+  n->left = left;
+  n->right = right;
+  return (node*)n;
+}
+
+/* Create array pattern node [a, b, *rest, c] */
+static node*
+new_pat_array(parser_state *p, node *pre, node *rest, node *post)
+{
+  struct mrb_ast_pat_array_node *n = NEW_NODE(pat_array, NODE_PAT_ARRAY);
+  n->pre = pre;
+  n->rest = rest;
+  n->post = post;
+  return (node*)n;
+}
+
+/* Create find pattern node [*pre, elems, *post] */
+static node*
+new_pat_find(parser_state *p, node *pre, node *elems, node *post)
+{
+  struct mrb_ast_pat_find_node *n = NEW_NODE(pat_find, NODE_PAT_FIND);
+  n->pre = pre;
+  n->elems = elems;
+  n->post = post;
+  return (node*)n;
+}
+
+/* Create hash pattern node {a:, b: x, **rest} */
+static node*
+new_pat_hash(parser_state *p, node *pairs, node *rest)
+{
+  struct mrb_ast_pat_hash_node *n = NEW_NODE(pat_hash, NODE_PAT_HASH);
+  n->pairs = pairs;
+  n->rest = rest;
+  return (node*)n;
+}
+
+/* Create one-line pattern matching node (expr in pattern / expr => pattern) */
+static node*
+new_match_pat(parser_state *p, node *value, node *pattern, mrb_bool raise_on_fail)
+{
+  struct mrb_ast_match_pat_node *n = NEW_NODE(match_pat, NODE_MATCH_PAT);
+  n->value = value;
+  n->pattern = pattern;
+  n->raise_on_fail = raise_on_fail;
+  return (node*)n;
+}
+
+/* Create in-clause node for case/in */
+static node*
+new_in(parser_state *p, node *pattern, node *guard, node *body, mrb_bool guard_is_unless)
+{
+  struct mrb_ast_in_node *n = NEW_NODE(in, NODE_IN);
+  n->pattern = pattern;
+  n->guard = guard;
+  n->body = body;
+  n->guard_is_unless = guard_is_unless;
   return (node*)n;
 }
 
@@ -997,7 +1118,7 @@ static void
 local_add_margs(parser_state *p, node *n)
 {
   while (n) {
-    if (get_node_type(n->car) == NODE_MARG) {
+    if (node_type(n->car) == NODE_MARG) {
       struct mrb_ast_masgn_node *masgn_n = (struct mrb_ast_masgn_node*)n->car;
       node *rhs = masgn_n->rhs;
 
@@ -1717,7 +1838,7 @@ ret_args(parser_state *p, node *n)
 static void
 assignable(parser_state *p, node *lhs)
 {
-  switch (get_node_type(lhs)) {
+  switch (node_type(lhs)) {
   case NODE_LVAR:
     local_add(p, var_node(lhs)->symbol);
     break;
@@ -1814,7 +1935,7 @@ parsing_heredoc_info(parser_state *p)
   node *nd = p->parsing_heredoc;
   if (nd == NULL) return NULL;
   /* mrb_assert(nd->car->car == NODE_HEREDOC); */
-  if (get_node_type(nd->car) == NODE_HEREDOC) {
+  if (node_type(nd->car) == NODE_HEREDOC) {
     /* Variable-sized heredoc node - return address of embedded info struct */
     struct mrb_ast_heredoc_node *heredoc = (struct mrb_ast_heredoc_node*)nd->car;
     return &heredoc->info;
@@ -1856,7 +1977,7 @@ prohibit_literals(parser_state *p, node *n)
     yyerror(NULL, p, "can't define singleton method for ().");
   }
   else {
-    enum node_type nt = get_node_type(n);
+    enum node_type nt = node_type(n);
     switch (nt) {
     case NODE_INT:
     case NODE_STR:
@@ -1983,6 +2104,9 @@ prohibit_literals(parser_state *p, node *n)
 %type <nd> args_tail opt_args_tail f_kwarg f_kw
 %type <nd> f_block_kwarg f_block_kw block_args_tail opt_block_args_tail
 %type <id> f_label f_kwrest
+
+/* pattern matching */
+%type <nd> in_clauses p_expr p_alt p_value p_var p_as p_array p_array_body p_array_elems p_rest p_hash p_hash_body p_hash_elems p_hash_elem p_kwrest p_args_head p_args_post p_const
 
 %token tUPLUS             "unary plus"
 %token tUMINUS            "unary minus"
@@ -2211,12 +2335,6 @@ stmt            : keyword_alias fsym {p->lstate = EXPR_FNAME;} fsym
                     {
                       $$ = new_masgn(p, $1, new_array(p, $3));
                     }
-                | arg tASSOC tIDENTIFIER
-                    {
-                      node *lhs = new_lvar(p, $3);
-                      assignable(p, lhs);
-                      $$ = new_asgn(p, lhs, $1);
-                    }
                 | expr
                 ;
 
@@ -2316,6 +2434,18 @@ expr            : command_call
                 | '!' command_call
                     {
                       $$ = call_uni_op(p, cond($2), "!");
+                    }
+                | arg tASSOC {p->in_kwarg++;} p_expr
+                    {
+                      /* expr => pattern (raises NoMatchingPatternError on failure) */
+                      p->in_kwarg--;
+                      $$ = new_match_pat(p, $1, $4, TRUE);
+                    }
+                | arg keyword_in {p->in_kwarg++;} p_expr
+                    {
+                      /* expr in pattern (returns true/false) */
+                      p->in_kwarg--;
+                      $$ = new_match_pat(p, $1, $4, FALSE);
                     }
                 | arg
                 ;
@@ -3247,6 +3377,33 @@ primary         : literal
                     {
                       $$ = new_case(p, 0, $3);
                     }
+                | keyword_case expr_value opt_terms
+                  keyword_in p_expr then
+                  compstmt
+                  in_clauses
+                  keyword_end
+                    {
+                      node *in_clause = new_in(p, $5, NULL, $7, FALSE);
+                      $$ = new_case_match(p, $2, cons(in_clause, $8));
+                    }
+                | keyword_case expr_value opt_terms
+                  keyword_in p_expr modifier_if expr_value then
+                  compstmt
+                  in_clauses
+                  keyword_end
+                    {
+                      node *in_clause = new_in(p, $5, $7, $9, FALSE);
+                      $$ = new_case_match(p, $2, cons(in_clause, $10));
+                    }
+                | keyword_case expr_value opt_terms
+                  keyword_in p_expr modifier_unless expr_value then
+                  compstmt
+                  in_clauses
+                  keyword_end
+                    {
+                      node *in_clause = new_in(p, $5, $7, $9, TRUE);
+                      $$ = new_case_match(p, $2, cons(in_clause, $10));
+                    }
                 | keyword_for for_var keyword_in
                   {COND_PUSH(1);}
                   expr_value do
@@ -3716,6 +3873,304 @@ cases           : opt_else
                       }
                     }
                 | case_body
+                ;
+
+/* Pattern matching in-clauses for case/in */
+/* in_kwarg is set by lexer when keyword_in is returned */
+in_clauses      : opt_else
+                    {
+                      $$ = $1 ? list1(new_in(p, NULL, NULL, $1, FALSE)) : 0;
+                    }
+                | keyword_in p_expr {p->in_kwarg--;} then compstmt in_clauses
+                    {
+                      node *in_clause = new_in(p, $2, NULL, $5, FALSE);
+                      $$ = cons(in_clause, $6);
+                    }
+                | keyword_in p_expr {p->in_kwarg--;} modifier_if expr_value then compstmt in_clauses
+                    {
+                      node *in_clause = new_in(p, $2, $5, $7, FALSE);
+                      $$ = cons(in_clause, $8);
+                    }
+                | keyword_in p_expr {p->in_kwarg--;} modifier_unless expr_value then compstmt in_clauses
+                    {
+                      node *in_clause = new_in(p, $2, $5, $7, TRUE);
+                      $$ = cons(in_clause, $8);
+                    }
+                ;
+
+/* Pattern expressions for case/in */
+/* Bracket-less array patterns: in 1, 2, x is same as in [1, 2, x] */
+/* Brace-less hash patterns: in a:, b: x is same as in {a:, b: x} */
+p_expr          : p_as
+                | p_args_head p_as
+                    {
+                      $$ = new_pat_array(p, push($1, $2), 0, 0);
+                    }
+                | p_args_head p_rest
+                    {
+                      $$ = new_pat_array(p, $1, $2, 0);
+                    }
+                | p_args_head p_rest ',' p_args_post
+                    {
+                      $$ = new_pat_array(p, $1, $2, $4);
+                    }
+                | p_rest
+                    {
+                      $$ = new_pat_array(p, 0, $1, 0);
+                    }
+                | p_rest ',' p_args_post
+                    {
+                      $$ = new_pat_array(p, 0, $1, $3);
+                    }
+                | p_hash_elems
+                    {
+                      /* Brace-less hash pattern: in a:, b: x */
+                      $$ = new_pat_hash(p, $1, 0);
+                    }
+                | p_hash_elems ',' p_kwrest
+                    {
+                      /* Brace-less hash pattern with kwrest: in a:, **rest */
+                      $$ = new_pat_hash(p, $1, $3);
+                    }
+                | p_kwrest
+                    {
+                      /* Brace-less kwrest only: in **rest */
+                      $$ = new_pat_hash(p, 0, $1);
+                    }
+                ;
+
+/* Comma-separated pattern list (prefix) */
+p_args_head     : p_as ','
+                    {
+                      $$ = list1($1);
+                    }
+                | p_args_head p_as ','
+                    {
+                      $$ = push($1, $2);
+                    }
+                ;
+
+/* Comma-separated pattern list (suffix, no trailing comma) */
+p_args_post     : p_as
+                    {
+                      $$ = list1($1);
+                    }
+                | p_args_post ',' p_as
+                    {
+                      $$ = push($1, $3);
+                    }
+                ;
+
+p_as            : p_alt
+                | p_alt tASSOC tIDENTIFIER
+                    {
+                      $$ = new_pat_as(p, $1, $3);
+                    }
+                ;
+
+p_alt           : p_value
+                | p_alt '|' p_value
+                    {
+                      $$ = new_pat_alt(p, $1, $3);
+                    }
+                ;
+
+p_value         : p_var
+                | numeric
+                    {
+                      $$ = new_pat_value(p, $1);
+                    }
+                | symbol
+                    {
+                      $$ = new_pat_value(p, $1);
+                    }
+                | tSTRING
+                    {
+                      $$ = new_pat_value(p, $1);
+                    }
+                | keyword_nil
+                    {
+                      $$ = new_pat_value(p, new_nil(p));
+                    }
+                | keyword_true
+                    {
+                      $$ = new_pat_value(p, new_true(p));
+                    }
+                | keyword_false
+                    {
+                      $$ = new_pat_value(p, new_false(p));
+                    }
+                | p_const
+                    {
+                      $$ = new_pat_value(p, $1);
+                    }
+                | p_array
+                | p_hash
+                | '^' tIDENTIFIER
+                    {
+                      $$ = new_pat_pin(p, $2);
+                    }
+                ;
+
+/* Array pattern: [a, b, *rest, c] */
+p_array         : tLBRACK p_array_body ']'
+                    {
+                      $$ = $2;
+                    }
+                | tLBRACK ']'
+                    {
+                      $$ = new_pat_array(p, 0, 0, 0);
+                    }
+                ;
+
+/* Array pattern body - pre elements, optional rest, post elements */
+p_array_body    : p_array_elems
+                    {
+                      /* Just pre elements, no rest */
+                      $$ = new_pat_array(p, $1, 0, 0);
+                    }
+                | p_array_elems ',' p_rest
+                    {
+                      /* Pre elements + rest, no post */
+                      $$ = new_pat_array(p, $1, $3, 0);
+                    }
+                | p_array_elems ',' p_rest ',' p_array_elems
+                    {
+                      /* Pre + rest + post */
+                      $$ = new_pat_array(p, $1, $3, $5);
+                    }
+                | p_rest
+                    {
+                      /* Just rest, no pre or post */
+                      $$ = new_pat_array(p, 0, $1, 0);
+                    }
+                | p_rest ',' p_array_elems
+                    {
+                      /* Rest + post, no pre */
+                      $$ = new_pat_array(p, 0, $1, $3);
+                    }
+                | p_rest ',' p_array_elems ',' p_rest
+                    {
+                      /* Find pattern: [*pre, elems, *post] */
+                      $$ = new_pat_find(p, $1, $3, $5);
+                    }
+                ;
+
+/* Non-rest array pattern elements - use p_as, not p_expr to avoid bracket-less recursion */
+p_array_elems   : p_as
+                    {
+                      $$ = list1($1);
+                    }
+                | p_array_elems ',' p_as
+                    {
+                      $$ = push($1, $3);
+                    }
+                ;
+
+/* Rest pattern in array: *var, *_, or just * */
+p_rest          : tSTAR tIDENTIFIER
+                    {
+                      $$ = new_pat_var(p, $2);
+                    }
+                | tSTAR
+                    {
+                      /* Anonymous rest pattern */
+                      $$ = (node*)-1;
+                    }
+                ;
+
+/* Constant path for pattern matching: Foo, Foo::Bar, ::Foo */
+p_const         : tCONSTANT
+                    {
+                      $$ = new_const(p, $1);
+                    }
+                | p_const tCOLON2 tCONSTANT
+                    {
+                      $$ = new_colon2(p, $1, $3);
+                    }
+                | tCOLON3 tCONSTANT
+                    {
+                      $$ = new_colon3(p, $2);
+                    }
+                ;
+
+/* Hash pattern: {a:, b: x, **rest} */
+p_hash          : tLBRACE p_hash_body '}'
+                    {
+                      $$ = $2;
+                    }
+                | tLBRACE '}'
+                    {
+                      $$ = new_pat_hash(p, 0, 0);
+                    }
+                ;
+
+/* Hash pattern body - pairs and optional kwrest */
+p_hash_body     : p_hash_elems
+                    {
+                      $$ = new_pat_hash(p, $1, 0);
+                    }
+                | p_hash_elems ',' p_kwrest
+                    {
+                      $$ = new_pat_hash(p, $1, $3);
+                    }
+                | p_kwrest
+                    {
+                      $$ = new_pat_hash(p, 0, $1);
+                    }
+                ;
+
+/* Hash pattern element list */
+p_hash_elems    : p_hash_elem
+                    {
+                      $$ = list1($1);
+                    }
+                | p_hash_elems ',' p_hash_elem
+                    {
+                      $$ = push($1, $3);
+                    }
+                ;
+
+/* Hash pattern element: key: pattern or key: (shorthand) */
+/* Use p_as, not p_expr to avoid brace-less recursion inside hash patterns */
+p_hash_elem     : tIDENTIFIER tLABEL_TAG p_as
+                    {
+                      /* {key: pattern} */
+                      $$ = cons(new_sym(p, $1), $3);
+                    }
+                | tIDENTIFIER tLABEL_TAG
+                    {
+                      /* {key:} shorthand - binds to variable with same name */
+                      $$ = cons(new_sym(p, $1), new_pat_var(p, $1));
+                    }
+                | symbol tASSOC p_as
+                    {
+                      /* {:"key" => pattern} or {:key => pattern} */
+                      $$ = cons($1, $3);
+                    }
+                ;
+
+/* Keyword rest pattern: **var, **nil, or ** */
+p_kwrest        : tDSTAR tIDENTIFIER
+                    {
+                      $$ = new_pat_var(p, $2);
+                    }
+                | tDSTAR keyword_nil
+                    {
+                      /* **nil - exact match, no extra keys allowed */
+                      $$ = (node*)-1;
+                    }
+                | tDSTAR
+                    {
+                      /* ** - anonymous rest, discards extra keys */
+                      $$ = (node*)-2;
+                    }
+                ;
+
+p_var           : tIDENTIFIER
+                    {
+                      $$ = new_pat_var(p, $1);
+                    }
                 ;
 
 opt_rescue      : keyword_rescue exc_list exc_var then
@@ -4920,30 +5375,8 @@ tokadd(parser_state *p, int32_t c)
     len = 1;
   }
   else {
-    /* Unicode character */
-    c = -c;
-    if (c < 0x80) {
-      utf8[0] = (char)c;
-      len = 1;
-    }
-    else if (c < 0x800) {
-      utf8[0] = (char)(0xC0 | (c >> 6));
-      utf8[1] = (char)(0x80 | (c & 0x3F));
-      len = 2;
-    }
-    else if (c < 0x10000) {
-      utf8[0] = (char)(0xE0 |  (c >> 12)        );
-      utf8[1] = (char)(0x80 | ((c >>  6) & 0x3F));
-      utf8[2] = (char)(0x80 | ( c        & 0x3F));
-      len = 3;
-    }
-    else {
-      utf8[0] = (char)(0xF0 |  (c >> 18)        );
-      utf8[1] = (char)(0x80 | ((c >> 12) & 0x3F));
-      utf8[2] = (char)(0x80 | ((c >>  6) & 0x3F));
-      utf8[3] = (char)(0x80 | ( c        & 0x3F));
-      len = 4;
-    }
+    /* Unicode character (negative c indicates codepoint) */
+    len = (int)mrb_utf8_to_buf(utf8, (uint32_t)(-c));
   }
   if (p->tidx+len >= p->tsiz) {
     if (p->tsiz >= MRB_PARSER_TOKBUF_MAX) {
@@ -4996,7 +5429,7 @@ toklen(parser_state *p)
 #define IS_END() (p->lstate == EXPR_END || p->lstate == EXPR_ENDARG || p->lstate == EXPR_ENDFN)
 #define IS_BEG() (p->lstate == EXPR_BEG || p->lstate == EXPR_MID || p->lstate == EXPR_VALUE || p->lstate == EXPR_CLASS)
 #define IS_SPCARG(c) (IS_ARG() && space_seen && !ISSPACE(c))
-#define IS_LABEL_POSSIBLE() ((p->lstate == EXPR_BEG && !cmd_state) || IS_ARG())
+#define IS_LABEL_POSSIBLE() ((p->lstate == EXPR_BEG && !cmd_state) || IS_ARG() || p->lstate == EXPR_VALUE)
 #define IS_LABEL_SUFFIX(n) (peek_n(p, ':',(n)) && !peek_n(p, ':', (n)+1))
 
 static int32_t
@@ -6458,7 +6891,8 @@ parser_yylex(parser_state *p)
     }
     if (!space_seen && IS_END()) {
       pushback(p, c);
-      p->lstate = EXPR_BEG;
+      /* In pattern matching context, use EXPR_ARG so newlines are significant */
+      p->lstate = p->in_kwarg ? EXPR_ARG : EXPR_BEG;
       return tLABEL_TAG;
     }
     if (IS_END() || ISSPACE(c) || c == '#') {
@@ -6960,6 +7394,10 @@ parser_yylex(parser_state *p)
               return keyword_do_block;
             return keyword_do;
           }
+          if (kw->id[0] == keyword_in) {
+            /* Set in_kwarg for pattern matching context */
+            p->in_kwarg++;
+          }
           if (state == EXPR_BEG || state == EXPR_VALUE || state == EXPR_CLASS)
             return kw->id[0];
           else {
@@ -7021,6 +7459,7 @@ parser_init_cxt(parser_state *p, mrb_ccontext *cxt)
   p->capture_errors = cxt->capture_errors;
   p->no_optimize = cxt->no_optimize;
   p->no_ext_ops = cxt->no_ext_ops;
+  p->no_return_value = cxt->no_return_value;
   p->upper = cxt->upper;
   if (cxt->partial_hook) {
     p->cxt = cxt;
@@ -7650,14 +8089,14 @@ dump_node(mrb_state *mrb, node *tree, int offset)
   if (!tree) return;
 
   /* Extract line number from variable-sized node header */
-  if (get_node_type(tree) != NODE_LAST) {
+  if (node_type(tree) != NODE_LAST) {
     lineno = ((struct mrb_ast_var_header*)tree)->lineno;
   }
 
   dump_prefix(offset, lineno);
 
   /* All nodes are now variable-sized nodes with headers */
-  nodetype = get_node_type(tree);
+  nodetype = node_type(tree);
 
   switch (nodetype) {
   /* Variable-sized node cases */
@@ -7813,7 +8252,7 @@ dump_node(mrb_state *mrb, node *tree, int offset)
 
   case NODE_MASGN:
   case NODE_MARG:
-    printf("%s:\n", get_node_type(tree) == NODE_MASGN ? "NODE_MASGN" : "NODE_MARG");
+    printf("%s:\n", node_type(tree) == NODE_MASGN ? "NODE_MASGN" : "NODE_MARG");
     /* Handle pre-splat variables */
     if (masgn_node(tree)->pre) {
       dump_prefix(offset+1, lineno);
@@ -8351,6 +8790,137 @@ dump_node(mrb_state *mrb, node *tree, int offset)
       dump_prefix(offset+1, lineno);
       printf("remove_indent: true\n");
     }
+    break;
+
+  case NODE_CASE_MATCH:
+    printf("NODE_CASE_MATCH:\n");
+    if (case_match_node(tree)->value) {
+      dump_prefix(offset+1, lineno);
+      printf("value:\n");
+      dump_node(mrb, case_match_node(tree)->value, offset+2);
+    }
+    if (case_match_node(tree)->in_clauses) {
+      node *in_clause = case_match_node(tree)->in_clauses;
+      while (in_clause) {
+        dump_node(mrb, in_clause->car, offset+1);
+        in_clause = in_clause->cdr;
+      }
+    }
+    break;
+
+  case NODE_IN:
+    printf("NODE_IN:\n");
+    if (in_node(tree)->pattern) {
+      dump_prefix(offset+1, lineno);
+      printf("pattern:\n");
+      dump_node(mrb, in_node(tree)->pattern, offset+2);
+    }
+    if (in_node(tree)->guard) {
+      dump_prefix(offset+1, lineno);
+      printf("guard (%s):\n", in_node(tree)->guard_is_unless ? "unless" : "if");
+      dump_node(mrb, in_node(tree)->guard, offset+2);
+    }
+    if (in_node(tree)->body) {
+      dump_prefix(offset+1, lineno);
+      printf("body:\n");
+      dump_node(mrb, in_node(tree)->body, offset+2);
+    }
+    break;
+
+  case NODE_PAT_VALUE:
+    printf("NODE_PAT_VALUE:\n");
+    if (pat_value_node(tree)->value) {
+      dump_node(mrb, pat_value_node(tree)->value, offset+1);
+    }
+    break;
+
+  case NODE_PAT_VAR:
+    if (pat_var_node(tree)->name) {
+      printf("NODE_PAT_VAR: %s\n", mrb_sym_dump(mrb, pat_var_node(tree)->name));
+    }
+    else {
+      printf("NODE_PAT_VAR: _ (wildcard)\n");
+    }
+    break;
+
+  case NODE_PAT_PIN:
+    printf("NODE_PAT_PIN: ^%s\n", mrb_sym_dump(mrb, pat_pin_node(tree)->name));
+    break;
+
+  case NODE_PAT_AS:
+    printf("NODE_PAT_AS: => %s\n", mrb_sym_dump(mrb, pat_as_node(tree)->name));
+    if (pat_as_node(tree)->pattern) {
+      dump_prefix(offset+1, lineno);
+      printf("pattern:\n");
+      dump_node(mrb, pat_as_node(tree)->pattern, offset+2);
+    }
+    break;
+
+  case NODE_PAT_ALT:
+    printf("NODE_PAT_ALT:\n");
+    if (pat_alt_node(tree)->left) {
+      dump_prefix(offset+1, lineno);
+      printf("left:\n");
+      dump_node(mrb, pat_alt_node(tree)->left, offset+2);
+    }
+    if (pat_alt_node(tree)->right) {
+      dump_prefix(offset+1, lineno);
+      printf("right:\n");
+      dump_node(mrb, pat_alt_node(tree)->right, offset+2);
+    }
+    break;
+
+  case NODE_PAT_ARRAY:
+    printf("NODE_PAT_ARRAY:\n");
+    if (pat_array_node(tree)->pre) {
+      dump_prefix(offset+1, lineno);
+      printf("pre:\n");
+      dump_recur(mrb, pat_array_node(tree)->pre, offset+2);
+    }
+    if (pat_array_node(tree)->rest) {
+      dump_prefix(offset+1, lineno);
+      if (pat_array_node(tree)->rest == (node*)-1) {
+        printf("rest: * (anonymous)\n");
+      }
+      else {
+        printf("rest:\n");
+        dump_node(mrb, pat_array_node(tree)->rest, offset+2);
+      }
+    }
+    if (pat_array_node(tree)->post) {
+      dump_prefix(offset+1, lineno);
+      printf("post:\n");
+      dump_recur(mrb, pat_array_node(tree)->post, offset+2);
+    }
+    break;
+
+  case NODE_PAT_HASH:
+    printf("NODE_PAT_HASH:\n");
+    if (pat_hash_node(tree)->pairs) {
+      dump_prefix(offset+1, lineno);
+      printf("pairs:\n");
+      dump_recur(mrb, pat_hash_node(tree)->pairs, offset+2);
+    }
+    if (pat_hash_node(tree)->rest) {
+      dump_prefix(offset+1, lineno);
+      if (pat_hash_node(tree)->rest == (node*)-1) {
+        printf("rest: **nil\n");
+      }
+      else {
+        printf("rest:\n");
+        dump_node(mrb, pat_hash_node(tree)->rest, offset+2);
+      }
+    }
+    break;
+
+  case NODE_MATCH_PAT:
+    printf("NODE_MATCH_PAT%s:\n", match_pat_node(tree)->raise_on_fail ? " (=>)" : " (in)");
+    dump_prefix(offset+1, lineno);
+    printf("value:\n");
+    dump_node(mrb, match_pat_node(tree)->value, offset+2);
+    dump_prefix(offset+1, lineno);
+    printf("pattern:\n");
+    dump_node(mrb, match_pat_node(tree)->pattern, offset+2);
     break;
 
   default:

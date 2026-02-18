@@ -107,7 +107,7 @@ typedef struct {
 
 
 /* Get format specifier info for character c */
-static inline fmt_spec_t get_format_info(unsigned char c) {
+static inline fmt_spec_t get_fmt_spec(unsigned char c) {
   static const fmt_spec_t invalid = {FMT_INVALID, 0, 0};
 
   switch (c) {
@@ -415,7 +415,7 @@ retry:
       mrb_raise(mrb, E_ARGUMENT_ERROR, "malformed format string - unexpected end");
     }
     {
-      fmt_spec_t spec = get_format_info(*p);
+      fmt_spec_t spec = get_fmt_spec(*p);
 
       switch (spec.type) {
         case FMT_INVALID:
@@ -512,42 +512,37 @@ retry:
         case FMT_CHAR: {
           /* CHARACTER FORMATTING (%c) */
           mrb_value val = GETARG();
-          mrb_value tmp;
-          char *c;
+          const char *c;
+          char cbuf[4];  /* stack buffer for character bytes */
+          int clen;
 
-          /* Convert argument to character string */
-          tmp = mrb_check_string_type(mrb, val);
-          if (!mrb_nil_p(tmp)) {
+          if (mrb_integer_p(val)) {
+            /* Integer: encode directly to stack buffer (no allocation) */
+            mrb_int code = mrb_integer(val);
+#ifdef MRB_UTF8_STRING
+            clen = (int)mrb_utf8_to_buf(cbuf, (uint32_t)code);
+            if (clen == 0) clen = 1;  /* invalid codepoint: write single byte */
+#else
+            cbuf[0] = (char)(code & 0xff);
+            clen = 1;
+#endif
+            c = cbuf;
+          }
+          else {
+            /* String: validate and use directly */
+            mrb_value tmp = mrb_check_string_type(mrb, val);
+            if (mrb_nil_p(tmp)) {
+              mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid character");
+            }
             if (RSTRING_LEN(tmp) != 1) {
               mrb_raise(mrb, E_ARGUMENT_ERROR, "%c requires a character");
             }
+            c = RSTRING_PTR(tmp);
+            clen = (int)RSTRING_LEN(tmp);
           }
-          else if (mrb_integer_p(val)) {
-            mrb_int n = mrb_integer(val);
-#ifndef MRB_UTF8_STRING
-            char buf[1];
 
-            buf[0] = (char)n&0xff;
-            tmp = mrb_str_new(mrb, buf, 1);
-#else
-            if (n < 0x80) {
-              char buf[1];
-
-              buf[0] = (char)n;
-              tmp = mrb_str_new(mrb, buf, 1);
-            }
-            else {
-              tmp = mrb_funcall_argv(mrb, val, MRB_SYM(chr), 0, NULL);
-              mrb_check_type(mrb, tmp, MRB_TT_STRING);
-            }
-#endif
-          }
-          else {
-            mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid character");
-          }
           /* Format and output the character with width/alignment */
-          c = RSTRING_PTR(tmp);
-          n = (int)RSTRING_LEN(tmp);
+          n = clen;
           if (!(flags & FWIDTH)) {
             PUSH(c, n);
           }
@@ -559,7 +554,6 @@ retry:
             if (width>0) FILL(' ', width-1);
             PUSH(c, n);
           }
-          mrb_gc_arena_restore(mrb, ai);
         }
         break;
 

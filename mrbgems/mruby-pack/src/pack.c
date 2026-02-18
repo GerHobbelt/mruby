@@ -10,6 +10,7 @@
 #include <mruby/string.h>
 #include <mruby/variable.h>
 #include <mruby/endian.h>
+#include <mruby/internal.h>
 #include <mruby/presym.h>
 
 #include <ctype.h>
@@ -297,7 +298,7 @@ typedef struct {
 } format_info_t;
 
 /* Format character lookup function */
-static inline format_info_t get_format_info(unsigned char c) {
+static inline format_info_t pack_format_info(unsigned char c) {
   switch (c) {
     case 'A': return (format_info_t){PACK_DIR_STR, PACK_TYPE_STRING, 0, PACK_FLAG_WIDTH | PACK_FLAG_COUNT2};
     case 'a': return (format_info_t){PACK_DIR_STR, PACK_TYPE_STRING, 0, PACK_FLAG_WIDTH | PACK_FLAG_COUNT2 | PACK_FLAG_a};
@@ -772,36 +773,11 @@ static int
 pack_utf8(mrb_state *mrb, mrb_value o, mrb_value str, mrb_int sidx, int count, unsigned int flags)
 {
   char utf8[4];
-  int len = 0;
-  uint32_t c = 0;
+  int len;
+  uint32_t c = (uint32_t)mrb_integer(o);
 
-  c = (uint32_t)mrb_integer(o);
-
-  /* Unicode character */
-  /* from mruby-compiler gem */
-  if (c < 0x80) {
-    utf8[0] = (char)c;
-    len = 1;
-  }
-  else if (c < 0x800) {
-    utf8[0] = (char)(0xC0 | (c >> 6));
-    utf8[1] = (char)(0x80 | (c & 0x3F));
-    len = 2;
-  }
-  else if (c < 0x10000) {
-    utf8[0] = (char)(0xE0 |  (c >> 12)        );
-    utf8[1] = (char)(0x80 | ((c >>  6) & 0x3F));
-    utf8[2] = (char)(0x80 | ( c        & 0x3F));
-    len = 3;
-  }
-  else if (c < 0x200000) {
-    utf8[0] = (char)(0xF0 |  (c >> 18)        );
-    utf8[1] = (char)(0x80 | ((c >> 12) & 0x3F));
-    utf8[2] = (char)(0x80 | ((c >>  6) & 0x3F));
-    utf8[3] = (char)(0x80 | ( c        & 0x3F));
-    len = 4;
-  }
-  else {
+  len = (int)mrb_utf8_to_buf(utf8, c);
+  if (len == 0) {
     mrb_raise(mrb, E_RANGE_ERROR, "pack(U): value out of range");
   }
 
@@ -1722,7 +1698,7 @@ read_tmpl(mrb_state *mrb, struct tmpl *tmpl, enum pack_type *typep, mrb_int *siz
   default:
     /* Use O(1) lookup table for standard format characters */
     if (t >= 0 && t < 256) {
-      format_info_t info_val = get_format_info((unsigned char)t);
+      format_info_t info_val = pack_format_info((unsigned char)t);
       const format_info_t *info = &info_val;
       if (info->dir != PACK_DIR_NONE) {
         /* Valid format character found in lookup table */
