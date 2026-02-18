@@ -70,11 +70,11 @@ class Integer
   #
   # ISO 15.2.8.3.22
   def times(&block)
-    return to_enum :times unless block
+    return to_enum(:times) unless block
 
     i = 0
     while i < self
-      block.call i
+      block.call(i)
       i += 1
     end
     self

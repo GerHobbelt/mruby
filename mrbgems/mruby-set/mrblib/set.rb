@@ -43,7 +43,7 @@ class Set
   #   set                   #=> #<Set: {1, 2, 3, 4}>
   #
   def merge(enum)
-    __merge(enum) || __do_with_enum(enum) { |o| add(o) }
+    __merge(enum) || __do_with_enum(enum) {|o| add(o) }
     self
   end
 
@@ -75,7 +75,7 @@ class Set
   #   set                   #=> #<Set: {1, 3}>
   #
   def subtract(enum)
-    __subtract(enum) || __do_with_enum(enum) { |o| delete(o) }
+    __subtract(enum) || __do_with_enum(enum) {|o| delete(o) }
     self
   end
 
@@ -93,7 +93,7 @@ class Set
   def intersection(enum)
     __intersection(enum) || begin
       n = Set.new
-      __do_with_enum(enum) { |o| n.add(o) if include?(o) }
+      __do_with_enum(enum) {|o| n.add(o) if include?(o) }
       n
     end
   end
@@ -136,7 +136,7 @@ class Set
   def difference(enum)
     __difference(enum) || begin
       result = dup
-      __do_with_enum(enum) { |o| result.delete(o) }
+      __do_with_enum(enum) {|o| result.delete(o) }
       result
     end
   end
@@ -174,7 +174,7 @@ class Set
   #   #=> #<Set: {1, 2, 3}>
   #
   def each(&block)
-    return to_enum :each unless block_given?
+    return to_enum(:each) unless block_given?
     # Use C implementation's to_a method and iterate
     to_a.each(&block)
     self
@@ -193,7 +193,7 @@ class Set
   #   set                            #=> #<Set: {1, 3, 5}>
   #
   def delete_if
-    return to_enum :delete_if unless block_given?
+    return to_enum(:delete_if) unless block_given?
     select { yield _1 }.each { delete(_1) }
     self
   end
@@ -211,7 +211,7 @@ class Set
   #   set                          #=> #<Set: {2, 4}>
   #
   def keep_if
-    return to_enum :keep_if unless block_given?
+    return to_enum(:keep_if) unless block_given?
     reject { yield _1 }.each { delete(_1) }
     self
   end
@@ -231,7 +231,7 @@ class Set
   #   set                         #=> #<Set: {2, 4, 6}>
   #
   def collect!
-    return to_enum :collect! unless block_given?
+    return to_enum(:collect!) unless block_given?
     set = self.class.new
     each { set << yield(_1) }
     replace(set)
@@ -251,7 +251,7 @@ class Set
   #   set.reject! { |x| x > 10 }   #=> nil
   #
   def reject!(&block)
-    return to_enum :reject! unless block_given?
+    return to_enum(:reject!) unless block_given?
     n = size
     delete_if(&block)
     size == n ? nil : self
@@ -272,7 +272,7 @@ class Set
   #   set.select! { |x| x.even? }  #=> nil
   #
   def select!(&block)
-    return to_enum :select! unless block_given?
+    return to_enum(:select!) unless block_given?
     n = size
     keep_if(&block)
     size == n ? nil : self
@@ -292,9 +292,9 @@ class Set
   #   #=> {1=>#<Set: {1, 4}>, 2=>#<Set: {2, 5}>, 0=>#<Set: {3, 6}>}
   #
   def classify
-    return to_enum :classify unless block_given?
+    return to_enum(:classify) unless block_given?
     h = {}
-    each { |i|
+    each {|i|
       x = yield(i)
       (h[x] ||= self.class.new).add(i)
     }
@@ -314,7 +314,7 @@ class Set
   #   #=> #<Set: {#<Set: {1, 4}>, #<Set: {2, 5}>, #<Set: {3, 6}>}>
   #
   def divide(&func)
-    return to_enum :divide unless block_given?
+    return to_enum(:divide) unless block_given?
 
     if func.arity == 2
       raise NotImplementedError, "Set#divide with 2 arity block is not implemented."
