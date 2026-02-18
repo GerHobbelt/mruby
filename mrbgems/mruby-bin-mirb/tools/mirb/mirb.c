@@ -37,6 +37,7 @@
 
 #include "mirb_editor.h"
 #include "mirb_completion.h"
+#include "mirb_highlight.h"
 
 /* obsolete configuration */
 #ifdef DISABLE_MIRB_UNDERSCORE
@@ -44,26 +45,22 @@
 #endif
 
 static void
-p(mrb_state *mrb, mrb_value obj)
+p(mrb_state *mrb, mrb_value obj, mirb_highlighter *hl)
 {
   mrb_value val = mrb_funcall_argv(mrb, obj, MRB_SYM(inspect), 0, NULL);
-  if (!mrb->exc) {
-    fputs(" => ", stdout);
-  }
-  else {
+  if (mrb->exc) {
     val = mrb_exc_get_output(mrb, mrb->exc);
   }
   if (!mrb_string_p(val)) {
     val = mrb_obj_as_string(mrb, obj);
   }
   char* msg = mrb_locale_from_utf8(RSTRING_PTR(val), (int)RSTRING_LEN(val));
-  fwrite(msg, strlen(msg), 1, stdout);
+  mirb_highlight_print_result(hl, msg);
   mrb_locale_free(msg);
-  putc('\n', stdout);
 }
 
 static void
-p_error(mrb_state *mrb, struct RObject* exc, mrb_ccontext *cxt)
+p_error(mrb_state *mrb, struct RObject* exc, mrb_ccontext *cxt, mirb_highlighter *hl)
 {
   mrb_value val = mrb_exc_get_output(mrb, exc);
   if (!mrb_string_p(val)) {
@@ -103,9 +100,8 @@ p_error(mrb_state *mrb, struct RObject* exc, mrb_ccontext *cxt)
   }
 
   char* msg = mrb_locale_from_utf8(RSTRING_PTR(val), (int)RSTRING_LEN(val));
-  fwrite(msg, strlen(msg), 1, stdout);
+  mirb_highlight_print_error(hl, msg);
   mrb_locale_free(msg);
-  putc('\n', stdout);
 }
 
 /* Guess if the user might want to enter more
@@ -520,6 +516,11 @@ main(int argc, char **argv)
   mrb_define_global_const(mrb, "ARGV", ARGV);
   mrb_gv_set(mrb, mrb_intern_lit(mrb, "$DEBUG"), mrb_bool_value(args.debug));
 
+  /* Query terminal background color before any output */
+  if (isatty(fileno(stdin)) && isatty(fileno(stdout))) {
+    mirb_highlight_query_terminal();
+  }
+
   print_hint();
 
   cxt = mrb_ccontext_new(mrb);
@@ -756,7 +757,7 @@ main(int argc, char **argv)
         /* did an exception occur? */
         if (mrb->exc) {
           MRB_EXC_CHECK_EXIT(mrb, mrb->exc);
-          p_error(mrb, mrb->exc, cxt);
+          p_error(mrb, mrb->exc, cxt, &editor.highlight);
           mrb->exc = 0;
         }
         else {
@@ -764,7 +765,7 @@ main(int argc, char **argv)
           if (!mrb_respond_to(mrb, result, MRB_SYM(inspect))){
             result = mrb_any_to_s(mrb, result);
           }
-          p(mrb, result);
+          p(mrb, result, &editor.highlight);
 #ifndef MRB_NO_MIRB_UNDERSCORE
           *(mrb->c->ci->stack + 1) = result;
 #endif

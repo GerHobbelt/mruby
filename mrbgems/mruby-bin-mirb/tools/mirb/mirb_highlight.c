@@ -5,6 +5,8 @@
 */
 
 #include "mirb_highlight.h"
+#include "mirb_term.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -21,6 +23,9 @@
 #define DARK_IVAR      "\033[34m"    /* blue */
 #define DARK_GVAR      "\033[1;34m"  /* bold blue */
 #define DARK_REGEXP    "\033[31m"    /* red */
+#define DARK_RESULT    "\033[36m"    /* cyan (same as number) */
+#define DARK_ERROR     "\033[1;31m"  /* bold red */
+#define DARK_ARROW     "\033[90m"    /* gray */
 
 /* Light theme colors (dark colors on light background) */
 #define LIGHT_KEYWORD  "\033[35m"    /* magenta */
@@ -32,6 +37,9 @@
 #define LIGHT_IVAR     "\033[34m"    /* blue */
 #define LIGHT_GVAR     "\033[34m"    /* blue */
 #define LIGHT_REGEXP   "\033[31m"    /* red */
+#define LIGHT_RESULT   "\033[36m"    /* cyan */
+#define LIGHT_ERROR    "\033[31m"    /* red */
+#define LIGHT_ARROW    "\033[90m"    /* gray */
 
 #define COLOR_RESET    "\033[0m"
 
@@ -140,35 +148,66 @@ print_colored(mirb_highlighter *hl, const char *start, size_t len, mirb_token_ty
   if (*color) printf("%s", reset);
 }
 
+/* Cached terminal background color from pre-query */
+static mirb_bg_color cached_bg_color = MIRB_BG_UNKNOWN;
+static mrb_bool bg_color_queried = FALSE;
+
 /*
- * Detect theme from environment
+ * Pre-query terminal background color
+ * Must be called before any output to avoid response appearing on screen
+ */
+void
+mirb_highlight_query_terminal(void)
+{
+  if (!bg_color_queried) {
+    cached_bg_color = mirb_term_query_bg_color(500);  /* 500ms timeout */
+    bg_color_queried = TRUE;
+  }
+}
+
+/*
+ * Detect theme from terminal background color
+ *
+ * Priority:
+ *   1. MIRB_THEME environment variable (explicit override)
+ *   2. Cached OSC 11 result (from mirb_highlight_query_terminal)
+ *   3. COLORFGBG environment variable (rxvt, some xterm)
+ *   4. Default to dark theme
  */
 mirb_theme
 mirb_highlight_detect_theme(void)
 {
   const char *env;
 
-  /* Check explicit MIRB_THEME first */
+  /* 1. Check explicit MIRB_THEME first (user override) */
   env = getenv("MIRB_THEME");
   if (env) {
     if (strcmp(env, "light") == 0) return MIRB_THEME_LIGHT;
     if (strcmp(env, "dark") == 0) return MIRB_THEME_DARK;
   }
 
-  /* Check COLORFGBG (format: "fg;bg" where bg > 6 usually means light) */
+  /* 2. Use cached OSC 11 result (must call mirb_highlight_query_terminal first) */
+  if (cached_bg_color == MIRB_BG_LIGHT) return MIRB_THEME_LIGHT;
+  if (cached_bg_color == MIRB_BG_DARK) return MIRB_THEME_DARK;
+
+  /* 3. Check COLORFGBG (format: "fg;bg" where bg > 6 usually means light) */
   env = getenv("COLORFGBG");
   if (env) {
     const char *semi = strchr(env, ';');
     if (semi) {
-      int bg = atoi(semi + 1);
+      int bg_color = atoi(semi + 1);
       /* Background colors 7, 15, or high values typically mean light theme */
-      if (bg == 7 || bg == 15 || (bg >= 230 && bg <= 255)) {
+      if (bg_color == 7 || bg_color == 15 || (bg_color >= 230 && bg_color <= 255)) {
         return MIRB_THEME_LIGHT;
+      }
+      /* Low values (0-6, 8) typically mean dark theme */
+      if (bg_color <= 8) {
+        return MIRB_THEME_DARK;
       }
     }
   }
 
-  /* Default to dark theme (more common in terminals) */
+  /* 4. Default to dark theme (more common in terminals) */
   return MIRB_THEME_DARK;
 }
 
@@ -404,7 +443,12 @@ mirb_highlight_print_line(mirb_highlighter *hl, const char *line)
 
       size_t len = (size_t)(p - token_start);
 
-      if (is_const) {
+      /* Check for hash key symbol syntax: identifier followed by ': ' */
+      if (*p == ':' && (p[1] == ' ' || p[1] == '\0' || p[1] == ',' || p[1] == '}')) {
+        p++;  /* include the colon */
+        print_colored(hl, token_start, (size_t)(p - token_start), MIRB_TOK_SYMBOL);
+      }
+      else if (is_const) {
         print_colored(hl, token_start, len, MIRB_TOK_CONSTANT);
       }
       else if (!after_dot && is_keyword(token_start, len)) {
@@ -422,4 +466,51 @@ mirb_highlight_print_line(mirb_highlighter *hl, const char *line)
     /* Default: just output character */
     putchar(*p++);
   }
+}
+
+/*
+ * Print result value with highlighting
+ */
+void
+mirb_highlight_print_result(mirb_highlighter *hl, const char *result)
+{
+  if (!hl->enabled) {
+    fputs(" => ", stdout);
+    fputs(result, stdout);
+    putchar('\n');
+    return;
+  }
+
+  /* Print arrow in gray */
+  if (hl->theme == MIRB_THEME_DARK) {
+    fputs(DARK_ARROW " => " COLOR_RESET, stdout);
+  }
+  else {
+    fputs(LIGHT_ARROW " => " COLOR_RESET, stdout);
+  }
+  /* Syntax highlight the result value */
+  mirb_highlight_print_line(hl, result);
+  putchar('\n');
+}
+
+/*
+ * Print error message with highlighting
+ */
+void
+mirb_highlight_print_error(mirb_highlighter *hl, const char *error)
+{
+  if (!hl->enabled) {
+    fputs(error, stdout);
+    putchar('\n');
+    return;
+  }
+
+  if (hl->theme == MIRB_THEME_DARK) {
+    fputs(DARK_ERROR, stdout);
+  }
+  else {
+    fputs(LIGHT_ERROR, stdout);
+  }
+  fputs(error, stdout);
+  fputs(COLOR_RESET "\n", stdout);
 }

@@ -1027,15 +1027,23 @@ mrb_define_method_raw(mrb_state *mrb, struct RClass *c, mrb_sym mid, mrb_method_
   }
 
   int flags = MT_KEY_FLG(m.flags);
-  if (mid == MRB_SYM(initialize)) {
+  if (mid == MRB_SYM(initialize) ||
+      mid == MRB_SYM(initialize_copy) ||
+      mid == MRB_SYM_Q(respond_to_missing)) {
     MRB_SET_VISIBILITY_FLAGS(flags, MT_PRIVATE);
   }
   else if ((flags & MT_VMASK) == MT_VDEFAULT) {
-    mrb_callinfo *ci;
-    struct REnv *e;
-    find_visibility_scope(mrb, c, 0, &ci, &e);
-    mrb_assert(ci || e);
-    MRB_SET_VISIBILITY_FLAGS(flags, (e ? MRB_ENV_VISIBILITY(e) : MRB_CI_VISIBILITY(ci)));
+    /* singleton methods are always public */
+    if (c->tt == MRB_TT_SCLASS) {
+      MRB_SET_VISIBILITY_FLAGS(flags, MT_PUBLIC);
+    }
+    else {
+      mrb_callinfo *ci;
+      struct REnv *e;
+      find_visibility_scope(mrb, c, 0, &ci, &e);
+      mrb_assert(ci || e);
+      MRB_SET_VISIBILITY_FLAGS(flags, (e ? MRB_ENV_VISIBILITY(e) : MRB_CI_VISIBILITY(ci)));
+    }
   }
   mt_put(mrb, h, mid, flags, ptr);
   if (!mrb->bootstrapping) mc_clear_by_id(mrb, mid);
@@ -4216,9 +4224,9 @@ static const mrb_code neq_iseq[] = {
   OP_ENTER, 0x4, 0, 0,       // 000 OP_ENTER     1:0:0:0:0:0:0
   OP_EQ, 0,                  // 004 OP_EQ        R0  (R1)
   OP_JMPNOT, 0, 0, 5,        // 006 OP_JMPNOT    R0  015
-  OP_LOADF, 0,               // 010 OP_LOADF     R0  (false)
+  OP_LOADFALSE, 0,               // 010 OP_LOADFALSE     R0  (false)
   OP_JMP, 0, 2,              // 012 OP_JMP       017
-  OP_LOADT, 0,               // 015 OP_LOADT     R0  (true)
+  OP_LOADTRUE, 0,               // 015 OP_LOADTRUE     R0  (true)
   OP_RETURN, 0               // 017 OP_RETURN    R0
 };
 

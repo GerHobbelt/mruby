@@ -841,7 +841,7 @@ genjmp2(codegen_scope *s, mrb_code i, uint16_t a, uint32_t pc, int val)
       }
       break;
     case OP_LOADNIL:
-    case OP_LOADF:
+    case OP_LOADFALSE:
       if (data.a == a || data.a > s->nlocals) {
         s->pc = addr_pc(s, data.addr);
         if (i == OP_JMPNOT || (i == OP_JMPNIL && data.insn == OP_LOADNIL)) {
@@ -852,7 +852,7 @@ genjmp2(codegen_scope *s, mrb_code i, uint16_t a, uint32_t pc, int val)
         }
       }
       break;
-    case OP_LOADT: case OP_LOADI8: case OP_LOADINEG: case OP_LOADI__1:
+    case OP_LOADTRUE: case OP_LOADI8: case OP_LOADINEG: case OP_LOADI__1:
     case OP_LOADI_0: case OP_LOADI_1: case OP_LOADI_2: case OP_LOADI_3:
     case OP_LOADI_4: case OP_LOADI_5: case OP_LOADI_6: case OP_LOADI_7:
       if (data.a == a || data.a > s->nlocals) {
@@ -937,7 +937,7 @@ gen_move(codegen_scope *s, uint16_t dst, uint16_t src, int nopeep)
         return;
       }
       break;
-    case OP_LOADNIL: case OP_LOADSELF: case OP_LOADT: case OP_LOADF:
+    case OP_LOADNIL: case OP_LOADSELF: case OP_LOADTRUE: case OP_LOADFALSE:
     case OP_LOADI__1:
     case OP_LOADI_0: case OP_LOADI_1: case OP_LOADI_2: case OP_LOADI_3:
     case OP_LOADI_4: case OP_LOADI_5: case OP_LOADI_6: case OP_LOADI_7:
@@ -996,17 +996,22 @@ gen_move(codegen_scope *s, uint16_t dst, uint16_t src, int nopeep)
         if (data0.insn != OP_MOVE || data0.a != data.a || data0.b != dst) break;
         if (addr_pc(s, data0.addr) != s->lastlabel) {
           /* constant folding */
-          data0 = mrb_decode_insn(mrb_prev_pc(s, data0.addr));
+          struct mrb_insn_data data1 = mrb_decode_insn(mrb_prev_pc(s, data0.addr));
           mrb_int n;
-          if (data0.a == dst && get_int_operand(s, &data0, &n)) {
+          if (data1.a == dst && get_int_operand(s, &data1, &n)) {
             if ((data.insn == OP_ADDI && !mrb_int_add_overflow(n, data.b, &n)) ||
                 (data.insn == OP_SUBI && !mrb_int_sub_overflow(n, data.b, &n))) {
-              s->pc = addr_pc(s, data0.addr);
+              s->pc = addr_pc(s, data1.addr);
               gen_int(s, dst, n);
               return;
             }
           }
         }
+        /* ADDILV/SUBILV fusion: MOVE temp local; ADDI temp imm; MOVE local temp */
+        /* -> ADDILV local temp imm (temp is working space for method fallback) */
+        s->pc = addr_pc(s, data0.addr);
+        genop_3(s, data.insn == OP_ADDI ? OP_ADDILV : OP_SUBILV, dst, data.a, data.b);
+        return;
       }
       break;
     default:
@@ -1141,7 +1146,28 @@ gen_return(codegen_scope *s, uint8_t op, uint16_t src)
       rewind_pc(s);
       genop_1(s, op, data.b);
     }
-    else if (data.insn != OP_RETURN) {
+    else if (data.insn == OP_LOADSELF && src == data.a && op == OP_RETURN) {
+      /* LOADSELF + RETURN -> RETSELF */
+      rewind_pc(s);
+      genop_0(s, OP_RETSELF);
+    }
+    else if (data.insn == OP_LOADNIL && src == data.a && op == OP_RETURN) {
+      /* LOADNIL + RETURN -> RETNIL */
+      rewind_pc(s);
+      genop_0(s, OP_RETNIL);
+    }
+    else if (data.insn == OP_LOADTRUE && src == data.a && op == OP_RETURN) {
+      /* LOADTRUE + RETURN -> RETTRUE */
+      rewind_pc(s);
+      genop_0(s, OP_RETTRUE);
+    }
+    else if (data.insn == OP_LOADFALSE && src == data.a && op == OP_RETURN) {
+      /* LOADFALSE + RETURN -> RETFALSE */
+      rewind_pc(s);
+      genop_0(s, OP_RETFALSE);
+    }
+    else if (data.insn != OP_RETURN && data.insn != OP_RETSELF && data.insn != OP_RETNIL &&
+             data.insn != OP_RETTRUE && data.insn != OP_RETFALSE) {
       genop_1(s, op, src);
     }
   }
@@ -1544,6 +1570,16 @@ gen_binop(codegen_scope *s, mrb_sym op, uint16_t dst)
 {
   if (no_peephole(s)) return FALSE;
   else if (op == MRB_OPSYM_2(s->mrb, aref)) {
+    /* GETIDX0 fusion: MOVE dst arr; LOADI_0 dst+1 -> GETIDX0 dst arr */
+    struct mrb_insn_data data = mrb_last_insn(s);
+    if (data.insn == OP_LOADI_0 && data.a == (uint32_t)dst+1 && addr_pc(s, data.addr) != s->lastlabel) {
+      struct mrb_insn_data data0 = mrb_decode_insn(mrb_prev_pc(s, data.addr));
+      if (data0.insn == OP_MOVE && data0.a == dst && data0.b != dst) {
+        s->pc = addr_pc(s, data0.addr);
+        genop_2(s, OP_GETIDX0, dst, data0.b);
+        return TRUE;
+      }
+    }
     genop_1(s, OP_GETIDX, dst);
     return TRUE;
   }
@@ -2708,10 +2744,10 @@ gen_literal_to_reg(codegen_scope *s, node *n, int reg)
     genop_1(s, OP_LOADNIL, reg);
     break;
   case NODE_TRUE:
-    genop_1(s, OP_LOADT, reg);
+    genop_1(s, OP_LOADTRUE, reg);
     break;
   case NODE_FALSE:
-    genop_1(s, OP_LOADF, reg);
+    genop_1(s, OP_LOADFALSE, reg);
     break;
   default:
     break;
@@ -3607,7 +3643,15 @@ codegen_call(codegen_scope *s, node *varnode, int val)
     /* constant folding succeeded */
   }
   else if (noself) {
-    genop_3(s, blk ? OP_SSENDB : OP_SSEND, cursp(), sym_idx(s, sym), n|(nk<<4));
+    if (!blk && n == 0 && nk == 0) {
+      genop_2(s, OP_SSEND0, cursp(), sym_idx(s, sym));
+    }
+    else {
+      genop_3(s, blk ? OP_SSENDB : OP_SSEND, cursp(), sym_idx(s, sym), n|(nk<<4));
+    }
+  }
+  else if (!blk && n == 0 && nk == 0) {
+    genop_2(s, OP_SEND0, cursp(), sym_idx(s, sym));
   }
   else {
     genop_3(s, blk ? OP_SENDB : OP_SEND, cursp(), sym_idx(s, sym), n|(nk<<4));
@@ -4997,12 +5041,18 @@ codegen_def(codegen_scope *s, node *varnode, int val)
   /* For NODE_DEF, args should contain the full locals structure from defn_setup */
   int idx = lambda_body(s, def_n->locals, def_n->args, def_n->body, 0);
 
-  genop_1(s, OP_TCLASS, cursp());
-  push();
-  genop_2(s, OP_METHOD, cursp(), idx);
-  push(); pop();
-  pop();
-  genop_2(s, OP_DEF, cursp(), sym);
+  if (idx <= 0xff) {
+    /* TDEF fusion: TCLASS + METHOD + DEF -> TDEF */
+    genop_3(s, OP_TDEF, cursp(), sym, idx);
+  }
+  else {
+    genop_1(s, OP_TCLASS, cursp());
+    push();
+    genop_2(s, OP_METHOD, cursp(), idx);
+    push(); pop();
+    pop();
+    genop_2(s, OP_DEF, cursp(), sym);
+  }
   if (val) push();
 }
 
@@ -5378,7 +5428,7 @@ codegen_op_asgn(codegen_scope *s, node *varnode, int val)
       lp->type = LOOP_RESCUE;
       catch_handler_set(s, catch_entry, MRB_CATCH_RESCUE, begin, end, s->pc);
       genop_1(s, OP_EXCEPT, exc);
-      genop_1(s, OP_LOADF, exc);
+      genop_1(s, OP_LOADFALSE, exc);
       dispatch(s, noexc);
       loop_pop(s, NOVAL);
     }
@@ -5546,7 +5596,7 @@ codegen_yield(codegen_scope *s, node *varnode, int val)
       }
     }
     if (callargs->keyword_args) {
-      nk = gen_hash(s, callargs->keyword_args->cdr, VAL, 14);
+      nk = gen_hash(s, callargs->keyword_args, VAL, 14);
       if (nk < 0) {
         nk = 15;
       }
@@ -5556,7 +5606,14 @@ codegen_yield(codegen_scope *s, node *varnode, int val)
   pop_n(n + (nk == 15 ? 1 : nk * 2) + 1);
   genop_2S(s, OP_BLKPUSH, cursp(), (ainfo<<4)|(lv & 0xf));
   if (sendv) n = CALL_MAXARGS;
-  genop_3(s, OP_SEND, cursp(), sym_idx(s, MRB_SYM_2(s->mrb, call)), n|(nk<<4));
+  if (nk == 0 && n < 15) {
+    /* fast path: direct block call without method dispatch */
+    genop_2(s, OP_BLKCALL, cursp(), n);
+  }
+  else {
+    /* fallback: use SEND for keyword args or splat */
+    genop_3(s, OP_SEND, cursp(), sym_idx(s, MRB_SYM_2(s->mrb, call)), n|(nk<<4));
+  }
   if (val) push();
 }
 
@@ -5591,7 +5648,7 @@ codegen_super(codegen_scope *s, node *varnode, int val)
 
       /* Keyword arguments */
       if (callargs->keyword_args) {
-        nk = gen_hash(s, callargs->keyword_args->cdr, VAL, 14);
+        nk = gen_hash(s, callargs->keyword_args, VAL, 14);
         if (nk < 0) {st++; nk = 15;}
         else st += nk*2;
         n |= nk<<4;
@@ -5690,15 +5747,15 @@ codegen_nil(codegen_scope *s, node *varnode, int val)
 static void
 codegen_true(codegen_scope *s, node *varnode, int val)
 {
-  /* Generate OP_LOADT instruction for true literal */
-  gen_load_op1(s, OP_LOADT, val);
+  /* Generate OP_LOADTRUE instruction for true literal */
+  gen_load_op1(s, OP_LOADTRUE, val);
 }
 
 static void
 codegen_false(codegen_scope *s, node *varnode, int val)
 {
-  /* Generate OP_LOADF instruction for false literal */
-  gen_load_op1(s, OP_LOADF, val);
+  /* Generate OP_LOADFALSE instruction for false literal */
+  gen_load_op1(s, OP_LOADFALSE, val);
 }
 
 static void
@@ -6380,12 +6437,18 @@ codegen_sdef(codegen_scope *s, const node *varnode, int val)
 
   codegen(s, recv, VAL);
   pop();
-  genop_1(s, OP_SCLASS, cursp());
-  push();
-  genop_2(s, OP_METHOD, cursp(), idx);
-  push(); pop();
-  pop();
-  genop_2(s, OP_DEF, cursp(), sym);
+  if (idx <= 0xff) {
+    /* SDEF fusion: SCLASS + METHOD + DEF -> SDEF */
+    genop_3(s, OP_SDEF, cursp(), sym, idx);
+  }
+  else {
+    genop_1(s, OP_SCLASS, cursp());
+    push();
+    genop_2(s, OP_METHOD, cursp(), idx);
+    push(); pop();
+    pop();
+    genop_2(s, OP_DEF, cursp(), sym);
+  }
   if (val) push();
 }
 
@@ -6535,7 +6598,7 @@ codegen(codegen_scope *s, node *tree, int val)
             gen_load_nil(s, 1);
           }
           else {
-            genop_1(s, OP_LOADT, cursp());
+            genop_1(s, OP_LOADTRUE, cursp());
             push();
           }
         }
@@ -6581,7 +6644,7 @@ codegen(codegen_scope *s, node *tree, int val)
                 gen_load_nil(s, 1);  /* '=>' pattern returns nil */
               }
               else {
-                genop_1(s, OP_LOADT, cursp());  /* 'in' pattern returns true */
+                genop_1(s, OP_LOADTRUE, cursp());  /* 'in' pattern returns true */
                 push();
               }
             }
@@ -6620,19 +6683,29 @@ codegen(codegen_scope *s, node *tree, int val)
             gen_load_nil(s, 1);
           }
           else {
-            genop_1(s, OP_LOADT, cursp());
+            genop_1(s, OP_LOADTRUE, cursp());
             push();
           }
         }
 
-        /* Optimize: single JMPNOT can be inverted to JMPIF, eliminating JMP */
+        /* Optimize: single JMPNOT can be replaced with MATCHERR for raise_on_fail */
         /* Conditions: (1) single entry in fail_pos chain,
          * (2) JMPNOT is immediately before current position (no code between), and
          * (3) the instruction is actually JMPNOT (not JMP from undefined pinned var) */
         if ((int32_t)(fail_pos + 2) + (int16_t)PEEK_S(s->iseq+fail_pos) == 0 &&
             fail_pos + 2 == s->pc &&
             s->iseq[fail_pos - 2] == OP_JMPNOT) {
-          /* Single failure point - invert JMPNOT to JMPIF */
+          if (mp->raise_on_fail) {
+            /* Single failure point with raise - replace JMPNOT with MATCHERR */
+            int reg = s->iseq[fail_pos - 1];  /* Register from JMPNOT */
+            s->pc = fail_pos - 2;  /* Rewind past JMPNOT */
+            s->lastpc = s->pc;
+            genop_1(s, OP_MATCHERR, reg);  /* Emit MATCHERR with the register */
+            s->sp = saved_sp - 1;
+            if (val) push();
+            break;  /* Pattern matching complete */
+          }
+          /* Single failure point with 'in' pattern - invert JMPNOT to JMPIF */
           s->iseq[fail_pos - 2] = OP_JMPIF;
           match_pos = fail_pos;
         }
@@ -6647,25 +6720,13 @@ codegen(codegen_scope *s, node *tree, int val)
         pop();  /* pop the value */
         if (mp->raise_on_fail) {
           /* expr => pattern: raise NoMatchingPatternError */
-          int msg_off = new_lit_cstr(s, "pattern not matched");
-          int exc_reg = cursp();
-          /* Get NoMatchingPatternError class */
-          genop_2(s, OP_GETCONST, exc_reg, sym_idx(s, MRB_SYM_2(s->mrb, NoMatchingPatternError)));
-          push();
-          /* Create message string */
-          genop_2(s, OP_STRING, cursp(), msg_off);
-          push();
-          /* Call NoMatchingPatternError.new(message) */
-          pop();  /* pop argument */
-          genop_3(s, OP_SEND, exc_reg, sym_idx(s, MRB_SYM_2(s->mrb, new)), 1);
-          /* Raise the exception */
-          genop_1(s, OP_RAISEIF, exc_reg);
-          /* No push here: RAISEIF never returns, control transfers to rescue handler */
+          genop_1(s, OP_LOADFALSE, cursp());  /* Load false for MATCHERR */
+          genop_1(s, OP_MATCHERR, cursp());
         }
         else {
           /* expr in pattern: return false */
           if (val) {
-            genop_1(s, OP_LOADF, cursp());
+            genop_1(s, OP_LOADFALSE, cursp());
             push();
           }
         }
@@ -6684,7 +6745,7 @@ codegen(codegen_scope *s, node *tree, int val)
             gen_load_nil(s, 1);  /* '=>' pattern returns nil */
           }
           else {
-            genop_1(s, OP_LOADT, cursp());  /* 'in' pattern returns true */
+            genop_1(s, OP_LOADTRUE, cursp());  /* 'in' pattern returns true */
             push();
           }
         }

@@ -59,10 +59,16 @@ void mirb_highlight_init(mirb_highlighter *hl, mrb_bool enabled);
 void mirb_highlight_set_theme(mirb_highlighter *hl, mirb_theme theme);
 
 /*
- * Detect theme from environment variables
+ * Detect theme from environment variables and terminal query
  * Returns MIRB_THEME_DARK if cannot detect
  */
 mirb_theme mirb_highlight_detect_theme(void);
+
+/*
+ * Pre-query terminal background color (call before any output)
+ * This caches the result for later use by mirb_highlight_detect_theme()
+ */
+void mirb_highlight_query_terminal(void);
 
 /*
  * Print a line with syntax highlighting
@@ -74,5 +80,16 @@ void mirb_highlight_print_line(mirb_highlighter *hl, const char *line);
  * Reset multi-line state (call when starting new input)
  */
 void mirb_highlight_reset(mirb_highlighter *hl);
+
+/*
+ * Print result value with highlighting
+ * Prints " => " prefix and the result string with appropriate colors
+ */
+void mirb_highlight_print_result(mirb_highlighter *hl, const char *result);
+
+/*
+ * Print error message with highlighting
+ */
+void mirb_highlight_print_error(mirb_highlighter *hl, const char *error);
 
 #endif /* MIRB_HIGHLIGHT_H */

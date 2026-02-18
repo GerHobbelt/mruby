@@ -256,6 +256,7 @@ typedef struct mrb_task_state {
   volatile uint32_t wakeup_tick;    /* Next wakeup tick */
   volatile mrb_bool switching;      /* Context switch pending flag */
   struct mrb_task *main_task;       /* Main task wrapper for root context */
+  uint8_t scheduler_lock;           /* Lock counter for synchronous execution */
 } mrb_task_state;
 #endif
 
@@ -300,6 +301,7 @@ typedef struct mrb_state {
   const char **symtbl;
   size_t symcapa;
   struct mrb_sym_hash_table *symhash;
+  void *sym_pool;
 #ifndef MRB_USE_ALL_SYMBOLS
   char symbuf[8];                         /* buffer for small symbol names */
 #endif
@@ -1613,6 +1615,10 @@ mrbmemset(void *s, int c, size_t n)
 #endif
 
 #define mrb_int_hash_func(mrb,key) (uint32_t)((key)^((key)<<2)^((key)>>2))
+
+#define MRB_UNIQNAME(name)         MRB_UNIQNAME_1(name, __LINE__)
+#define MRB_UNIQNAME_1(name, line) MRB_UNIQNAME_2(name, line)
+#define MRB_UNIQNAME_2(name, line) name##line
 
 MRB_END_DECL
 
