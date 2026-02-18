@@ -14,22 +14,58 @@
 #include <mruby/data.h>
 #include <mruby/internal.h>
 #include <mruby/presym.h>
+#include <mruby/error.h>
 #include <mruby/khash.h>
 
 /* Use khash.h for set implementation - set mode (no values, only keys) */
 KHASH_DECLARE(set_val, mrb_value, char, FALSE)  /* FALSE = set mode */
 
+/* Helper for protected hash computation */
+static mrb_value
+kset_hash_body(mrb_state *mrb, void *data)
+{
+  mrb_value *key = (mrb_value*)data;
+  return mrb_int_value(mrb, mrb_obj_hash_code(mrb, *key));
+}
+
+/* Helper for protected equality check */
+struct kset_eql_data {
+  mrb_value a;
+  mrb_value b;
+};
+
+static mrb_value
+kset_eql_body(mrb_state *mrb, void *data)
+{
+  struct kset_eql_data *d = (struct kset_eql_data*)data;
+  return mrb_bool_value(mrb_eql(mrb, d->a, d->b));
+}
+
 /* Hash and equality functions for mrb_value keys */
+/* These use mrb_protect_error to catch exceptions and prevent leaks in khash rebuild */
 static inline khint_t
 kset_hash_value(mrb_state *mrb, mrb_value key)
 {
-  return (khint_t)mrb_obj_hash_code(mrb, key);
+  mrb_bool error;
+  mrb_value result = mrb_protect_error(mrb, kset_hash_body, &key, &error);
+  if (error) {
+    mrb->exc = mrb_obj_ptr(result);  /* Store exception to raise later */
+    return 0;  /* Return default hash value */
+  }
+  return (khint_t)mrb_integer(result);
 }
 
 static inline mrb_bool
 kset_equal_value(mrb_state *mrb, mrb_value a, mrb_value b)
 {
-  return mrb_eql(mrb, a, b);
+  struct kset_eql_data data = { a, b };
+  mrb_bool error;
+  mrb_value result = mrb_protect_error(mrb, kset_eql_body, &data, &error);
+  if (error) {
+    mrb->exc = mrb_obj_ptr(result);  /* Store exception to raise later */
+    return FALSE;  /* Return not-equal */
+  }
+  return mrb_test(result);
 }
 
 KHASH_DEFINE(set_val, mrb_value, char, FALSE, kset_hash_value, kset_equal_value)
@@ -62,9 +98,6 @@ typedef khint_t kset_iter_t;
 /* Helper macros for set state checking */
 #define kset_is_uninitialized(s) ((s)->data == NULL)
 #define kset_is_empty(s) (kset_is_uninitialized(s) || kset_size(s) == 0)
-
-/* Flag to detect recursive hash computation */
-#define MRB_SET_HASH_RUNNING (1 << 19)
 
 /* Embedded set structure in RSet - exactly 3 pointers */
 struct RSet {
@@ -659,14 +692,7 @@ set_equal(mrb_state *mrb, mrb_value self)
 static mrb_value
 set_hash_m(mrb_state *mrb, mrb_value self)
 {
-  struct RSet *s = mrb_set_ptr(self);
-  kset_t *set = &s->set;
-
-  /* Detect recursive hash computation (e.g., Set containing itself) */
-  if (MRB_FLAG_TEST(s, MRB_SET_HASH_RUNNING)) {
-    /* Return 0 for recursive reference, similar to Ruby's behavior */
-    return mrb_fixnum_value(0);
-  }
+  kset_t *set = set_get_kset(mrb, self);
 
   /* Use order-independent hash algorithm for sets */
   uint64_t hash = 0; /* Start with zero for XOR accumulation */
@@ -676,9 +702,6 @@ set_hash_m(mrb_state *mrb, mrb_value self)
   hash ^= size * GOLDEN_RATIO_PRIME;
 
   if (!kset_is_uninitialized(set) && size > 0) {
-    /* Mark as computing hash to detect recursion */
-    s->flags |= MRB_SET_HASH_RUNNING;
-
     /* Process each element - order independent using XOR */
     int ai = mrb_gc_arena_save(mrb);
     KSET_FOREACH(set, k) {
@@ -690,9 +713,6 @@ set_hash_m(mrb_state *mrb, mrb_value self)
 
       mrb_gc_arena_restore(mrb, ai);
     }
-
-    /* Clear the flag */
-    s->flags &= ~MRB_SET_HASH_RUNNING;
   }
 
   /* Final mixing to improve distribution */
