@@ -22,12 +22,16 @@ void mrb_gc_destroy(mrb_state*, mrb_gc *gc);
 
 int mrb_core_init_protect(mrb_state *mrb, void (*body)(mrb_state*, void*), void *opaque);
 
+void mrb_init_shape(mrb_state*);
+void mrb_free_shape(mrb_state*);
+
 static void
 init_gc_and_core(mrb_state *mrb, void *opaque)
 {
   static const struct mrb_context mrb_context_zero = { 0 };
 
   mrb_gc_init(mrb, &mrb->gc);
+  mrb_init_shape(mrb);
   mrb->c = (struct mrb_context*)mrb_malloc(mrb, sizeof(struct mrb_context));
   *mrb->c = mrb_context_zero;
   mrb->root_c = mrb->c;
@@ -134,8 +138,10 @@ void
 mrb_irep_free(mrb_state *mrb, mrb_irep *irep)
 {
   int i;
+  mrb_bool consolidated;
 
   if (irep->flags & MRB_IREP_NO_FREE) return;
+  consolidated = (irep->flags & MRB_IREP_CONSOLIDATED) != 0;
   if (!(irep->flags & MRB_ISEQ_NO_FREE))
     mrb_free(mrb, (void*)irep->iseq);
   if (irep->pool) {
@@ -145,15 +151,15 @@ mrb_irep_free(mrb_state *mrb, mrb_irep *irep)
         mrb_free(mrb, (void*)irep->pool[i].u.str);
       }
     }
-    mrb_free(mrb, (void*)irep->pool);
+    if (!consolidated) mrb_free(mrb, (void*)irep->pool);
   }
-  mrb_free(mrb, (void*)irep->syms);
+  if (!consolidated) mrb_free(mrb, (void*)irep->syms);
   if (irep->reps) {
     for (i=0; i<irep->rlen; i++) {
       if (irep->reps[i])
         mrb_irep_decref(mrb, (mrb_irep*)irep->reps[i]);
     }
-    mrb_free(mrb, (void*)irep->reps);
+    if (!consolidated) mrb_free(mrb, (void*)irep->reps);
   }
   mrb_free(mrb, (void*)irep->lv);
   mrb_debug_info_free(mrb, irep->debug_info);
@@ -185,8 +191,21 @@ mrb_close(mrb_state *mrb)
   /* free */
   mrb_gc_free_gv(mrb);
   mrb_gc_destroy(mrb, &mrb->gc);
+  mrb_free_shape(mrb);
   mrb_free_context(mrb, mrb->root_c);
   mrb_free_symtbl(mrb);
+
+  /* free heap-allocated ROM method table wrappers */
+  {
+    struct mrb_mt_rom_list *node = mrb->rom_mt;
+    while (node) {
+      struct mrb_mt_rom_list *next = node->next;
+      mrb_free(mrb, node->tbl);
+      mrb_free(mrb, node);
+      node = next;
+    }
+  }
+
   mrb_free(mrb, mrb);
 }
 

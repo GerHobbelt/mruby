@@ -5,11 +5,11 @@
 */
 
 #include "mirb_highlight.h"
+#include "mirb_buffer.h"
 #include "mirb_term.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <ctype.h>
 
 /* ANSI color codes - using standard 16-color palette for compatibility */
 
@@ -41,18 +41,17 @@
 #define LIGHT_ERROR    "\033[31m"    /* red */
 #define LIGHT_ARROW    "\033[90m"    /* gray */
 
-#define COLOR_RESET    "\033[0m"
-
-/* Keyword list - must be sorted alphabetically for bsearch */
-static const char *keywords[] = {
+/* Keyword list - sorted alphabetically for bsearch, NULL-terminated */
+const char *mirb_keywords[] = {
   "BEGIN", "END", "__ENCODING__", "__FILE__", "__LINE__",
   "alias", "and", "begin", "break", "case", "class", "def",
   "defined?", "do", "else", "elsif", "end", "ensure", "false",
   "for", "if", "in", "module", "next", "nil", "not", "or",
   "redo", "rescue", "retry", "return", "self", "super", "then",
-  "true", "undef", "unless", "until", "when", "while", "yield"
+  "true", "undef", "unless", "until", "when", "while", "yield",
+  NULL
 };
-#define NUM_KEYWORDS (sizeof(keywords) / sizeof(keywords[0]))
+const size_t mirb_num_keywords = sizeof(mirb_keywords) / sizeof(mirb_keywords[0]) - 1;
 
 static int
 keyword_cmp(const void *a, const void *b)
@@ -68,14 +67,7 @@ is_keyword(const char *word, size_t len)
   if (len >= sizeof(buf)) return FALSE;
   memcpy(buf, word, len);
   buf[len] = '\0';
-  return bsearch(buf, keywords, NUM_KEYWORDS, sizeof(keywords[0]), keyword_cmp) != NULL;
-}
-
-static mrb_bool
-is_word_char(char c)
-{
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-         (c >= '0' && c <= '9') || c == '_';
+  return bsearch(buf, mirb_keywords, mirb_num_keywords, sizeof(mirb_keywords[0]), keyword_cmp) != NULL;
 }
 
 static mrb_bool
@@ -364,7 +356,7 @@ mirb_highlight_print_line(mirb_highlighter *hl, const char *line)
       }
       else {
         /* Regular symbol */
-        while (*p && (is_word_char(*p) || *p == '?' || *p == '!')) p++;
+        while (*p && (mirb_is_word_char(*p) || *p == '?' || *p == '!')) p++;
       }
       print_colored(hl, token_start, (size_t)(p - token_start), MIRB_TOK_SYMBOL);
       continue;
@@ -374,7 +366,7 @@ mirb_highlight_print_line(mirb_highlighter *hl, const char *line)
     if (*p == '@') {
       token_start = p++;
       if (*p == '@') p++;  /* @@class_var */
-      while (*p && is_word_char(*p)) p++;
+      while (*p && mirb_is_word_char(*p)) p++;
       print_colored(hl, token_start, (size_t)(p - token_start), MIRB_TOK_IVAR);
       continue;
     }
@@ -383,11 +375,11 @@ mirb_highlight_print_line(mirb_highlighter *hl, const char *line)
     if (*p == '$') {
       token_start = p++;
       /* Special globals like $!, $?, $1, etc. */
-      if (*p && !is_word_char(*p) && *p != ' ') {
+      if (*p && !mirb_is_word_char(*p) && *p != ' ') {
         p++;
       }
       else {
-        while (*p && is_word_char(*p)) p++;
+        while (*p && mirb_is_word_char(*p)) p++;
       }
       print_colored(hl, token_start, (size_t)(p - token_start), MIRB_TOK_GVAR);
       continue;
@@ -395,7 +387,7 @@ mirb_highlight_print_line(mirb_highlighter *hl, const char *line)
 
     /* Numbers */
     if ((*p >= '0' && *p <= '9') ||
-        (*p == '-' && p[1] >= '0' && p[1] <= '9' && (p == line || !is_word_char(p[-1])))) {
+        (*p == '-' && p[1] >= '0' && p[1] <= '9' && (p == line || !mirb_is_word_char(p[-1])))) {
       token_start = p;
       if (*p == '-') p++;
       if (*p == '0' && (p[1] == 'x' || p[1] == 'X')) {
@@ -439,7 +431,7 @@ mirb_highlight_print_line(mirb_highlighter *hl, const char *line)
       mrb_bool is_const = is_upper(*p);
       /* Check if preceded by dot (method call like obj.class) */
       mrb_bool after_dot = (token_start > line && token_start[-1] == '.');
-      while (*p && (is_word_char(*p) || *p == '?' || *p == '!')) p++;
+      while (*p && (mirb_is_word_char(*p) || *p == '?' || *p == '!')) p++;
 
       size_t len = (size_t)(p - token_start);
 

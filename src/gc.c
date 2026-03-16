@@ -121,7 +121,13 @@ struct free_obj {
 
 struct RVALUE_initializer {
   MRB_OBJECT_HEADER;
+#if defined(MRB_WORD_BOXING) && defined(MRB_32BIT) && defined(MRB_USE_FLOAT32) && !defined(MRB_WORDBOX_NO_INLINE_FLOAT)
+  /* inline float word boxing needs 8-byte aligned objects;
+     pad RVALUE to 24 bytes (multiple of 8) on 32-bit */
+  char padding[sizeof(void*) * 4];
+#else
   char padding[sizeof(void*) * 3];
+#endif
 };
 
 struct RVALUE {
@@ -160,8 +166,16 @@ typedef struct mrb_heap_page {
   struct mrb_heap_page *next;
   struct mrb_heap_page *free_next;
   mrb_bool old:1;
+  mrb_bool region:1;             /* from contiguous region, not malloc */
   RVALUE objects[MRB_HEAP_PAGE_SIZE];
 } mrb_heap_page;
+
+typedef struct mrb_heap_region {
+  struct mrb_heap_region *next;
+  uint8_t *base;                 /* start of user buffer */
+  size_t size;                   /* buffer size in bytes */
+  uint16_t page_count;           /* pages carved from region */
+} mrb_heap_region;
 
 #define GC_STEP_SIZE 1024
 
@@ -277,6 +291,17 @@ static mrb_bool
 heap_p(mrb_gc *gc, const struct RBasic *object)
 {
   mrb_heap_page* page;
+  mrb_heap_region *region;
+
+  /* fast path: check contiguous regions via arithmetic */
+  for (region = gc->regions; region; region = region->next) {
+    uintptr_t addr = (uintptr_t)object;
+    uintptr_t base = (uintptr_t)region->base;
+    uintptr_t end = base + (size_t)region->page_count * sizeof(mrb_heap_page);
+    if (addr >= base && addr < end) {
+      return TRUE;
+    }
+  }
 
   page = gc->heaps;
   while (page) {
@@ -300,9 +325,17 @@ mrb_object_dead_p(mrb_state *mrb, struct RBasic *object)
 }
 
 static void
-add_heap(mrb_state *mrb, mrb_gc *gc)
+link_heap_page(mrb_gc *gc, mrb_heap_page *page)
 {
-  mrb_heap_page *page = (mrb_heap_page*)mrb_calloc(mrb, 1, sizeof(mrb_heap_page));
+  page->next = gc->heaps;
+  gc->heaps = page;
+  page->free_next = gc->free_heaps;
+  gc->free_heaps = page;
+}
+
+static void
+init_heap_page(mrb_heap_page *page)
+{
   RVALUE *p, *e;
   RVALUE *prev = NULL;
 
@@ -312,12 +345,50 @@ add_heap(mrb_state *mrb, mrb_gc *gc)
     prev = p;
   }
   page->freelist = prev;
+}
 
-  page->next = gc->heaps;
-  gc->heaps = page;
+static void
+add_heap(mrb_state *mrb, mrb_gc *gc)
+{
+  mrb_heap_page *page = (mrb_heap_page*)mrb_calloc(mrb, 1, sizeof(mrb_heap_page));
+  init_heap_page(page);
+  link_heap_page(gc, page);
+}
 
-  page->free_next = gc->free_heaps;
-  gc->free_heaps = page;
+MRB_API int
+mrb_gc_add_region(mrb_state *mrb, void *start, size_t size)
+{
+  mrb_gc *gc = &mrb->gc;
+  uint8_t *base = (uint8_t*)start;
+  mrb_heap_region *region;
+  uint16_t page_count;
+  uint16_t i;
+
+  /* align base to pointer size */
+  uintptr_t align = sizeof(void*);
+  uintptr_t offset = ((uintptr_t)base + align - 1) & ~(align - 1);
+  size -= (size_t)(offset - (uintptr_t)base);
+  base = (uint8_t*)offset;
+
+  page_count = (uint16_t)(size / sizeof(mrb_heap_page));
+  if (page_count == 0) return 0;
+
+  region = (mrb_heap_region*)mrb_malloc(mrb, sizeof(mrb_heap_region));
+  region->base = base;
+  region->size = size;
+  region->page_count = page_count;
+  region->next = gc->regions;
+  gc->regions = region;
+
+  /* carve pages from the contiguous buffer */
+  for (i = 0; i < page_count; i++) {
+    mrb_heap_page *page = (mrb_heap_page*)(base + (size_t)i * sizeof(mrb_heap_page));
+    memset(page, 0, sizeof(mrb_heap_page));
+    page->region = TRUE;
+    init_heap_page(page);
+    link_heap_page(gc, page);
+  }
+  return page_count;
 }
 
 #define DEFAULT_GC_INTERVAL_RATIO 200
@@ -339,6 +410,7 @@ mrb_gc_init(mrb_state *mrb, mrb_gc *gc)
   gc->current_white_part = GC_WHITE_A;
   gc->heaps = NULL;
   gc->free_heaps = NULL;
+  gc->regions = NULL;
   add_heap(mrb, gc);
   gc->interval_ratio = DEFAULT_GC_INTERVAL_RATIO;
   gc->step_ratio = DEFAULT_GC_STEP_RATIO;
@@ -364,7 +436,9 @@ free_heap(mrb_state *mrb, mrb_gc *gc)
       if (p->as.free.tt != MRB_TT_FREE)
         obj_free(mrb, &p->as.basic, TRUE);
     }
-    mrb_free(mrb, tmp);
+    if (!tmp->region) {
+      mrb_free(mrb, tmp);
+    }
   }
 }
 
@@ -372,6 +446,15 @@ void
 mrb_gc_destroy(mrb_state *mrb, mrb_gc *gc)
 {
   free_heap(mrb, gc);
+  /* free region descriptors (buffer memory belongs to the caller) */
+  {
+    mrb_heap_region *region = gc->regions;
+    while (region) {
+      mrb_heap_region *next = region->next;
+      mrb_free(mrb, region);
+      region = next;
+    }
+  }
 #ifndef MRB_GC_FIXED_ARENA
   mrb_free(mrb, gc->arena);
 #endif
@@ -518,6 +601,9 @@ mrb_obj_alloc(mrb_state *mrb, enum mrb_vtype ttype, struct RClass *cls)
   *p = RVALUE_zero;
   p->as.basic.tt = ttype;
   p->as.basic.c = cls;
+  if (ttype == MRB_TT_OBJECT) {
+    p->as.basic.flags |= MRB_FL_OBJ_SHAPED;
+  }
   paint_partial_white(gc, &p->as.basic);
   return &p->as.basic;
 }
@@ -1114,7 +1200,7 @@ incremental_sweep_phase(mrb_state *mrb, mrb_gc *gc, size_t limit)
     }
 
     /* free dead slot */
-    if (dead_slot) {
+    if (dead_slot && !page->region) {
       mrb_heap_page *next = page->next;
 
       if (prev) prev->next = next;
@@ -1594,7 +1680,13 @@ mrb_init_gc(mrb_state *mrb)
 {
   struct RClass *gc;
 
+#if defined(MRB_WORD_BOXING) && defined(MRB_32BIT) && defined(MRB_USE_FLOAT32) && !defined(MRB_WORDBOX_NO_INLINE_FLOAT)
+  /* 6 words: padded to 8-byte alignment for inline float word boxing */
+  mrb_static_assert(sizeof(RVALUE) <= sizeof(void*) * 6,
+                    "RVALUE size must be within 6 words");
+#else
   mrb_static_assert_object_size(RVALUE);
+#endif
 
   gc = mrb_define_module_id(mrb, MRB_SYM(GC));
 

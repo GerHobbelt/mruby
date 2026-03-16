@@ -2303,45 +2303,44 @@ mrb_hash_eql(mrb_state *mrb, mrb_value hash)
 }
 
 /* ---------------------------*/
-static mrb_mt_entry hash_rom_entries[] = {
-  MRB_MT_ENTRY(mrb_hash_equal,           MRB_OPSYM(eq),            MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_aget,            MRB_OPSYM(aref),          MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_aset,            MRB_OPSYM(aset),          MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_clear,           MRB_SYM(clear),           MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_hash_default,         MRB_SYM(default),         MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_set_default,     MRB_SYM_E(default),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_default_proc,    MRB_SYM(default_proc),    MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_hash_set_default_proc, MRB_SYM_E(default_proc), MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_delete,          MRB_SYM(__delete),        MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_eql,             MRB_SYM_Q(eql),           MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_empty_m,         MRB_SYM_Q(empty),         MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_hash_has_key,         MRB_SYM_Q(has_key),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_has_value,       MRB_SYM_Q(has_value),     MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_has_key,         MRB_SYM_Q(include),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_init,            MRB_SYM(initialize),      MRB_MT_FUNC|MRB_MT_PRIVATE),
-  MRB_MT_ENTRY(mrb_hash_init_copy,       MRB_SYM(initialize_copy), MRB_MT_FUNC|MRB_MT_PRIVATE),
-  MRB_MT_ENTRY(mrb_hash_has_key,         MRB_SYM_Q(key),           MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_keys,            MRB_SYM(keys),            MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_hash_size_m,          MRB_SYM(length),          MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_hash_has_key,         MRB_SYM_Q(member),        MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_init_copy,       MRB_SYM(replace),         MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_shift,           MRB_SYM(shift),           MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_hash_size_m,          MRB_SYM(size),            MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_hash_aset,            MRB_SYM(store),           MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_has_value,       MRB_SYM_Q(value),         MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_values,          MRB_SYM(values),          MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_hash_to_s,            MRB_SYM(to_s),            MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_hash_to_s,            MRB_SYM(inspect),         MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_hash_rehash,          MRB_SYM(rehash),          MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_hash_to_hash,         MRB_SYM(to_hash),         MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_hash_assoc,           MRB_SYM(assoc),           MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_rassoc,          MRB_SYM(rassoc),          MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_merge_m,         MRB_SYM(__merge),         MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_compact,         MRB_SYM(__compact),       MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_hash_pat_values,      MRB_SYM(__pat_values),    MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_hash_except_keys,     MRB_SYM(__except),        MRB_MT_FUNC),
+static const mrb_mt_entry hash_rom_entries[] = {
+  MRB_MT_ENTRY(mrb_hash_equal,            MRB_OPSYM(eq),            MRB_ARGS_REQ(1)),                                    /* 15.2.13.4.1  */
+  MRB_MT_ENTRY(mrb_hash_aget,             MRB_OPSYM(aref),          MRB_ARGS_REQ(1)),                                    /* 15.2.13.4.2  */
+  MRB_MT_ENTRY(mrb_hash_aset,             MRB_OPSYM(aset),          MRB_ARGS_REQ(2)),                                    /* 15.2.13.4.3  */
+  MRB_MT_ENTRY(mrb_hash_clear,            MRB_SYM(clear),           MRB_ARGS_NONE()),                                    /* 15.2.13.4.4  */
+  MRB_MT_ENTRY(mrb_hash_default,          MRB_SYM(default),         MRB_ARGS_OPT(1)),                                    /* 15.2.13.4.5  */
+  MRB_MT_ENTRY(mrb_hash_set_default,      MRB_SYM_E(default),       MRB_ARGS_REQ(1)),                                    /* 15.2.13.4.6  */
+  MRB_MT_ENTRY(mrb_hash_default_proc,     MRB_SYM(default_proc),    MRB_ARGS_NONE()),                                    /* 15.2.13.4.7  */
+  MRB_MT_ENTRY(mrb_hash_set_default_proc, MRB_SYM_E(default_proc),  MRB_ARGS_REQ(1)),                                    /* 15.2.13.4.7  */
+  MRB_MT_ENTRY(mrb_hash_delete,           MRB_SYM(__delete),        MRB_ARGS_REQ(1)),                                    /* core of 15.2.13.4.8  */
+  MRB_MT_ENTRY(mrb_hash_eql,              MRB_SYM_Q(eql),           MRB_ARGS_REQ(1)),                                    /* Hash#eql? */
+  MRB_MT_ENTRY(mrb_hash_empty_m,          MRB_SYM_Q(empty),         MRB_ARGS_NONE()),                                    /* 15.2.13.4.12 */
+  MRB_MT_ENTRY(mrb_hash_has_key,          MRB_SYM_Q(has_key),       MRB_ARGS_REQ(1)),                                    /* 15.2.13.4.13 */
+  MRB_MT_ENTRY(mrb_hash_has_value,        MRB_SYM_Q(has_value),     MRB_ARGS_REQ(1)),                                    /* 15.2.13.4.14 */
+  MRB_MT_ENTRY(mrb_hash_has_key,          MRB_SYM_Q(include),       MRB_ARGS_REQ(1)),                                    /* 15.2.13.4.15 */
+  MRB_MT_ENTRY(mrb_hash_init,             MRB_SYM(initialize),      MRB_ARGS_OPT(1)|MRB_ARGS_BLOCK() | MRB_MT_PRIVATE),  /* 15.2.13.4.16 */
+  MRB_MT_ENTRY(mrb_hash_init_copy,        MRB_SYM(initialize_copy), MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),                   /* 15.2.13.4.17 */
+  MRB_MT_ENTRY(mrb_hash_has_key,          MRB_SYM_Q(key),           MRB_ARGS_REQ(1)),                                    /* 15.2.13.4.18 */
+  MRB_MT_ENTRY(mrb_hash_keys,             MRB_SYM(keys),            MRB_ARGS_NONE()),                                    /* 15.2.13.4.19 */
+  MRB_MT_ENTRY(mrb_hash_size_m,           MRB_SYM(length),          MRB_ARGS_NONE()),                                    /* 15.2.13.4.20 */
+  MRB_MT_ENTRY(mrb_hash_has_key,          MRB_SYM_Q(member),        MRB_ARGS_REQ(1)),                                    /* 15.2.13.4.21 */
+  MRB_MT_ENTRY(mrb_hash_init_copy,        MRB_SYM(replace),         MRB_ARGS_REQ(1)),                                    /* 15.2.13.4.23 */
+  MRB_MT_ENTRY(mrb_hash_shift,            MRB_SYM(shift),           MRB_ARGS_NONE()),                                    /* 15.2.13.4.24 */
+  MRB_MT_ENTRY(mrb_hash_size_m,           MRB_SYM(size),            MRB_ARGS_NONE()),                                    /* 15.2.13.4.25 */
+  MRB_MT_ENTRY(mrb_hash_aset,             MRB_SYM(store),           MRB_ARGS_REQ(2)),                                    /* 15.2.13.4.26 */
+  MRB_MT_ENTRY(mrb_hash_has_value,        MRB_SYM_Q(value),         MRB_ARGS_REQ(1)),                                    /* 15.2.13.4.27 */
+  MRB_MT_ENTRY(mrb_hash_values,           MRB_SYM(values),          MRB_ARGS_NONE()),                                    /* 15.2.13.4.28 */
+  MRB_MT_ENTRY(mrb_hash_to_s,             MRB_SYM(to_s),            MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_hash_to_s,             MRB_SYM(inspect),         MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_hash_rehash,           MRB_SYM(rehash),          MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_hash_to_hash,          MRB_SYM(to_hash),         MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_hash_assoc,            MRB_SYM(assoc),           MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(mrb_hash_rassoc,           MRB_SYM(rassoc),          MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(mrb_hash_merge_m,          MRB_SYM(__merge),         MRB_ARGS_ANY()),
+  MRB_MT_ENTRY(mrb_hash_compact,          MRB_SYM(__compact),       MRB_ARGS_NONE()),                                    /* implementation of Hash#compact! */
+  MRB_MT_ENTRY(mrb_hash_pat_values,       MRB_SYM(__pat_values),    MRB_ARGS_REQ(1)),                                    /* for pattern matching keys */
+  MRB_MT_ENTRY(mrb_hash_except_keys,      MRB_SYM(__except),        MRB_ARGS_REQ(1)),                                    /* for pattern matching **rest */
 };
-static mrb_mt_tbl hash_rom_mt = MRB_MT_ROM_TAB(hash_rom_entries);
 
 void
 mrb_init_hash(mrb_state *mrb)
@@ -2351,6 +2350,6 @@ mrb_init_hash(mrb_state *mrb)
   mrb->hash_class = h = mrb_define_class_id(mrb, MRB_SYM(Hash), mrb->object_class);              /* 15.2.13 */
   MRB_SET_INSTANCE_TT(h, MRB_TT_HASH);
 
-  mrb_mt_init_rom(h, &hash_rom_mt);
+  MRB_MT_INIT_ROM(mrb, h, hash_rom_entries);
 }
 #undef lesser

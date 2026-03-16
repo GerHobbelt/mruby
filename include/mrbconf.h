@@ -64,8 +64,14 @@
 # define MRB_WORD_BOXING
 #endif
 
-/* if defined mruby allocates Float objects in the heap to keep full precision if needed */
-//#define MRB_WORDBOX_NO_FLOAT_TRUNCATE
+/* if defined mruby does not inline float values in word boxing;
+   all floats are heap-allocated as RFloat objects */
+//#define MRB_WORDBOX_NO_INLINE_FLOAT
+
+/* obsolete configuration */
+#if defined(MRB_WORDBOX_NO_FLOAT_TRUNCATE)
+# define MRB_WORDBOX_NO_INLINE_FLOAT
+#endif
 
 /* add -DMRB_INT32 to use 32-bit integer for mrb_int; conflict with MRB_INT64;
    Default for 32-bit CPU mode. */
@@ -84,6 +90,13 @@
 /* Otherwise use 32-bit integers */
 #  define MRB_INT32
 # endif
+#endif
+
+/* MRB_INT64 on 32-bit with word/NaN boxing causes alignment issues
+   for heap-allocated RInteger (int64_t needs 8-byte alignment but
+   GC heap slots may not guarantee it); use MRB_NO_BOXING instead */
+#if defined(MRB_INT64) && defined(MRB_32BIT) && !defined(MRB_NO_BOXING)
+#error "MRB_INT64 on 32-bit requires MRB_NO_BOXING"
 #endif
 
 /* call malloc_trim(0) from mrb_full_gc() */

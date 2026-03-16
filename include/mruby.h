@@ -227,7 +227,7 @@ mrb_static_assert_powerof2(MRB_METHOD_CACHE_SIZE);
 typedef mrb_value (*mrb_func_t)(struct mrb_state *mrb, mrb_value self);
 
 typedef struct {
-  uint32_t flags;                       /* compatible with mt keys in class.c */
+  uint32_t flags;                       /* method flags (no symbol packed) */
 
   union {
     const struct RProc *proc;
@@ -238,7 +238,7 @@ typedef struct {
 #ifndef MRB_NO_METHOD_CACHE
 struct mrb_cache_entry {
   struct RClass *c, *c0;
-  /* mrb_sym mid; // mid is stored in mrb_method_t::flags */
+  mrb_sym mid;
   mrb_method_t m;
 };
 #endif
@@ -322,6 +322,10 @@ typedef struct mrb_state {
 #ifdef MRB_GC_FIXED_ARENA
   struct RObject *arena_err;              /* pre-allocated arena overflow error */
 #endif
+
+  struct mrb_mt_rom_list *rom_mt;  /* heap-allocated ROM wrappers (freed at close) */
+
+  struct mrb_iv_shape *root_shape; /* root of IV shape tree */
 
   void *ud; /* auxiliary data */
 

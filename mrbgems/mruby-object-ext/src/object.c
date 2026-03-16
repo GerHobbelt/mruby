@@ -97,36 +97,29 @@ obj_instance_exec(mrb_state *mrb, mrb_value self)
   return mrb_object_exec(mrb, self, mrb_singleton_class_ptr(mrb, self));
 }
 
-static mrb_mt_entry nil_ext_rom_entries[] = {
-  MRB_MT_ENTRY(nil_to_a, MRB_SYM(to_a), MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(nil_to_h, MRB_SYM(to_h), MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(nil_to_i, MRB_SYM(to_i), MRB_MT_FUNC|MRB_MT_NOARG),
+static const mrb_mt_entry nil_ext_rom_entries[] = {
+  MRB_MT_ENTRY(nil_to_a, MRB_SYM(to_a), MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(nil_to_h, MRB_SYM(to_h), MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(nil_to_i, MRB_SYM(to_i), MRB_ARGS_NONE()),
+#ifndef MRB_NO_FLOAT
+  MRB_MT_ENTRY(nil_to_f, MRB_SYM(to_f), MRB_ARGS_NONE()),
+#endif
 };
-static mrb_mt_tbl nil_ext_rom_mt = MRB_MT_ROM_TAB(nil_ext_rom_entries);
 
-static mrb_mt_entry kernel_ext_rom_entries[] = {
-  MRB_MT_ENTRY(mrb_obj_itself, MRB_SYM(itself), MRB_MT_FUNC|MRB_MT_NOARG),
+static const mrb_mt_entry bob_ext_rom_entries[] = {
+  MRB_MT_ENTRY(obj_instance_exec, MRB_SYM(instance_exec), MRB_ARGS_ANY()|MRB_ARGS_BLOCK()),
 };
-static mrb_mt_tbl kernel_ext_rom_mt = MRB_MT_ROM_TAB(kernel_ext_rom_entries);
-
-static mrb_mt_entry bob_ext_rom_entries[] = {
-  MRB_MT_ENTRY(obj_instance_exec, MRB_SYM(instance_exec), MRB_MT_FUNC),
-};
-static mrb_mt_tbl bob_ext_rom_mt = MRB_MT_ROM_TAB(bob_ext_rom_entries);
 
 void
 mrb_mruby_object_ext_gem_init(mrb_state* mrb)
 {
   struct RClass * n = mrb->nil_class;
 
-  mrb_mt_init_rom(n, &nil_ext_rom_mt);
-#ifndef MRB_NO_FLOAT
-  mrb_define_method_id(mrb, n, MRB_SYM(to_f), nil_to_f,       MRB_ARGS_NONE());
-#endif
+  MRB_MT_INIT_ROM(mrb, n, nil_ext_rom_entries);
 
-  mrb_mt_init_rom(mrb->kernel_module, &kernel_ext_rom_mt);
+  mrb_define_method_id(mrb, mrb->kernel_module, MRB_SYM(itself), mrb_obj_itself, MRB_ARGS_NONE());
 
-  mrb_mt_init_rom(mrb_class_get_id(mrb, MRB_SYM(BasicObject)), &bob_ext_rom_mt);
+  MRB_MT_INIT_ROM(mrb, mrb_class_get_id(mrb, MRB_SYM(BasicObject)), bob_ext_rom_entries);
 }
 
 void

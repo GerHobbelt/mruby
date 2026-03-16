@@ -49,6 +49,12 @@ typedef struct mirb_highlighter {
 } mirb_highlighter;
 
 /*
+ * Ruby keyword list (sorted alphabetically, NULL-terminated)
+ */
+extern const char *mirb_keywords[];
+extern const size_t mirb_num_keywords;
+
+/*
  * Initialize highlighter with auto-detected or specified theme
  */
 void mirb_highlight_init(mirb_highlighter *hl, mrb_bool enabled);
@@ -91,5 +97,8 @@ void mirb_highlight_print_result(mirb_highlighter *hl, const char *result);
  * Print error message with highlighting
  */
 void mirb_highlight_print_error(mirb_highlighter *hl, const char *error);
+
+/* Common ANSI reset code shared across modules */
+#define COLOR_RESET "\033[0m"
 
 #endif /* MIRB_HIGHLIGHT_H */

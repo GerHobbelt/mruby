@@ -8,7 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 
 #ifdef MRB_UTF8_STRING
 /*
@@ -258,6 +257,44 @@ line_set(mirb_line *line, const char *str, size_t len)
 }
 
 /*
+ * Helper: Ensure buffer has capacity for one more line
+ */
+static mrb_bool
+buffer_ensure_line_cap(mirb_buffer *buf)
+{
+  if (buf->line_count < buf->line_cap) return TRUE;
+  size_t new_cap = buf->line_cap * 2;
+  if (new_cap > MIRB_BUF_LINES_MAX) return FALSE;
+  mirb_line *new_lines = (mirb_line*)realloc(buf->lines, sizeof(mirb_line) * new_cap);
+  if (new_lines == NULL) return FALSE;
+  buf->lines = new_lines;
+  buf->line_cap = new_cap;
+  return TRUE;
+}
+
+/*
+ * Helper: Join line at line_idx with the previous line (line_idx-1).
+ * Appends content of line_idx to line_idx-1, then removes line_idx.
+ */
+static mrb_bool
+buffer_join_line_up(mirb_buffer *buf, size_t line_idx)
+{
+  mirb_line *prev = &buf->lines[line_idx - 1];
+  mirb_line *curr = &buf->lines[line_idx];
+
+  if (!line_ensure_cap(prev, curr->len)) return FALSE;
+  memcpy(prev->data + prev->len, curr->data, curr->len + 1);
+  prev->len += curr->len;
+
+  line_free(curr);
+  memmove(&buf->lines[line_idx],
+          &buf->lines[line_idx + 1],
+          sizeof(mirb_line) * (buf->line_count - line_idx - 1));
+  buf->line_count--;
+  return TRUE;
+}
+
+/*
  * Initialize buffer
  */
 mrb_bool
@@ -397,14 +434,7 @@ mirb_buffer_set_string(mirb_buffer *buf, const char *str)
       /* Set current line */
       if (line_idx >= buf->line_count) {
         /* Need to add new line */
-        if (buf->line_count >= buf->line_cap) {
-          size_t new_cap = buf->line_cap * 2;
-          if (new_cap > MIRB_BUF_LINES_MAX) return FALSE;
-          mirb_line *new_lines = (mirb_line*)realloc(buf->lines, sizeof(mirb_line) * new_cap);
-          if (new_lines == NULL) return FALSE;
-          buf->lines = new_lines;
-          buf->line_cap = new_cap;
-        }
+        if (!buffer_ensure_line_cap(buf)) return FALSE;
         if (!line_init(&buf->lines[buf->line_count])) return FALSE;
         buf->line_count++;
       }
@@ -422,14 +452,7 @@ mirb_buffer_set_string(mirb_buffer *buf, const char *str)
   /* Handle last line (may not end with newline) */
   if (start < p || line_idx == 0) {
     if (line_idx >= buf->line_count) {
-      if (buf->line_count >= buf->line_cap) {
-        size_t new_cap = buf->line_cap * 2;
-        if (new_cap > MIRB_BUF_LINES_MAX) return FALSE;
-        mirb_line *new_lines = (mirb_line*)realloc(buf->lines, sizeof(mirb_line) * new_cap);
-        if (new_lines == NULL) return FALSE;
-        buf->lines = new_lines;
-        buf->line_cap = new_cap;
-      }
+      if (!buffer_ensure_line_cap(buf)) return FALSE;
       if (!line_init(&buf->lines[buf->line_count])) return FALSE;
       buf->line_count++;
     }
@@ -503,22 +526,8 @@ mirb_buffer_delete_back(mirb_buffer *buf)
   }
   else if (buf->cursor_line > 0) {
     /* Join with previous line */
-    mirb_line *prev = &buf->lines[buf->cursor_line - 1];
-    mirb_line *curr = &buf->lines[buf->cursor_line];
-    size_t prev_len = prev->len;
-
-    /* Append current line to previous */
-    if (!line_ensure_cap(prev, curr->len)) return FALSE;
-    memcpy(prev->data + prev->len, curr->data, curr->len + 1);
-    prev->len += curr->len;
-
-    /* Remove current line */
-    line_free(curr);
-    memmove(&buf->lines[buf->cursor_line],
-            &buf->lines[buf->cursor_line + 1],
-            sizeof(mirb_line) * (buf->line_count - buf->cursor_line - 1));
-    buf->line_count--;
-
+    size_t prev_len = buf->lines[buf->cursor_line - 1].len;
+    if (!buffer_join_line_up(buf, buf->cursor_line)) return FALSE;
     buf->cursor_line--;
     buf->cursor_col = prev_len;
     buf->modified = TRUE;
@@ -554,21 +563,7 @@ mirb_buffer_delete_forward(mirb_buffer *buf)
   }
   else if (buf->cursor_line < buf->line_count - 1) {
     /* Join with next line */
-    mirb_line *curr = &buf->lines[buf->cursor_line];
-    mirb_line *next = &buf->lines[buf->cursor_line + 1];
-
-    /* Append next line to current */
-    if (!line_ensure_cap(curr, next->len)) return FALSE;
-    memcpy(curr->data + curr->len, next->data, next->len + 1);
-    curr->len += next->len;
-
-    /* Remove next line */
-    line_free(next);
-    memmove(&buf->lines[buf->cursor_line + 1],
-            &buf->lines[buf->cursor_line + 2],
-            sizeof(mirb_line) * (buf->line_count - buf->cursor_line - 2));
-    buf->line_count--;
-
+    if (!buffer_join_line_up(buf, buf->cursor_line + 1)) return FALSE;
     buf->modified = TRUE;
     return TRUE;
   }
@@ -582,14 +577,7 @@ mrb_bool
 mirb_buffer_newline(mirb_buffer *buf)
 {
   /* Ensure we have room for a new line */
-  if (buf->line_count >= buf->line_cap) {
-    size_t new_cap = buf->line_cap * 2;
-    if (new_cap > MIRB_BUF_LINES_MAX) return FALSE;
-    mirb_line *new_lines = (mirb_line*)realloc(buf->lines, sizeof(mirb_line) * new_cap);
-    if (new_lines == NULL) return FALSE;
-    buf->lines = new_lines;
-    buf->line_cap = new_cap;
-  }
+  if (!buffer_ensure_line_cap(buf)) return FALSE;
 
   mirb_line *curr = &buf->lines[buf->cursor_line];
   size_t split_pos = buf->cursor_col;
@@ -783,15 +771,6 @@ mirb_buffer_cursor_finish(mirb_buffer *buf)
 }
 
 /*
- * Helper: Check if character is word character
- */
-static mrb_bool
-is_word_char(char c)
-{
-  return isalnum((unsigned char)c) || c == '_';
-}
-
-/*
  * Move cursor back one word
  */
 mrb_bool
@@ -810,7 +789,7 @@ mirb_buffer_cursor_word_back(mirb_buffer *buf)
     }
 
     char c = buf->lines[buf->cursor_line].data[buf->cursor_col - 1];
-    if (is_word_char(c)) break;
+    if (mirb_is_word_char(c)) break;
     buf->cursor_col--;
     moved = TRUE;
   }
@@ -818,7 +797,7 @@ mirb_buffer_cursor_word_back(mirb_buffer *buf)
   /* Move through word chars */
   while (buf->cursor_col > 0) {
     char c = buf->lines[buf->cursor_line].data[buf->cursor_col - 1];
-    if (!is_word_char(c)) break;
+    if (!mirb_is_word_char(c)) break;
     buf->cursor_col--;
     moved = TRUE;
   }
@@ -837,7 +816,7 @@ mirb_buffer_cursor_word_forward(mirb_buffer *buf)
 
   /* Move through current word chars */
   while (buf->cursor_col < line->len) {
-    if (!is_word_char(line->data[buf->cursor_col])) break;
+    if (!mirb_is_word_char(line->data[buf->cursor_col])) break;
     buf->cursor_col++;
     moved = TRUE;
   }
@@ -853,7 +832,7 @@ mirb_buffer_cursor_word_forward(mirb_buffer *buf)
       continue;
     }
 
-    if (is_word_char(line->data[buf->cursor_col])) break;
+    if (mirb_is_word_char(line->data[buf->cursor_col])) break;
     buf->cursor_col++;
     moved = TRUE;
   }
@@ -960,12 +939,12 @@ mirb_buffer_kill_word_forward(mirb_buffer *buf)
   size_t end_col = start_col;
 
   /* Skip word chars */
-  while (end_col < line->len && is_word_char(line->data[end_col])) {
+  while (end_col < line->len && mirb_is_word_char(line->data[end_col])) {
     end_col++;
   }
 
   /* Skip non-word chars */
-  while (end_col < line->len && !is_word_char(line->data[end_col])) {
+  while (end_col < line->len && !mirb_is_word_char(line->data[end_col])) {
     end_col++;
   }
 

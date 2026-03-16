@@ -46,57 +46,64 @@ After String.define_method(:foo):
 ### Memory Layout
 
 Each `mrb_mt_tbl` stores method entries as an array of `mrb_mt_entry`
-structs, each combining a function pointer and an encoded key:
+structs, each combining a function pointer, a symbol key, and flags:
 
 ```
 ptr -> [ entry[0] | entry[1] | ... | entry[N-1] ]
-       |<--- mrb_mt_entry: { val, key } each ---->|
+       |<-- mrb_mt_entry: { val, key, flags } -->|
 ```
 
 Values are `union mrb_mt_ptr` (function pointer or proc pointer). Keys
-are `mrb_sym` with flags packed into the lower bits using
-`MRB_MT_KEY()`.
+are pure `mrb_sym` (no flag encoding). Flags are a separate `uint32_t`
+field that stores visibility, func/proc type, and argument spec.
 
-Entries must be sorted by symbol ID for binary search. The
-`mrb_mt_init_rom()` function handles sorting at startup, so the
-source code order does not matter.
+Entries are searched linearly, so source code order does not matter.
+The method cache makes repeated lookups O(1), so the linear scan
+only occurs on cache misses.
+
+### Per-State Wrappers
+
+The `const mrb_mt_entry[]` arrays are truly static and shared across
+the process. However, the `mrb_mt_tbl` wrapper (which carries the
+`next` pointer for chaining) is heap-allocated per `mrb_state` by
+`MRB_MT_INIT_ROM()`. This allows multiple `mrb_state` instances in
+the same process to each have independent method table chains, even
+when linking to the same const entries.
 
 ## How to Define a ROM Method Table
 
 ### Step 1: Define the Static Data
 
-Include `<mruby/internal.h>` (which provides `mrb_mt_entry`,
-`mrb_mt_tbl`, `MRB_MT_ENTRY()`, `MRB_MT_ROM_TAB()`, and flag
-constants) and define the ROM entries:
+Include `<mruby/class.h>` (which provides `mrb_mt_entry`,
+`MRB_MT_ENTRY()`, and flag constants) and define the ROM entries:
 
 ```c
-#include <mruby/internal.h>
+#include <mruby/class.h>
 #include <mruby/presym.h>
 
-static mrb_mt_entry my_rom_entries[] = {
-  MRB_MT_ENTRY(my_method_a, MRB_SYM(method_a), MRB_MT_FUNC),
-  MRB_MT_ENTRY(my_method_b, MRB_SYM(method_b), MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(my_method_eq, MRB_OPSYM(eq),    MRB_MT_FUNC),
+static const mrb_mt_entry my_rom_entries[] = {
+  MRB_MT_ENTRY(my_method_a,  MRB_SYM(method_a), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(my_method_b,  MRB_SYM(method_b), MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(my_method_eq, MRB_OPSYM(eq),     MRB_ARGS_REQ(1)),
 };
-static mrb_mt_tbl my_rom_mt = MRB_MT_ROM_TAB(my_rom_entries);
 ```
 
 ### Step 2: Register in the Init Function
 
 Replace `mrb_define_method_id()` calls with a single
-`mrb_mt_init_rom()` call:
+`MRB_MT_INIT_ROM()` call:
 
 ```c
 void
 mrb_mruby_mygem_gem_init(mrb_state *mrb)
 {
   struct RClass *c = mrb_define_class_id(mrb, MRB_SYM(MyClass), mrb->object_class);
-  mrb_mt_init_rom(c, &my_rom_mt);
+  MRB_MT_INIT_ROM(mrb, c, my_rom_entries);
 }
 ```
 
-`mrb_mt_init_rom()` sorts the entries by symbol ID, sets the readonly
-flag, and pushes the ROM layer onto the class's method table chain.
+`MRB_MT_INIT_ROM()` allocates a per-state wrapper and pushes the ROM
+layer onto the class's method table chain.
 
 ### Step 3: Verify
 
@@ -107,7 +114,7 @@ to Ruby code.
 
 ### Data Types
 
-Defined in `include/mruby/internal.h`:
+Defined in `include/mruby/class.h`:
 
 ```c
 union mrb_mt_ptr {
@@ -117,7 +124,8 @@ union mrb_mt_ptr {
 
 typedef struct mrb_mt_entry {
   union mrb_mt_ptr val;
-  mrb_sym key;
+  mrb_sym key;              /* pure symbol ID (no flags packed) */
+  uint32_t flags;           /* method flags + aspec */
 } mrb_mt_entry;
 
 typedef struct mrb_mt_tbl {
@@ -131,42 +139,41 @@ typedef struct mrb_mt_tbl {
 ### Macros
 
 ```c
-/* ROM table entry: bundles function pointer with encoded key */
+/* ROM table entry: 3rd param is MRB_ARGS_*() optionally OR'd with
+   MRB_MT_PRIVATE.  The macro OR's in MRB_MT_FUNC automatically. */
 #define MRB_MT_ENTRY(fn, sym, flags) \
-  { { .func = (fn) }, MRB_MT_KEY((sym), (flags)) }
+  { { .func = (fn) }, (sym), (flags) | MRB_MT_FUNC }
 
-/* ROM table initializer (auto-computes size from entries array) */
-#define MRB_MT_ROM_TAB(entries) { \
-  (int)(sizeof(entries)/sizeof(entries[0])), \
-  (int)(sizeof(entries)/sizeof(entries[0])), \
-  (entries), NULL }
-```
+/* Extract aspec from combined flags */
+#define MRB_MT_ASPEC(flags) ((mrb_aspec)((flags) & 0xffffff))
 
-### Key Encoding
-
-```c
-#define MRB_MT_KEY(sym, flags)  ((sym) << MRB_MT_KEY_SHIFT | (flags))
+/* Allocate a per-state ROM wrapper and push onto class method chain */
+#define MRB_MT_INIT_ROM(mrb, cls, entries) \
+  mrb_mt_init_rom(mrb, cls, entries, \
+                  (int)(sizeof(entries)/sizeof(entries[0])))
 ```
 
 ### Flags
 
-| Flag             | Value | Description                                   |
-| ---------------- | ----- | --------------------------------------------- |
-| `MRB_MT_FUNC`    | 8     | Entry is a C function pointer (not an RProc)  |
-| `MRB_MT_NOARG`   | 4     | Method takes no arguments (optimization hint) |
-| `MRB_MT_PUBLIC`  | 0     | Public visibility                             |
-| `MRB_MT_PRIVATE` | 1     | Private visibility                            |
+| Flag             | Value   | Description                         |
+| ---------------- | ------- | ----------------------------------- |
+| `MRB_MT_FUNC`    | (1<<24) | C function (auto-set by macro)      |
+| `MRB_MT_PUBLIC`  | 0       | Public visibility (default)         |
+| `MRB_MT_PRIVATE` | (1<<25) | Private visibility (in entry param) |
 
-Most ROM entries use `MRB_MT_FUNC` or `MRB_MT_FUNC|MRB_MT_NOARG`.
-Since `MRB_MT_PUBLIC` is 0, it can be omitted.
+The third parameter to `MRB_MT_ENTRY()` is an `MRB_ARGS_*()`
+expression optionally OR'd with `MRB_MT_PRIVATE`. The aspec value
+occupies bits 0-23 and the visibility flag occupies bit 25; these
+ranges do not overlap, so the values are simply OR'd together.
+`MRB_MT_FUNC` is set automatically. The no-arg optimization is
+derived at runtime from `aspec == 0` (`MRB_ARGS_NONE()`).
 
-**How to choose flags:**
+**How to write entries:**
 
-- **`MRB_MT_FUNC`**: Always set for C function methods. Omit only for
-  RProc-based methods (rare in ROM tables).
-- **`MRB_MT_NOARG`**: Set when the original `mrb_define_method_id()` used
-  `MRB_ARGS_NONE()`. This enables an optimized call path in the VM.
-- **`MRB_MT_PRIVATE`**: Set for private methods (e.g., `initialize`).
+- **`MRB_MT_ENTRY(fn, sym, MRB_ARGS_*(...))`**: Public method.
+- **`MRB_MT_ENTRY(fn, sym, MRB_ARGS_*(...) | MRB_MT_PRIVATE)`**:
+  Private method.
+- Use the same `MRB_ARGS_*()` macros as `mrb_define_method_id()`.
 
 ### Symbol Macros
 
@@ -189,84 +196,81 @@ MRB_IVSYM(name)     /* @name */
 ### API
 
 ```c
-void mrb_mt_init_rom(struct RClass *c, mrb_mt_tbl *rom);
+void mrb_mt_init_rom(mrb_state *mrb, struct RClass *c,
+                     const mrb_mt_entry *entries, int size);
 ```
 
-Sorts the ROM table, sets the readonly flag, and pushes it onto the
-class's method table chain. Multiple calls push additional layers,
+Allocates a per-state `mrb_mt_tbl` wrapper for the const entries and
+pushes it onto the class's method table chain. The wrapper is tracked
+in `mrb->rom_mt` and freed at `mrb_close()`. Use the `MRB_MT_INIT_ROM`
+macro to auto-compute the size. Multiple calls push additional layers,
 which is how extension gems add methods to core classes.
 
 ## Entry Correspondence
 
 Each `MRB_MT_ENTRY()` bundles a function pointer with its method name
 and flags in a single line. Their order in the source code does not
-matter (they are sorted at init time), but keeping related methods
+matter, but keeping related methods
 together improves readability.
 
 **Method aliases** (two names for the same function) are expressed as
 separate entries sharing the same function pointer:
 
 ```c
-static mrb_mt_entry str_rom_entries[] = {
-  MRB_MT_ENTRY(mrb_str_size, MRB_SYM(size),   MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_str_size, MRB_SYM(length), MRB_MT_FUNC|MRB_MT_NOARG),
+static const mrb_mt_entry str_rom_entries[] = {
+  MRB_MT_ENTRY(mrb_str_size, MRB_SYM(size),   MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_str_size, MRB_SYM(length), MRB_ARGS_NONE()),
 };
 ```
 
 ## Conditional Methods
 
 Methods that depend on build configuration (e.g., `MRB_NO_FLOAT`) can
-be handled in two ways:
+use `#ifdef` directly inside the ROM entries array. The `sizeof` in
+`MRB_MT_INIT_ROM()` automatically adjusts to the number of entries
+that survive preprocessing:
 
-**Option A: Separate ROM table under `#ifdef`** (preferred for large
-blocks):
+```c
+static const mrb_mt_entry integer_rom_entries[] = {
+  MRB_MT_ENTRY(int_to_s, MRB_SYM(to_s), MRB_ARGS_OPT(1)),
+  MRB_MT_ENTRY(int_add,  MRB_OPSYM(add), MRB_ARGS_REQ(1)),
+#ifndef MRB_NO_FLOAT
+  MRB_MT_ENTRY(int_to_f, MRB_SYM(to_f), MRB_ARGS_NONE()),
+#endif
+};
+```
+
+For conditional methods on a **different class**, use a separate ROM
+table wrapped in the `#ifdef`:
 
 ```c
 #ifndef MRB_NO_FLOAT
-static mrb_mt_entry float_rom_entries[] = { ... };
-static mrb_mt_tbl float_rom_mt = MRB_MT_ROM_TAB(float_rom_entries);
+static const mrb_mt_entry float_rom_entries[] = { ... };
 #endif
 
 void mrb_init_numeric(mrb_state *mrb) {
-  mrb_mt_init_rom(integer, &integer_rom_mt);
+  MRB_MT_INIT_ROM(mrb, integer, integer_rom_entries);
 #ifndef MRB_NO_FLOAT
-  mrb_mt_init_rom(fl, &float_rom_mt);
+  MRB_MT_INIT_ROM(mrb, fl, float_rom_entries);
 #endif
 }
 ```
-
-**Option B: Keep as `mrb_define_method_id()`** (preferred for a few
-conditional methods):
-
-```c
-void mrb_init_numeric(mrb_state *mrb) {
-  mrb_mt_init_rom(integer, &integer_rom_mt);
-#ifndef MRB_NO_FLOAT
-  mrb_define_method_id(mrb, integer, MRB_SYM(to_f), int_to_f, MRB_ARGS_NONE());
-#endif
-}
-```
-
-Both approaches work correctly. The ROM layer and the
-`mrb_define_method_id()` calls coexist: method lookup walks the
-mutable layer first, then the ROM chain.
 
 ## Extension Gems
 
 Extension gems use exactly the same pattern. Since gems are
-initialized after core, calling `mrb_mt_init_rom()` pushes the gem's
+initialized after core, calling `MRB_MT_INIT_ROM()` pushes the gem's
 ROM layer in front of the core ROM layer:
 
 ```c
 /* mrbgems/mruby-string-ext/src/string.c */
 
-static mrb_mt_entry string_ext_rom_entries[] = { ... };
-static mrb_mt_tbl string_ext_rom_mt = MRB_MT_ROM_TAB(string_ext_rom_entries);
+static const mrb_mt_entry string_ext_rom_entries[] = { ... };
 
 void mrb_mruby_string_ext_gem_init(mrb_state *mrb)
 {
   struct RClass *s = mrb->string_class;
-  mrb_mt_init_rom(s, &string_ext_rom_mt);
+  MRB_MT_INIT_ROM(mrb, s, string_ext_rom_entries);
 }
 ```
 
@@ -283,8 +287,8 @@ A gem may also define ROM tables for multiple classes:
 ```c
 void mrb_mruby_mygem_gem_init(mrb_state *mrb)
 {
-  mrb_mt_init_rom(mrb->string_class, &string_mygem_rom_mt);
-  mrb_mt_init_rom(mrb->integer_class, &integer_mygem_rom_mt);
+  MRB_MT_INIT_ROM(mrb, mrb->string_class, string_mygem_rom_entries);
+  MRB_MT_INIT_ROM(mrb, mrb->integer_class, integer_mygem_rom_entries);
 }
 ```
 
@@ -301,8 +305,13 @@ Some methods must remain as `mrb_define_method_id()` calls:
 - **Methods on dynamically created classes**: Classes created at
   init time (not stored in `mrb->xxx_class`) that require
   `mrb_define_class()` to obtain the class pointer.
+- **Cross-class methods** (methods on a class the gem does not own):
+  Each ROM table adds a 16-byte `mrb_mt_tbl` layer to the target
+  class's chain. For 1-2 methods, this overhead exceeds the savings.
+  Use `mrb_define_method_id()` instead -- cross-class methods share
+  the target class's existing mutable layer.
 
-These methods are added after `mrb_mt_init_rom()` and go into the
+These methods are added after `MRB_MT_INIT_ROM()` and go into the
 mutable layer that sits in front of the ROM chain.
 
 ## Runtime Behavior
@@ -347,12 +356,13 @@ data is copied.
 
 ROM layers are skipped during GC mark and sweep phases. Only mutable
 layers are scanned for live RProc references and freed when the class
-is collected. This reduces GC overhead.
+is collected. ROM wrappers are freed at `mrb_close()` via the
+`mrb->rom_mt` tracking list.
 
 ### Memory Measurement
 
-`mrb_class_mt_memsize()` reports only mutable layer memory. ROM layers
-are not counted since they do not consume heap memory.
+`mrb_class_mt_memsize()` reports only mutable layer memory. ROM
+wrappers are tracked separately and not counted per-class.
 
 ## Converting Existing Code
 
@@ -363,22 +373,19 @@ To convert existing `mrb_define_method_id()` calls to a ROM table:
 2. **Create** the ROM entries array using `MRB_MT_ENTRY()`.
 
 3. **Move** each `mrb_define_method_id()` call into the entries:
-   - `MRB_MT_ENTRY(func, sym, flags)` where:
+   - `MRB_MT_ENTRY(func, sym, aspec)` where:
      - `func` is the function pointer
      - `sym` is the symbol macro (e.g., `MRB_SYM(name)`)
-     - `flags` are:
-       - `MRB_ARGS_NONE()` -> `MRB_MT_FUNC|MRB_MT_NOARG`
-       - Anything else -> `MRB_MT_FUNC`
-       - Add `MRB_MT_PRIVATE` for private methods
+     - `aspec` is the original `MRB_ARGS_*()` macro
+   - For private methods, OR `MRB_MT_PRIVATE` into the aspec:
+     `MRB_MT_ENTRY(func, sym, aspec | MRB_MT_PRIVATE)`
 
-4. **Create** the table with `MRB_MT_ROM_TAB(entries)`.
+4. **Replace** the calls with `MRB_MT_INIT_ROM(mrb, c, entries)`.
 
-5. **Replace** the calls with `mrb_mt_init_rom(c, &my_rom_mt)`.
-
-6. **Keep** any methods that cannot be converted (see above) as
+5. **Keep** any methods that cannot be converted (see above) as
    individual `mrb_define_method_id()` calls after the ROM init.
 
-7. **Build and test**: `rake CONFIG=host-debug -j24 all test:run:serial`
+6. **Build and test**: `rake CONFIG=host-debug -j24 all test:run:serial`
 
 ### Before
 
@@ -394,15 +401,14 @@ void mrb_mruby_foo_gem_init(mrb_state *mrb) {
 ### After
 
 ```c
-static mrb_mt_entry foo_rom_entries[] = {
-  MRB_MT_ENTRY(foo_bar, MRB_SYM(bar),  MRB_MT_FUNC),
-  MRB_MT_ENTRY(foo_baz, MRB_SYM(baz),  MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(foo_eq,  MRB_OPSYM(eq), MRB_MT_FUNC),
+static const mrb_mt_entry foo_rom_entries[] = {
+  MRB_MT_ENTRY(foo_bar, MRB_SYM(bar),  MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(foo_baz, MRB_SYM(baz),  MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(foo_eq,  MRB_OPSYM(eq), MRB_ARGS_REQ(1)),
 };
-static mrb_mt_tbl foo_rom_mt = MRB_MT_ROM_TAB(foo_rom_entries);
 
 void mrb_mruby_foo_gem_init(mrb_state *mrb) {
   struct RClass *foo = mrb_define_class_id(mrb, MRB_SYM(Foo), mrb->object_class);
-  mrb_mt_init_rom(foo, &foo_rom_mt);
+  MRB_MT_INIT_ROM(mrb, foo, foo_rom_entries);
 }
 ```

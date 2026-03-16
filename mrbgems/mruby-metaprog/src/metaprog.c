@@ -9,12 +9,8 @@
 #include <mruby/khash.h>
 #include <mruby/presym.h>
 
-#undef MRB_MT_PUBLIC
-#undef MRB_MT_PRIVATE
-#define MRB_MT_PUBLIC MRB_METHOD_PUBLIC_FL
-#define MRB_MT_PRIVATE MRB_METHOD_PRIVATE_FL
 #define MT_PROTECTED MRB_METHOD_PROTECTED_FL
-#define MT_NOPRIV (MRB_MT_PRIVATE|MT_PROTECTED)
+#define MT_NOPRIV (MRB_METHOD_PRIVATE_FL|MT_PROTECTED)
 
 static mrb_value
 mrb_f_nil(mrb_state *mrb, mrb_value cv)
@@ -139,7 +135,7 @@ struct mt_set {
   khash_t(st) *set;
 };
 
-#define vicheck(flags, visi) (((visi)==MT_NOPRIV) ? (((flags)&0x3)!=MRB_MT_PRIVATE) : (((flags)&0x3)==(visi)))
+#define vicheck(flags, visi) (((visi)==MT_NOPRIV) ? (((flags)&MRB_METHOD_VISIBILITY_MASK)!=MRB_METHOD_PRIVATE_FL) : (((flags)&MRB_METHOD_VISIBILITY_MASK)==(visi)))
 
 static int
 method_entry_i(mrb_state *mrb, mrb_sym mid, mrb_method_t m, void *p)
@@ -243,7 +239,7 @@ mrb_obj_methods_m(mrb_state *mrb, mrb_value self)
 static mrb_value
 mrb_obj_private_methods(mrb_state *mrb, mrb_value self)
 {
-  return mrb_obj_methods(mrb, self, MRB_MT_PRIVATE);
+  return mrb_obj_methods(mrb, self, MRB_METHOD_PRIVATE_FL);
 }
 
 /* 15.3.1.3.37 */
@@ -569,7 +565,7 @@ mrb_mod_public_instance_methods(mrb_state *mrb, mrb_value mod)
 static mrb_value
 mrb_mod_private_instance_methods(mrb_state *mrb, mrb_value mod)
 {
-  return mod_instance_methods(mrb, mod, MRB_MT_PRIVATE);
+  return mod_instance_methods(mrb, mod, MRB_METHOD_PRIVATE_FL);
 }
 
 static mrb_value
@@ -690,42 +686,40 @@ mrb_mod_s_nesting(mrb_state *mrb, mrb_value mod)
 }
 
 /* ---------------------------*/
-static mrb_mt_entry metaprog_krn_rom_entries[] = {
-  MRB_MT_ENTRY(mrb_f_global_variables,    MRB_SYM(global_variables),            MRB_MT_FUNC|MRB_MT_NOARG|MRB_MT_PRIVATE),
-  MRB_MT_ENTRY(mrb_local_variables,       MRB_SYM(local_variables),             MRB_MT_FUNC|MRB_MT_NOARG|MRB_MT_PRIVATE),
-  MRB_MT_ENTRY(mrb_singleton_class,       MRB_SYM(singleton_class),             MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_obj_ivar_defined,      MRB_SYM_Q(instance_variable_defined), MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_obj_ivar_get,          MRB_SYM(instance_variable_get),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_obj_ivar_set,          MRB_SYM(instance_variable_set),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_obj_instance_variables, MRB_SYM(instance_variables),         MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_obj_methods_m,         MRB_SYM(methods),                     MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_obj_private_methods,   MRB_SYM(private_methods),             MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_obj_protected_methods, MRB_SYM(protected_methods),           MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_obj_public_methods,    MRB_SYM(public_methods),              MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_obj_singleton_methods_m, MRB_SYM(singleton_methods),         MRB_MT_FUNC),
-  MRB_MT_ENTRY(mod_define_singleton_method, MRB_SYM(define_singleton_method),   MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_f_send,               MRB_SYM(send),                        MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_f_public_send,        MRB_SYM(public_send),                 MRB_MT_FUNC),
+static const mrb_mt_entry metaprog_krn_rom_entries[] = {
+  MRB_MT_ENTRY(mrb_f_global_variables, MRB_SYM(global_variables),                        MRB_ARGS_NONE() | MRB_MT_PRIVATE),  /* 15.3.1.3.14 (15.3.1.2.4) */
+  MRB_MT_ENTRY(mrb_local_variables, MRB_SYM(local_variables),                         MRB_ARGS_NONE() | MRB_MT_PRIVATE),  /* 15.3.1.3.28 (15.3.1.2.7) */
+  MRB_MT_ENTRY(mrb_singleton_class,       MRB_SYM(singleton_class),          MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_obj_ivar_defined,      MRB_SYM_Q(instance_variable_defined), MRB_ARGS_REQ(1)),  /* 15.3.1.3.20 */
+  MRB_MT_ENTRY(mrb_obj_ivar_get,          MRB_SYM(instance_variable_get), MRB_ARGS_REQ(1)),  /* 15.3.1.3.21 */
+  MRB_MT_ENTRY(mrb_obj_ivar_set,          MRB_SYM(instance_variable_set), MRB_ARGS_REQ(2)),  /* 15.3.1.3.22 */
+  MRB_MT_ENTRY(mrb_obj_instance_variables, MRB_SYM(instance_variables),      MRB_ARGS_NONE()),  /* 15.3.1.3.23 */
+  MRB_MT_ENTRY(mrb_obj_methods_m,         MRB_SYM(methods),       MRB_ARGS_OPT(1)),  /* 15.3.1.3.31 */
+  MRB_MT_ENTRY(mrb_obj_private_methods,   MRB_SYM(private_methods), MRB_ARGS_OPT(1)),  /* 15.3.1.3.36 */
+  MRB_MT_ENTRY(mrb_obj_protected_methods, MRB_SYM(protected_methods), MRB_ARGS_OPT(1)),  /* 15.3.1.3.37 */
+  MRB_MT_ENTRY(mrb_obj_public_methods,    MRB_SYM(public_methods), MRB_ARGS_OPT(1)),  /* 15.3.1.3.38 */
+  MRB_MT_ENTRY(mrb_obj_singleton_methods_m, MRB_SYM(singleton_methods), MRB_ARGS_OPT(1)),  /* 15.3.1.3.45 */
+  MRB_MT_ENTRY(mod_define_singleton_method, MRB_SYM(define_singleton_method), MRB_ARGS_REQ(1)|MRB_ARGS_BLOCK()),
+  MRB_MT_ENTRY(mrb_f_send,               MRB_SYM(send), MRB_ARGS_REQ(1)|MRB_ARGS_REST()|MRB_ARGS_BLOCK()),  /* 15.3.1.3.44 */
+  MRB_MT_ENTRY(mrb_f_public_send,        MRB_SYM(public_send), MRB_ARGS_REQ(1)|MRB_ARGS_REST()|MRB_ARGS_BLOCK()),
 };
-static mrb_mt_tbl metaprog_krn_rom_mt = MRB_MT_ROM_TAB(metaprog_krn_rom_entries);
 
-static mrb_mt_entry metaprog_mod_rom_entries[] = {
-  MRB_MT_ENTRY(mrb_mod_class_variables,          MRB_SYM(class_variables),             MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_mod_remove_cvar,              MRB_SYM(remove_class_variable),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_mod_cvar_defined,             MRB_SYM_Q(class_variable_defined),    MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_mod_cvar_get,                 MRB_SYM(class_variable_get),          MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_mod_cvar_set,                 MRB_SYM(class_variable_set),          MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_mod_included_modules,         MRB_SYM(included_modules),            MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_mod_instance_methods,         MRB_SYM(instance_methods),            MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_mod_public_instance_methods,  MRB_SYM(public_instance_methods),     MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_mod_private_instance_methods, MRB_SYM(private_instance_methods),    MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_mod_protected_instance_methods, MRB_SYM(protected_instance_methods), MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_mod_undefined_methods,        MRB_SYM(undefined_instance_methods),  MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_mod_remove_method,            MRB_SYM(remove_method),               MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_f_nil,                        MRB_SYM(method_removed),              MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_mod_constants,                MRB_SYM(constants),                   MRB_MT_FUNC),
+static const mrb_mt_entry metaprog_mod_rom_entries[] = {
+  MRB_MT_ENTRY(mrb_mod_class_variables,          MRB_SYM(class_variables), MRB_ARGS_OPT(1)),  /* 15.2.2.4.19 */
+  MRB_MT_ENTRY(mrb_mod_remove_cvar,              MRB_SYM(remove_class_variable), MRB_ARGS_REQ(1)),  /* 15.2.2.4.39 */
+  MRB_MT_ENTRY(mrb_mod_cvar_defined,             MRB_SYM_Q(class_variable_defined), MRB_ARGS_REQ(1)),  /* 15.2.2.4.16 */
+  MRB_MT_ENTRY(mrb_mod_cvar_get,                 MRB_SYM(class_variable_get), MRB_ARGS_REQ(1)),  /* 15.2.2.4.17 */
+  MRB_MT_ENTRY(mrb_mod_cvar_set,                 MRB_SYM(class_variable_set), MRB_ARGS_REQ(2)),  /* 15.2.2.4.18 */
+  MRB_MT_ENTRY(mrb_mod_included_modules,         MRB_SYM(included_modules),         MRB_ARGS_NONE()),  /* 15.2.2.4.30 */
+  MRB_MT_ENTRY(mrb_mod_instance_methods,         MRB_SYM(instance_methods), MRB_ARGS_ANY()),  /* 15.2.2.4.33 */
+  MRB_MT_ENTRY(mrb_mod_public_instance_methods,  MRB_SYM(public_instance_methods), MRB_ARGS_OPT(1)),
+  MRB_MT_ENTRY(mrb_mod_private_instance_methods, MRB_SYM(private_instance_methods), MRB_ARGS_OPT(1)),
+  MRB_MT_ENTRY(mrb_mod_protected_instance_methods, MRB_SYM(protected_instance_methods), MRB_ARGS_OPT(1)),
+  MRB_MT_ENTRY(mrb_mod_undefined_methods,        MRB_SYM(undefined_instance_methods), MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_mod_remove_method,            MRB_SYM(remove_method),  MRB_ARGS_ANY()),  /* 15.2.2.4.41 */
+  MRB_MT_ENTRY(mrb_f_nil,                        MRB_SYM(method_removed), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(mrb_mod_constants,                MRB_SYM(constants),     MRB_ARGS_OPT(1)),  /* 15.2.2.4.24 */
 };
-static mrb_mt_tbl metaprog_mod_rom_mt = MRB_MT_ROM_TAB(metaprog_mod_rom_entries);
 
 void
 mrb_mruby_metaprog_gem_init(mrb_state* mrb)
@@ -733,8 +727,8 @@ mrb_mruby_metaprog_gem_init(mrb_state* mrb)
   struct RClass *krn = mrb->kernel_module;
   struct RClass *mod = mrb->module_class;
 
-  mrb_mt_init_rom(krn, &metaprog_krn_rom_mt);
-  mrb_mt_init_rom(mod, &metaprog_mod_rom_mt);
+  MRB_MT_INIT_ROM(mrb, krn, metaprog_krn_rom_entries);
+  MRB_MT_INIT_ROM(mrb, mod, metaprog_mod_rom_entries);
   mrb_define_class_method_id(mrb, mod, MRB_SYM(constants), mrb_mod_s_constants, MRB_ARGS_ANY()); /* 15.2.2.3.1 */
   mrb_define_class_method_id(mrb, mod, MRB_SYM(nesting), mrb_mod_s_nesting, MRB_ARGS_NONE()); /* 15.2.2.3.2 */
 }

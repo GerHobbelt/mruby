@@ -170,7 +170,7 @@ static mrb_value
 rand_range_float(mrb_state *mrb, rand_state *t,
                  mrb_float begin, mrb_float end,
                  mrb_bool excl) {
-  mrb_float span = end - begin + (excl ? 0.0 : 1.0);
+  mrb_float span = end - begin;
   if (span <= 0.0)
     return mrb_nil_value();
 
@@ -568,26 +568,12 @@ random_f_bytes(mrb_state *mrb, mrb_value self)
 }
 
 
-static mrb_mt_entry kernel_rand_rom_entries[] = {
-  MRB_MT_ENTRY(random_f_rand,  MRB_SYM(rand),  MRB_MT_FUNC|MRB_MT_PRIVATE),
-  MRB_MT_ENTRY(random_f_srand, MRB_SYM(srand), MRB_MT_FUNC|MRB_MT_PRIVATE),
+static const mrb_mt_entry random_rom_entries[] = {
+  MRB_MT_ENTRY(random_m_init,  MRB_SYM(initialize), MRB_ARGS_OPT(1)),
+  MRB_MT_ENTRY(random_m_rand,  MRB_SYM(rand), MRB_ARGS_OPT(1)),
+  MRB_MT_ENTRY(random_m_srand, MRB_SYM(srand), MRB_ARGS_OPT(1)),
+  MRB_MT_ENTRY(random_m_bytes, MRB_SYM(bytes), MRB_ARGS_REQ(1)),
 };
-static mrb_mt_tbl kernel_rand_rom_mt = MRB_MT_ROM_TAB(kernel_rand_rom_entries);
-
-static mrb_mt_entry random_rom_entries[] = {
-  MRB_MT_ENTRY(random_m_init,  MRB_SYM(initialize), MRB_MT_FUNC),
-  MRB_MT_ENTRY(random_m_rand,  MRB_SYM(rand),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(random_m_srand, MRB_SYM(srand),      MRB_MT_FUNC),
-  MRB_MT_ENTRY(random_m_bytes, MRB_SYM(bytes),      MRB_MT_FUNC),
-};
-static mrb_mt_tbl random_rom_mt = MRB_MT_ROM_TAB(random_rom_entries);
-
-static mrb_mt_entry array_rand_rom_entries[] = {
-  MRB_MT_ENTRY(mrb_ary_shuffle,      MRB_SYM(shuffle),    MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_ary_shuffle_bang, MRB_SYM_B(shuffle),  MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_ary_sample,      MRB_SYM(sample),     MRB_MT_FUNC),
-};
-static mrb_mt_tbl array_rand_rom_mt = MRB_MT_ROM_TAB(array_rand_rom_entries);
 
 void mrb_mruby_random_gem_init(mrb_state *mrb)
 {
@@ -602,9 +588,12 @@ void mrb_mruby_random_gem_init(mrb_state *mrb)
   mrb_define_class_method_id(mrb, random, MRB_SYM(srand), random_f_srand, MRB_ARGS_OPT(1));
   mrb_define_class_method_id(mrb, random, MRB_SYM(bytes), random_f_bytes, MRB_ARGS_REQ(1));
 
-  mrb_mt_init_rom(mrb->kernel_module, &kernel_rand_rom_mt);
-  mrb_mt_init_rom(random, &random_rom_mt);
-  mrb_mt_init_rom(array, &array_rand_rom_mt);
+  mrb_define_private_method_id(mrb, mrb->kernel_module, MRB_SYM(rand), random_f_rand, MRB_ARGS_OPT(1));
+  mrb_define_private_method_id(mrb, mrb->kernel_module, MRB_SYM(srand), random_f_srand, MRB_ARGS_OPT(1));
+  MRB_MT_INIT_ROM(mrb, random, random_rom_entries);
+  mrb_define_method_id(mrb, array, MRB_SYM(shuffle), mrb_ary_shuffle, MRB_ARGS_OPT(1));
+  mrb_define_method_id(mrb, array, MRB_SYM_B(shuffle), mrb_ary_shuffle_bang, MRB_ARGS_OPT(1));
+  mrb_define_method_id(mrb, array, MRB_SYM(sample), mrb_ary_sample, MRB_ARGS_OPT(2));
 
   mrb_value d = mrb_obj_new(mrb, random, 0, NULL);
   rand_state *t = random_ptr(d);

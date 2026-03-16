@@ -1122,15 +1122,14 @@ mrb_file_join(mrb_state *mrb, mrb_value klass)
 }
 
 /* ---------------------------*/
-static mrb_mt_entry file_rom_entries[] = {
-  MRB_MT_ENTRY(mrb_file_flock,    MRB_SYM(flock),    MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_file_atime,    MRB_SYM(_atime),   MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_file_ctime,    MRB_SYM(_ctime),   MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_file_mtime,    MRB_SYM(_mtime),   MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_file_size,     MRB_SYM(size),     MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_file_truncate, MRB_SYM(truncate), MRB_MT_FUNC),
+static const mrb_mt_entry file_rom_entries[] = {
+  MRB_MT_ENTRY(mrb_file_flock,    MRB_SYM(flock), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(mrb_file_atime,    MRB_SYM(_atime), MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_file_ctime,    MRB_SYM(_ctime), MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_file_mtime,    MRB_SYM(_mtime), MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_file_size,     MRB_SYM(size),  MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_file_truncate, MRB_SYM(truncate), MRB_ARGS_REQ(1)),
 };
-static mrb_mt_tbl file_rom_mt = MRB_MT_ROM_TAB(file_rom_entries);
 
 void
 mrb_init_file(mrb_state *mrb)
@@ -1146,7 +1145,7 @@ mrb_init_file(mrb_state *mrb)
   mrb_define_class_method_id(mrb, file, MRB_SYM(chmod), mrb_file_s_chmod, MRB_ARGS_REQ(1) | MRB_ARGS_REST());
   mrb_define_class_method_id(mrb, file, MRB_SYM(readlink), mrb_file_s_readlink, MRB_ARGS_REQ(1));
 
-  mrb_define_class_method_id(mrb, file, MRB_SYM(dirname),   mrb_file_dirname,    MRB_ARGS_REQ(1));
+  mrb_define_class_method_id(mrb, file, MRB_SYM(dirname),   mrb_file_dirname,    MRB_ARGS_ARG(1,1));
   mrb_define_class_method_id(mrb, file, MRB_SYM(basename),  mrb_file_basename,   MRB_ARGS_REQ(1)|MRB_ARGS_OPT(1));
   mrb_define_class_method_id(mrb, file, MRB_SYM(extname),   mrb_file_extname,    MRB_ARGS_REQ(1));
   mrb_define_class_method_id(mrb, file, MRB_SYM(join),      mrb_file_join,       MRB_ARGS_ANY());
@@ -1156,7 +1155,7 @@ mrb_init_file(mrb_state *mrb)
   mrb_define_class_method_id(mrb, file, MRB_SYM_Q(absolute_path), mrb_file_absolute_path_p, MRB_ARGS_REQ(1));
   mrb_define_class_method_id(mrb, file, MRB_SYM(expand_path),  mrb_file_expand_path, MRB_ARGS_REQ(1)|MRB_ARGS_OPT(1));
 
-  mrb_mt_init_rom(file, &file_rom_mt);
+  MRB_MT_INIT_ROM(mrb, file, file_rom_entries);
 
   struct RClass *cnst = mrb_define_module_under_id(mrb, file, MRB_SYM(Constants));
   mrb_define_const_id(mrb, cnst, MRB_SYM(LOCK_SH), mrb_fixnum_value(LOCK_SH));

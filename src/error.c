@@ -892,16 +892,15 @@ mrb_check_error(mrb_state *mrb)
 }
 
 /* ---------------------------*/
-static mrb_mt_entry exception_rom_entries[] = {
-  MRB_MT_ENTRY(exc_exception,     MRB_SYM(exception),      MRB_MT_FUNC),
-  MRB_MT_ENTRY(exc_initialize,    MRB_SYM(initialize),     MRB_MT_FUNC|MRB_MT_PRIVATE),
-  MRB_MT_ENTRY(exc_to_s,          MRB_SYM(to_s),           MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(exc_to_s,          MRB_SYM(message),        MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_exc_inspect,   MRB_SYM(inspect),        MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_exc_backtrace, MRB_SYM(backtrace),      MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(exc_set_backtrace, MRB_SYM(set_backtrace),  MRB_MT_FUNC),
+static const mrb_mt_entry exception_rom_entries[] = {
+  MRB_MT_ENTRY(exc_exception,     MRB_SYM(exception), MRB_ARGS_OPT(1)),
+  MRB_MT_ENTRY(exc_initialize, MRB_SYM(initialize),    MRB_ARGS_OPT(1) | MRB_MT_PRIVATE),
+  MRB_MT_ENTRY(exc_to_s,          MRB_SYM(to_s),        MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(exc_to_s,          MRB_SYM(message),     MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_exc_inspect,   MRB_SYM(inspect),     MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_exc_backtrace, MRB_SYM(backtrace),   MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(exc_set_backtrace, MRB_SYM(set_backtrace), MRB_ARGS_REQ(1)),
 };
-static mrb_mt_tbl exception_rom_mt = MRB_MT_ROM_TAB(exception_rom_entries);
 
 void
 mrb_init_exception(mrb_state *mrb)
@@ -909,7 +908,7 @@ mrb_init_exception(mrb_state *mrb)
   struct RClass *exception = mrb->eException_class = mrb_define_class_id(mrb, MRB_SYM(Exception), mrb->object_class); /* 15.2.22 */
   MRB_SET_INSTANCE_TT(exception, MRB_TT_EXCEPTION);
   mrb_define_class_method_id(mrb, exception, MRB_SYM(exception), mrb_instance_new,  MRB_ARGS_OPT(1));
-  mrb_mt_init_rom(exception, &exception_rom_mt);
+  MRB_MT_INIT_ROM(mrb, exception, exception_rom_entries);
 
   mrb->eStandardError_class = mrb_define_class_id(mrb, MRB_SYM(StandardError), mrb->eException_class); /* 15.2.23 */
   mrb_define_class_id(mrb, MRB_SYM(ArgumentError), E_STANDARD_ERROR);                                  /* 15.2.24 */

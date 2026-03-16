@@ -2299,81 +2299,85 @@ flo_hash(mrb_state *mrb, mrb_value flo)
 #endif
 
 /* ------------------------------------------------------------------------*/
-static mrb_mt_entry numeric_rom_entries[] = {
-  MRB_MT_ENTRY(num_finite_p,   MRB_SYM_Q(finite),   MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(num_infinite_p, MRB_SYM_Q(infinite), MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(num_eql,        MRB_SYM_Q(eql),      MRB_MT_FUNC),
+static const mrb_mt_entry numeric_rom_entries[] = {
+  MRB_MT_ENTRY(num_finite_p,   MRB_SYM_Q(finite), MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(num_infinite_p, MRB_SYM_Q(infinite), MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(num_eql,        MRB_SYM_Q(eql), MRB_ARGS_REQ(1)),  /* 15.2.8.3.16 */
+#ifndef MRB_NO_FLOAT
+  MRB_MT_ENTRY(num_fdiv, MRB_SYM(fdiv), MRB_ARGS_REQ(1)),
+#endif
 };
-static mrb_mt_tbl numeric_rom_mt = MRB_MT_ROM_TAB(numeric_rom_entries);
 
-static mrb_mt_entry integer_rom_entries[] = {
-  MRB_MT_ENTRY(int_pow,              MRB_OPSYM(pow),                  MRB_MT_FUNC),
-  MRB_MT_ENTRY(num_cmp,              MRB_OPSYM(cmp),                  MRB_MT_FUNC),
-  MRB_MT_ENTRY(num_lt,               MRB_OPSYM(lt),                   MRB_MT_FUNC),
-  MRB_MT_ENTRY(num_le,               MRB_OPSYM(le),                   MRB_MT_FUNC),
-  MRB_MT_ENTRY(num_gt,               MRB_OPSYM(gt),                   MRB_MT_FUNC),
-  MRB_MT_ENTRY(num_ge,               MRB_OPSYM(ge),                   MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_obj_itself,       MRB_SYM(to_i),                   MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_obj_itself,       MRB_SYM(to_int),                 MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(int_add,              MRB_OPSYM(add),                  MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_sub,              MRB_OPSYM(sub),                  MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_mul,              MRB_OPSYM(mul),                  MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_mod,              MRB_OPSYM(mod),                  MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_div,              MRB_OPSYM(div),                  MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_quo,              MRB_SYM(quo),                    MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_idiv,             MRB_SYM(div),                    MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_equal,            MRB_OPSYM(eq),                   MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_rev,              MRB_OPSYM(neg),                  MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(int_and,              MRB_OPSYM(and),                  MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_or,               MRB_OPSYM(or),                   MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_xor,              MRB_OPSYM(xor),                  MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_lshift,           MRB_OPSYM(lshift),               MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_rshift,           MRB_OPSYM(rshift),               MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_ceil,             MRB_SYM(ceil),                   MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_floor,            MRB_SYM(floor),                  MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_round,            MRB_SYM(round),                  MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_truncate,         MRB_SYM(truncate),               MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_hash,             MRB_SYM(hash),                   MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(int_to_s,             MRB_SYM(to_s),                   MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_to_s,             MRB_SYM(inspect),                MRB_MT_FUNC),
-  MRB_MT_ENTRY(int_divmod,           MRB_SYM(divmod),                 MRB_MT_FUNC),
-  MRB_MT_ENTRY(coerce_step_counter,  MRB_SYM(__coerce_step_counter),  MRB_MT_FUNC),
+static const mrb_mt_entry integer_rom_entries[] = {
+  MRB_MT_ENTRY(int_pow,              MRB_OPSYM(pow),    MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(num_cmp,              MRB_OPSYM(cmp),    MRB_ARGS_REQ(1)),  /* 15.2.8.3.1  */
+  MRB_MT_ENTRY(num_lt,               MRB_OPSYM(lt),     MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(num_le,               MRB_OPSYM(le),     MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(num_gt,               MRB_OPSYM(gt),     MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(num_ge,               MRB_OPSYM(ge),     MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(mrb_obj_itself,       MRB_SYM(to_i),                MRB_ARGS_NONE()),  /* 15.2.8.3.24 */
+  MRB_MT_ENTRY(mrb_obj_itself,       MRB_SYM(to_int),              MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(int_add,              MRB_OPSYM(add),    MRB_ARGS_REQ(1)),  /* 15.2.8.3.1 */
+  MRB_MT_ENTRY(int_sub,              MRB_OPSYM(sub),    MRB_ARGS_REQ(1)),  /* 15.2.8.3.2 */
+  MRB_MT_ENTRY(int_mul,              MRB_OPSYM(mul),    MRB_ARGS_REQ(1)),  /* 15.2.8.3.3 */
+  MRB_MT_ENTRY(int_mod,              MRB_OPSYM(mod),    MRB_ARGS_REQ(1)),  /* 15.2.8.3.5 */
+  MRB_MT_ENTRY(int_div,              MRB_OPSYM(div),    MRB_ARGS_REQ(1)),  /* 15.2.8.3.6 */
+  MRB_MT_ENTRY(int_quo,              MRB_SYM(quo),      MRB_ARGS_REQ(1)),  /* 15.2.7.4.5(x) */
+  MRB_MT_ENTRY(int_idiv,             MRB_SYM(div),      MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(int_equal,            MRB_OPSYM(eq),     MRB_ARGS_REQ(1)),  /* 15.2.8.3.7 */
+  MRB_MT_ENTRY(int_rev,              MRB_OPSYM(neg),               MRB_ARGS_NONE()),  /* 15.2.8.3.8 */
+  MRB_MT_ENTRY(int_and,              MRB_OPSYM(and),    MRB_ARGS_REQ(1)),  /* 15.2.8.3.9 */
+  MRB_MT_ENTRY(int_or,               MRB_OPSYM(or),     MRB_ARGS_REQ(1)),  /* 15.2.8.3.10 */
+  MRB_MT_ENTRY(int_xor,              MRB_OPSYM(xor),    MRB_ARGS_REQ(1)),  /* 15.2.8.3.11 */
+  MRB_MT_ENTRY(int_lshift,           MRB_OPSYM(lshift), MRB_ARGS_REQ(1)),  /* 15.2.8.3.12 */
+  MRB_MT_ENTRY(int_rshift,           MRB_OPSYM(rshift), MRB_ARGS_REQ(1)),  /* 15.2.8.3.13 */
+  MRB_MT_ENTRY(int_ceil,             MRB_SYM(ceil),     MRB_ARGS_OPT(1)),  /* 15.2.8.3.14 */
+  MRB_MT_ENTRY(int_floor,            MRB_SYM(floor),    MRB_ARGS_OPT(1)),  /* 15.2.8.3.17 */
+  MRB_MT_ENTRY(int_round,            MRB_SYM(round),    MRB_ARGS_OPT(1)),  /* 15.2.8.3.20 */
+  MRB_MT_ENTRY(int_truncate,         MRB_SYM(truncate), MRB_ARGS_OPT(1)),  /* 15.2.8.3.26 */
+  MRB_MT_ENTRY(int_hash,             MRB_SYM(hash),                MRB_ARGS_NONE()),  /* 15.2.8.3.18 */
+  MRB_MT_ENTRY(int_to_s,             MRB_SYM(to_s),     MRB_ARGS_OPT(1)),  /* 15.2.8.3.25 */
+  MRB_MT_ENTRY(int_to_s,             MRB_SYM(inspect),  MRB_ARGS_OPT(1)),
+  MRB_MT_ENTRY(int_divmod,           MRB_SYM(divmod),   MRB_ARGS_REQ(1)),  /* 15.2.8.3.30(x) */
+  MRB_MT_ENTRY(coerce_step_counter,  MRB_SYM(__coerce_step_counter), MRB_ARGS_REQ(1)),
+#ifndef MRB_NO_FLOAT
+  MRB_MT_ENTRY(int_fdiv, MRB_SYM(fdiv), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(int_to_f, MRB_SYM(to_f), MRB_ARGS_NONE()),  /* 15.2.8.3.23 */
+#endif
 };
-static mrb_mt_tbl integer_rom_mt = MRB_MT_ROM_TAB(integer_rom_entries);
 
 #ifndef MRB_NO_FLOAT
-static mrb_mt_entry float_rom_entries[] = {
-  MRB_MT_ENTRY(flo_pow,        MRB_OPSYM(pow),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(flo_div,        MRB_OPSYM(div),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(flo_div,        MRB_SYM(quo),         MRB_MT_FUNC),
-  MRB_MT_ENTRY(flo_div,        MRB_SYM(fdiv),        MRB_MT_FUNC),
-  MRB_MT_ENTRY(flo_idiv,       MRB_SYM(div),         MRB_MT_FUNC),
-  MRB_MT_ENTRY(flo_add,        MRB_OPSYM(add),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(flo_sub,        MRB_OPSYM(sub),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(flo_mul,        MRB_OPSYM(mul),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(flo_mod,        MRB_OPSYM(mod),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(num_cmp,        MRB_OPSYM(cmp),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(num_lt,         MRB_OPSYM(lt),        MRB_MT_FUNC),
-  MRB_MT_ENTRY(num_le,         MRB_OPSYM(le),        MRB_MT_FUNC),
-  MRB_MT_ENTRY(num_gt,         MRB_OPSYM(gt),        MRB_MT_FUNC),
-  MRB_MT_ENTRY(num_ge,         MRB_OPSYM(ge),        MRB_MT_FUNC),
-  MRB_MT_ENTRY(flo_eq,         MRB_OPSYM(eq),        MRB_MT_FUNC),
-  MRB_MT_ENTRY(flo_ceil,       MRB_SYM(ceil),        MRB_MT_FUNC),
-  MRB_MT_ENTRY(flo_finite_p,   MRB_SYM_Q(finite),    MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(flo_floor,      MRB_SYM(floor),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(flo_infinite_p, MRB_SYM_Q(infinite),  MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(flo_round,      MRB_SYM(round),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(mrb_obj_itself, MRB_SYM(to_f),        MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(flo_to_i,       MRB_SYM(to_i),        MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(flo_truncate,   MRB_SYM(truncate),    MRB_MT_FUNC),
-  MRB_MT_ENTRY(flo_divmod,     MRB_SYM(divmod),      MRB_MT_FUNC),
-  MRB_MT_ENTRY(flo_to_s,       MRB_SYM(to_s),        MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(flo_to_s,       MRB_SYM(inspect),     MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(flo_nan_p,      MRB_SYM_Q(nan),       MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(flo_abs,        MRB_SYM(abs),         MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(flo_hash,       MRB_SYM(hash),        MRB_MT_FUNC|MRB_MT_NOARG),
+static const mrb_mt_entry float_rom_entries[] = {
+  MRB_MT_ENTRY(flo_pow,        MRB_OPSYM(pow), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(flo_div,        MRB_OPSYM(div), MRB_ARGS_REQ(1)),  /* 15.2.9.3.6 */
+  MRB_MT_ENTRY(flo_div,        MRB_SYM(quo), MRB_ARGS_REQ(1)),  /* 15.2.7.4.5(x) */
+  MRB_MT_ENTRY(flo_div,        MRB_SYM(fdiv), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(flo_idiv,       MRB_SYM(div), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(flo_add,        MRB_OPSYM(add), MRB_ARGS_REQ(1)),  /* 15.2.9.3.3 */
+  MRB_MT_ENTRY(flo_sub,        MRB_OPSYM(sub), MRB_ARGS_REQ(1)),  /* 15.2.9.3.4 */
+  MRB_MT_ENTRY(flo_mul,        MRB_OPSYM(mul), MRB_ARGS_REQ(1)),  /* 15.2.9.3.5 */
+  MRB_MT_ENTRY(flo_mod,        MRB_OPSYM(mod), MRB_ARGS_REQ(1)),  /* 15.2.9.3.7 */
+  MRB_MT_ENTRY(num_cmp,        MRB_OPSYM(cmp), MRB_ARGS_REQ(1)),  /* 15.2.8.3.1  */
+  MRB_MT_ENTRY(num_lt,         MRB_OPSYM(lt), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(num_le,         MRB_OPSYM(le), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(num_gt,         MRB_OPSYM(gt), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(num_ge,         MRB_OPSYM(ge), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(flo_eq,         MRB_OPSYM(eq), MRB_ARGS_REQ(1)),  /* 15.2.9.3.2  */
+  MRB_MT_ENTRY(flo_ceil,       MRB_SYM(ceil), MRB_ARGS_OPT(1)),  /* 15.2.9.3.8  */
+  MRB_MT_ENTRY(flo_finite_p,   MRB_SYM_Q(finite), MRB_ARGS_NONE()),  /* 15.2.9.3.9  */
+  MRB_MT_ENTRY(flo_floor,      MRB_SYM(floor), MRB_ARGS_OPT(1)),  /* 15.2.9.3.10 */
+  MRB_MT_ENTRY(flo_infinite_p, MRB_SYM_Q(infinite), MRB_ARGS_NONE()),  /* 15.2.9.3.11 */
+  MRB_MT_ENTRY(flo_round,      MRB_SYM(round), MRB_ARGS_OPT(1)),  /* 15.2.9.3.12 */
+  MRB_MT_ENTRY(mrb_obj_itself, MRB_SYM(to_f),     MRB_ARGS_NONE()),  /* 15.2.9.3.13 */
+  MRB_MT_ENTRY(flo_to_i,       MRB_SYM(to_i),     MRB_ARGS_NONE()),  /* 15.2.9.3.14 */
+  MRB_MT_ENTRY(flo_truncate,   MRB_SYM(truncate), MRB_ARGS_OPT(1)),  /* 15.2.9.3.15 */
+  MRB_MT_ENTRY(flo_divmod,     MRB_SYM(divmod), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(flo_to_s,       MRB_SYM(to_s),     MRB_ARGS_NONE()),  /* 15.2.9.3.16(x) */
+  MRB_MT_ENTRY(flo_to_s,       MRB_SYM(inspect),  MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(flo_nan_p,      MRB_SYM_Q(nan),    MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(flo_abs,        MRB_SYM(abs),      MRB_ARGS_NONE()),  /* 15.2.7.4.3 */
+  MRB_MT_ENTRY(flo_hash,       MRB_SYM(hash),     MRB_ARGS_NONE()),
 };
-static mrb_mt_tbl float_rom_mt = MRB_MT_ROM_TAB(float_rom_entries);
 #endif /* !MRB_NO_FLOAT */
 
 void
@@ -2386,21 +2390,14 @@ mrb_init_numeric(mrb_state *mrb)
 
   /* Numeric Class */
   numeric = mrb_define_class_id(mrb, MRB_SYM(Numeric), mrb->object_class);                  /* 15.2.7 */
-  mrb_mt_init_rom(numeric, &numeric_rom_mt);
-#ifndef MRB_NO_FLOAT
-  mrb_define_method_id(mrb, numeric, MRB_SYM(fdiv),      num_fdiv,        MRB_ARGS_REQ(1));
-#endif
+  MRB_MT_INIT_ROM(mrb, numeric, numeric_rom_entries);
 
   /* Integer Class */
   mrb->integer_class = integer = mrb_define_class_id(mrb, MRB_SYM(Integer),  numeric);     /* 15.2.8 */
   MRB_SET_INSTANCE_TT(integer, MRB_TT_INTEGER);
   MRB_UNDEF_ALLOCATOR(integer);
   mrb_undef_class_method_id(mrb, integer, MRB_SYM(new));
-  mrb_mt_init_rom(integer, &integer_rom_mt);
-#ifndef MRB_NO_FLOAT
-  mrb_define_method_id(mrb, integer, MRB_SYM(fdiv),     int_fdiv,        MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, integer, MRB_SYM(to_f),     int_to_f,        MRB_ARGS_NONE()); /* 15.2.8.3.23 */
-#endif
+  MRB_MT_INIT_ROM(mrb, integer, integer_rom_entries);
 
   /* Fixnum Class for compatibility */
   mrb_define_const_id(mrb, mrb->object_class, MRB_SYM(Fixnum), mrb_obj_value(integer));
@@ -2411,7 +2408,7 @@ mrb_init_numeric(mrb_state *mrb)
   MRB_SET_INSTANCE_TT(fl, MRB_TT_FLOAT);
   MRB_UNDEF_ALLOCATOR(fl);
   mrb_undef_class_method(mrb,  fl, "new");
-  mrb_mt_init_rom(fl, &float_rom_mt);
+  MRB_MT_INIT_ROM(mrb, fl, float_rom_entries);
 
 #ifdef INFINITY
   mrb_define_const_id(mrb, fl, MRB_SYM(INFINITY), mrb_float_value(mrb, INFINITY));

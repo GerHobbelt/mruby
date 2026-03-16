@@ -558,32 +558,21 @@ complex_pow(mrb_state *mrb, mrb_value self)
 }
 
 /* ---------------------------*/
-static mrb_mt_entry complex_rom_entries[] = {
-  MRB_MT_ENTRY(complex_real,      MRB_SYM(real),      MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(complex_imaginary, MRB_SYM(imaginary), MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_complex_to_f,  MRB_SYM(to_f),      MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_complex_to_i,  MRB_SYM(to_i),      MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(mrb_obj_itself,    MRB_SYM(to_c),      MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(complex_add,       MRB_OPSYM(add),     MRB_MT_FUNC),
-  MRB_MT_ENTRY(complex_sub,       MRB_OPSYM(sub),     MRB_MT_FUNC),
-  MRB_MT_ENTRY(complex_mul,       MRB_OPSYM(mul),     MRB_MT_FUNC),
-  MRB_MT_ENTRY(complex_div,       MRB_OPSYM(div),     MRB_MT_FUNC),
-  MRB_MT_ENTRY(complex_div,       MRB_SYM(quo),       MRB_MT_FUNC),
-  MRB_MT_ENTRY(complex_eq,        MRB_OPSYM(eq),      MRB_MT_FUNC),
-  MRB_MT_ENTRY(complex_hash,      MRB_SYM(hash),      MRB_MT_FUNC|MRB_MT_NOARG),
-  MRB_MT_ENTRY(complex_pow,       MRB_OPSYM(pow),     MRB_MT_FUNC),
+static const mrb_mt_entry complex_rom_entries[] = {
+  MRB_MT_ENTRY(complex_real,      MRB_SYM(real),   MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(complex_imaginary, MRB_SYM(imaginary), MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_complex_to_f,  MRB_SYM(to_f),   MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_complex_to_i,  MRB_SYM(to_i),   MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_obj_itself,    MRB_SYM(to_c),   MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(complex_add,       MRB_OPSYM(add), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(complex_sub,       MRB_OPSYM(sub), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(complex_mul,       MRB_OPSYM(mul), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(complex_div,       MRB_OPSYM(div), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(complex_div,       MRB_SYM(quo), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(complex_eq,        MRB_OPSYM(eq), MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(complex_hash,      MRB_SYM(hash),   MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(complex_pow,       MRB_OPSYM(pow), MRB_ARGS_REQ(1)),
 };
-static mrb_mt_tbl complex_rom_mt = MRB_MT_ROM_TAB(complex_rom_entries);
-
-static mrb_mt_entry nil_to_c_rom_entries[] = {
-  MRB_MT_ENTRY(nil_to_c, MRB_SYM(to_c), MRB_MT_FUNC|MRB_MT_NOARG),
-};
-static mrb_mt_tbl nil_to_c_rom_mt = MRB_MT_ROM_TAB(nil_to_c_rom_entries);
-
-static mrb_mt_entry kernel_complex_rom_entries[] = {
-  MRB_MT_ENTRY(complex_s_rect, MRB_SYM(Complex), MRB_MT_FUNC|MRB_MT_PRIVATE),
-};
-static mrb_mt_tbl kernel_complex_rom_mt = MRB_MT_ROM_TAB(kernel_complex_rom_entries);
 
 void mrb_mruby_complex_gem_init(mrb_state *mrb)
 {
@@ -597,9 +586,9 @@ void mrb_mruby_complex_gem_init(mrb_state *mrb)
   mrb_define_class_method_id(mrb, comp, MRB_SYM(rectangular), complex_s_rect, MRB_ARGS_REQ(1)|MRB_ARGS_OPT(1));
   mrb_define_class_method_id(mrb, comp, MRB_SYM(rect), complex_s_rect, MRB_ARGS_REQ(1)|MRB_ARGS_OPT(1));
 
-  mrb_mt_init_rom(comp, &complex_rom_mt);
-  mrb_mt_init_rom(mrb->nil_class, &nil_to_c_rom_mt);
-  mrb_mt_init_rom(mrb->kernel_module, &kernel_complex_rom_mt);
+  MRB_MT_INIT_ROM(mrb, comp, complex_rom_entries);
+  mrb_define_method_id(mrb, mrb->nil_class, MRB_SYM(to_c), nil_to_c, MRB_ARGS_NONE());
+  mrb_define_private_method_id(mrb, mrb->kernel_module, MRB_SYM(Complex), complex_s_rect, MRB_ARGS_REQ(1)|MRB_ARGS_OPT(1));
 }
 
 void
