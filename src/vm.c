@@ -20,7 +20,6 @@
 #include <mruby/throw.h>
 #include <mruby/dump.h>
 #include <mruby/internal.h>
-#include <mruby/presym.h>
 
 #ifdef MRB_NO_STDIO
 #if defined(__cplusplus)
@@ -708,7 +707,9 @@ prepare_missing(mrb_state *mrb, mrb_callinfo *ci, mrb_value recv, mrb_sym mid, m
   }
   else {
     mrb_assert(ci->nk == 15);
-    argv[1] = argv[ci->n];
+    if (ci->n != CALL_MAXARGS) {
+      argv[1] = argv[ci->n];    /* keyword arguments */
+    }
     argv[2] = blk;
   }
   argv[0] = args;               /* must be replaced after saving argv[0] as it may be a keyword argument */
@@ -1681,7 +1682,6 @@ mrb_vm_exec(mrb_state *mrb, const struct RProc *begin_proc, const mrb_code *iseq
   uint16_t b;
   uint16_t c;
   mrb_sym mid;
-  struct RClass *tc;  /* target class for OP_TDEF/OP_SDEF */
   const struct mrb_irep_catch_handler *ch;
 
 #ifndef MRB_USE_VM_SWITCH_DISPATCH
@@ -3517,16 +3517,26 @@ RETRY_TRY_BLOCK:
     }
 
     CASE(OP_TDEF, BBB) {
-      tc = check_target_class(mrb);
+      struct RClass *tc = check_target_class(mrb);
+      struct RProc *p;
+      mrb_method_t m;
+
       if (mrb_unlikely(!tc)) goto L_RAISE;
+      p = mrb_proc_new(mrb, irep->reps[c]);
+      mid = irep->syms[b];
+      p->flags |= MRB_PROC_SCOPE | MRB_PROC_STRICT;
+      MRB_METHOD_FROM_PROC(m, p);
+      MRB_METHOD_SET_VISIBILITY(m, MRB_METHOD_VDEFAULT_FL);
+      mrb_define_method_raw(mrb, tc, mid, m);
+      mrb_method_added(mrb, tc, mid);
+      ci = mrb->c->ci;
+      mrb_gc_arena_restore(mrb, ai);
+      regs[a] = mrb_symbol_value(mid);
+      NEXT;
     }
-    goto L_DEF_METHOD;
 
     CASE(OP_SDEF, BBB) {
-      tc = mrb_class_ptr(mrb_singleton_class(mrb, regs[a]));
-    }
-    L_DEF_METHOD:
-    {
+      struct RClass *tc = mrb_class_ptr(mrb_singleton_class(mrb, regs[a]));
       struct RProc *p = mrb_proc_new(mrb, irep->reps[c]);
       mrb_method_t m;
 

@@ -7,8 +7,6 @@ all_prerequisites = ->(task_name, prereqs) do
 end
 
 MRuby.each_target do |build|
-  gensym_task = task(:gensym)
-
   presym = build.presym
 
   include_dir = "#{build.build_dir}/include"
@@ -34,27 +32,26 @@ MRuby.each_target do |build|
   file presym.list_path => ppps do
     presyms = presym.scan(ppps)
     current_presyms = presym.read_list if File.exist?(presym.list_path)
-    update = presyms != current_presyms
-    presym.write_list(presyms) if update
-    mkdir_p presym.header_dir
-    %w[id table].each do |type|
-      next if !update && File.exist?(presym.send("#{type}_header_path"))
-      presym.send("write_#{type}_header", presyms)
+    if presyms != current_presyms
+      mkdir_p presym.header_dir
+      %w[id table].each do |type|
+        presym.send("write_#{type}_header", presyms)
+      end
+      presym.write_list(presyms)
     end
   end
 
-  # Internal sub-builds (e.g., mrbc) may be compiled within another
-  # build's presym scanning chain, before :gensym completes.
-  # They need explicit .o -> presym.list_path dependencies.
-  # Regular builds don't need this since :all => :gensym => :build
-  # already guarantees ordering, and .d files track header changes.
-  if build.internal?
-    prereqs.each_key do |prereq|
-      next unless File.extname(prereq) == build.exts.object
-      next unless prereq.start_with?(build_dir)
-      file prereq => presym.list_path
-    end
+  # Ensure .o files depend on presym headers being generated.
+  # This is critical when a build's .o files are compiled during another
+  # build's presym scanning chain (before :gensym completes), e.g.:
+  #   - internal sub-builds (mrbc) triggered by their parent build
+  #   - the implicit host build triggered by a cross build needing mrbc
+  prereqs.each_key do |prereq|
+    next unless File.extname(prereq) == build.exts.object
+    next unless prereq.start_with?(build_dir)
+    next if mrbc_build_dir && prereq.start_with?(mrbc_build_dir)
+    file prereq => presym.list_path
   end
 
-  gensym_task.enhance([presym.list_path])
+  task gensym: presym.list_path
 end
