@@ -2218,73 +2218,76 @@ str_prepend(mrb_state *mrb, mrb_value self)
   return self;
 }
 
+/* ---------------------------*/
+static mrb_mt_entry string_ext_rom_entries[] = {
+  MRB_MT_ENTRY(mrb_str_dump,        MRB_SYM(dump),             MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_swapcase_bang,   MRB_SYM_B(swapcase),       MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(mrb_str_slice_bang,  MRB_SYM_B(slice),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_swapcase,        MRB_SYM(swapcase),         MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_clear,           MRB_SYM(clear),            MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_concat_m,        MRB_OPSYM(lshift),         MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_concat_m,        MRB_SYM(concat),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_append_as_bytes, MRB_SYM(append_as_bytes),  MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_count,           MRB_SYM(count),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_tr_m,            MRB_SYM(tr),               MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_partition,       MRB_SYM(partition),        MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_rpartition,      MRB_SYM(rpartition),       MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_insert,          MRB_SYM(insert),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_prepend,         MRB_SYM(prepend),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_tr_bang,         MRB_SYM_B(tr),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_tr_s,            MRB_SYM(tr_s),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_tr_s_bang,       MRB_SYM_B(tr_s),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_squeeze_m,       MRB_SYM(squeeze),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_squeeze_bang,    MRB_SYM_B(squeeze),        MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_delete_m,        MRB_SYM(delete),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_delete_bang,     MRB_SYM_B(delete),         MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_start_with,      MRB_SYM_Q(start_with),     MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_end_with,        MRB_SYM_Q(end_with),       MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_hex,             MRB_SYM(hex),              MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_oct,             MRB_SYM(oct),              MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_chr,             MRB_SYM(chr),              MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_succ,            MRB_SYM(succ),             MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_succ_bang,       MRB_SYM_B(succ),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_succ,            MRB_SYM(next),             MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_succ_bang,       MRB_SYM_B(next),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_ord,             MRB_SYM(ord),              MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_del_prefix_bang, MRB_SYM_B(delete_prefix),  MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_del_prefix,      MRB_SYM(delete_prefix),    MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_del_suffix_bang, MRB_SYM_B(delete_suffix),  MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_del_suffix,      MRB_SYM(delete_suffix),    MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_casecmp,         MRB_SYM(casecmp),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_casecmp_p,       MRB_SYM_Q(casecmp),        MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_uplus,           MRB_OPSYM(plus),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_uminus,          MRB_OPSYM(minus),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_ascii_only_p,    MRB_SYM_Q(ascii_only),     MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_b,               MRB_SYM(b),                MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_lines,           MRB_SYM(__lines),          MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_codepoints,      MRB_SYM(__codepoints),     MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_lstrip,          MRB_SYM(lstrip),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_rstrip,          MRB_SYM(rstrip),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_strip,           MRB_SYM(strip),            MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_lstrip_bang,     MRB_SYM_B(lstrip),         MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_rstrip_bang,     MRB_SYM_B(rstrip),         MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_strip_bang,      MRB_SYM_B(strip),          MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_chars_ary,       MRB_SYM(__chars),          MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(str_ljust_core,      MRB_SYM(ljust),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_rjust_core,      MRB_SYM(rjust),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(str_center_core,     MRB_SYM(center),           MRB_MT_FUNC),
+};
+static mrb_mt_tbl string_ext_rom_mt = MRB_MT_ROM_TAB(string_ext_rom_entries);
+
+static mrb_mt_entry integer_chr_rom_entries[] = {
+  MRB_MT_ENTRY(int_chr, MRB_SYM(chr), MRB_MT_FUNC),
+};
+static mrb_mt_tbl integer_chr_rom_mt = MRB_MT_ROM_TAB(integer_chr_rom_entries);
+
 void
 mrb_mruby_string_ext_gem_init(mrb_state* mrb)
 {
   struct RClass *s = mrb->string_class;
 
-  mrb_define_method_id(mrb, s, MRB_SYM(dump),             mrb_str_dump,        MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM_B(swapcase),       str_swapcase_bang,   MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM_B(slice), mrb_str_slice_bang, MRB_ARGS_ARG(1, 1));
-  mrb_define_method_id(mrb, s, MRB_SYM(swapcase),         str_swapcase,        MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM(clear),            str_clear,           MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_OPSYM(lshift),         str_concat_m,        MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM(concat),           str_concat_m,        MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM(append_as_bytes),  str_append_as_bytes, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM(count),            str_count,           MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM(tr),               str_tr_m,            MRB_ARGS_REQ(2));
-  mrb_define_method_id(mrb, s, MRB_SYM(partition),        str_partition,       MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM(rpartition),       str_rpartition,      MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM(insert),           str_insert,          MRB_ARGS_REQ(2));
-  mrb_define_method_id(mrb, s, MRB_SYM(prepend),          str_prepend,         MRB_ARGS_REST());
-  mrb_define_method_id(mrb, s, MRB_SYM_B(tr),             str_tr_bang,         MRB_ARGS_REQ(2));
-  mrb_define_method_id(mrb, s, MRB_SYM(tr_s),             str_tr_s,            MRB_ARGS_REQ(2));
-  mrb_define_method_id(mrb, s, MRB_SYM_B(tr_s),           str_tr_s_bang,       MRB_ARGS_REQ(2));
-  mrb_define_method_id(mrb, s, MRB_SYM(squeeze),          str_squeeze_m,       MRB_ARGS_OPT(1));
-  mrb_define_method_id(mrb, s, MRB_SYM_B(squeeze),        str_squeeze_bang,    MRB_ARGS_OPT(1));
-  mrb_define_method_id(mrb, s, MRB_SYM(delete),           str_delete_m,        MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM_B(delete),         str_delete_bang,     MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM_Q(start_with),     str_start_with,      MRB_ARGS_REST());
-  mrb_define_method_id(mrb, s, MRB_SYM_Q(end_with),       str_end_with,        MRB_ARGS_REST());
-  mrb_define_method_id(mrb, s, MRB_SYM(hex),              str_hex,             MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM(oct),              str_oct,             MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM(chr),              str_chr,             MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM(succ),             str_succ,            MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM_B(succ),           str_succ_bang,       MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM(next),             str_succ,            MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM_B(next),           str_succ_bang,       MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM(ord),              str_ord,             MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM_B(delete_prefix),  str_del_prefix_bang, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM(delete_prefix),    str_del_prefix,      MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM_B(delete_suffix),  str_del_suffix_bang, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM(delete_suffix),    str_del_suffix,      MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM(casecmp),          str_casecmp,         MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM_Q(casecmp),        str_casecmp_p,       MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_OPSYM(plus),           str_uplus,           MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_OPSYM(minus),          str_uminus,          MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM_Q(ascii_only),     str_ascii_only_p,    MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM(b),                str_b,               MRB_ARGS_NONE());
-
-  mrb_define_method_id(mrb, s, MRB_SYM(__lines),          str_lines,           MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM(__codepoints),     str_codepoints,      MRB_ARGS_NONE());
-
-  /* Optimized strip methods implemented in C */
-  mrb_define_method_id(mrb, s, MRB_SYM(lstrip),           str_lstrip,          MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM(rstrip),           str_rstrip,          MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM(strip),            str_strip,           MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM_B(lstrip),         str_lstrip_bang,     MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM_B(rstrip),         str_rstrip_bang,     MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM_B(strip),          str_strip_bang,      MRB_ARGS_NONE());
-
-  /* Fast path for chars method implemented in C */
-  mrb_define_method_id(mrb, s, MRB_SYM(__chars),          str_chars_ary,       MRB_ARGS_NONE());
-
-  /* Padding methods implemented in C */
-  mrb_define_method_id(mrb, s, MRB_SYM(ljust),            str_ljust_core,      MRB_ARGS_ARG(1,1));
-  mrb_define_method_id(mrb, s, MRB_SYM(rjust),            str_rjust_core,      MRB_ARGS_ARG(1,1));
-  mrb_define_method_id(mrb, s, MRB_SYM(center),           str_center_core,     MRB_ARGS_ARG(1,1));
-
-  mrb_define_method_id(mrb, mrb->integer_class, MRB_SYM(chr), int_chr, MRB_ARGS_OPT(1));
+  mrb_mt_init_rom(s, &string_ext_rom_mt);
+  mrb_mt_init_rom(mrb->integer_class, &integer_chr_rom_mt);
 }
 
 void

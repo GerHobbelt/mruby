@@ -2,6 +2,7 @@
 #include <mruby/numeric.h>
 #include <mruby/array.h>
 #include <mruby/string.h>
+#include <mruby/class.h>
 #include <mruby/internal.h>
 #include <mruby/presym.h>
 
@@ -479,22 +480,26 @@ int_sqrt(mrb_state *mrb, mrb_value self)
   }
 }
 
+static mrb_mt_entry integer_ext_rom_entries[] = {
+  MRB_MT_ENTRY(int_remainder,  MRB_SYM(remainder),  MRB_MT_FUNC),
+  MRB_MT_ENTRY(int_powm,       MRB_SYM(pow),        MRB_MT_FUNC),
+  MRB_MT_ENTRY(int_digits,     MRB_SYM(digits),     MRB_MT_FUNC),
+  MRB_MT_ENTRY(int_size,       MRB_SYM(size),       MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(int_bit_length, MRB_SYM(bit_length), MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(int_odd,        MRB_SYM_Q(odd),      MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(int_even,       MRB_SYM_Q(even),     MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(int_gcd,        MRB_SYM(gcd),        MRB_MT_FUNC),
+  MRB_MT_ENTRY(int_lcm,        MRB_SYM(lcm),        MRB_MT_FUNC),
+};
+static mrb_mt_tbl integer_ext_rom_mt = MRB_MT_ROM_TAB(integer_ext_rom_entries);
+
 void
 mrb_mruby_numeric_ext_gem_init(mrb_state* mrb)
 {
   struct RClass *ic = mrb->integer_class;
 
   mrb_define_alias_id(mrb, ic, MRB_SYM(modulo), MRB_OPSYM(mod));
-  mrb_define_method_id(mrb, ic, MRB_SYM(remainder), int_remainder, MRB_ARGS_REQ(1));
-
-  mrb_define_method_id(mrb, ic, MRB_SYM(pow), int_powm, MRB_ARGS_ARG(1,1));
-  mrb_define_method_id(mrb, ic, MRB_SYM(digits), int_digits, MRB_ARGS_OPT(1));
-  mrb_define_method_id(mrb, ic, MRB_SYM(size), int_size, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, ic, MRB_SYM(bit_length), int_bit_length, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, ic, MRB_SYM_Q(odd), int_odd, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, ic, MRB_SYM_Q(even), int_even, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, ic, MRB_SYM(gcd), int_gcd, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, ic, MRB_SYM(lcm), int_lcm, MRB_ARGS_REQ(1));
+  mrb_mt_init_rom(ic, &integer_ext_rom_mt);
   mrb_define_class_method_id(mrb, ic, MRB_SYM(sqrt), int_sqrt, MRB_ARGS_REQ(1));
 
 #ifndef MRB_NO_FLOAT

@@ -334,6 +334,26 @@ mrb_mod_cmp(mrb_state *mrb, mrb_value self)
   }
 }
 
+/* ---------------------------*/
+static mrb_mt_entry mod_ext_rom_entries[] = {
+  MRB_MT_ENTRY(mrb_mod_lt,            MRB_OPSYM(lt),              MRB_MT_FUNC),
+  MRB_MT_ENTRY(mrb_mod_le,            MRB_OPSYM(le),              MRB_MT_FUNC),
+  MRB_MT_ENTRY(mrb_mod_cmp,           MRB_OPSYM(cmp),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(mrb_mod_gt,            MRB_OPSYM(gt),              MRB_MT_FUNC),
+  MRB_MT_ENTRY(mrb_mod_ge,            MRB_OPSYM(ge),              MRB_MT_FUNC),
+  MRB_MT_ENTRY(mod_module_exec,       MRB_SYM(class_exec),        MRB_MT_FUNC),
+  MRB_MT_ENTRY(mod_module_exec,       MRB_SYM(module_exec),       MRB_MT_FUNC),
+  MRB_MT_ENTRY(mod_name,              MRB_SYM(name),              MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(mod_singleton_class_p, MRB_SYM_Q(singleton_class), MRB_MT_FUNC|MRB_MT_NOARG),
+};
+static mrb_mt_tbl mod_ext_rom_mt = MRB_MT_ROM_TAB(mod_ext_rom_entries);
+
+static mrb_mt_entry cls_ext_rom_entries[] = {
+  MRB_MT_ENTRY(class_attached_object, MRB_SYM(attached_object), MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(class_subclasses,      MRB_SYM(subclasses),      MRB_MT_FUNC|MRB_MT_NOARG),
+};
+static mrb_mt_tbl cls_ext_rom_mt = MRB_MT_ROM_TAB(cls_ext_rom_entries);
+
 /*
  * Initialize the mruby-class-ext gem.
  *
@@ -347,24 +367,10 @@ void
 mrb_mruby_class_ext_gem_init(mrb_state *mrb)
 {
   struct RClass *mod = mrb->module_class;
-
-  /* Module methods */
-  mrb_define_method_id(mrb, mod, MRB_SYM(name), mod_name, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, mod, MRB_SYM_Q(singleton_class), mod_singleton_class_p, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, mod, MRB_SYM(module_exec), mod_module_exec, MRB_ARGS_ANY()|MRB_ARGS_BLOCK());
-  mrb_define_method_id(mrb, mod, MRB_SYM(class_exec), mod_module_exec, MRB_ARGS_ANY()|MRB_ARGS_BLOCK());
-
-  /* Module comparison operators */
-  mrb_define_method_id(mrb, mod, MRB_OPSYM(lt), mrb_mod_lt, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, mod, MRB_OPSYM(le), mrb_mod_le, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, mod, MRB_OPSYM(gt), mrb_mod_gt, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, mod, MRB_OPSYM(ge), mrb_mod_ge, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, mod, MRB_OPSYM(cmp), mrb_mod_cmp, MRB_ARGS_REQ(1));
-
-  /* Class-specific methods */
   struct RClass *cls = mrb->class_class;
-  mrb_define_method_id(mrb, cls, MRB_SYM(subclasses), class_subclasses, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, cls, MRB_SYM(attached_object), class_attached_object, MRB_ARGS_NONE());
+
+  mrb_mt_init_rom(mod, &mod_ext_rom_mt);
+  mrb_mt_init_rom(cls, &cls_ext_rom_mt);
 }
 
 void

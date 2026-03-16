@@ -1,5 +1,6 @@
 #include <mruby.h>
 #include <mruby/array.h>
+#include <mruby/class.h>
 #include <mruby/string.h>
 #include <mruby/internal.h>
 #include <mruby/presym.h>
@@ -57,6 +58,12 @@ mrb_sym_length(mrb_state *mrb, mrb_value self)
   return mrb_fixnum_value(len);
 }
 
+static mrb_mt_entry symbol_ext_rom_entries[] = {
+  MRB_MT_ENTRY(mrb_sym_length, MRB_SYM(length), MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(mrb_sym_length, MRB_SYM(size),   MRB_MT_FUNC|MRB_MT_NOARG),
+};
+static mrb_mt_tbl symbol_ext_rom_mt = MRB_MT_ROM_TAB(symbol_ext_rom_entries);
+
 void
 mrb_mruby_symbol_ext_gem_init(mrb_state* mrb)
 {
@@ -64,8 +71,7 @@ mrb_mruby_symbol_ext_gem_init(mrb_state* mrb)
 #ifdef MRB_USE_ALL_SYMBOLS
   mrb_define_class_method_id(mrb, s, MRB_SYM(all_symbols), mrb_sym_all_symbols, MRB_ARGS_NONE());
 #endif
-  mrb_define_method_id(mrb, s, MRB_SYM(length), mrb_sym_length, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM(size), mrb_sym_length, MRB_ARGS_NONE());
+  mrb_mt_init_rom(s, &symbol_ext_rom_mt);
 }
 
 void

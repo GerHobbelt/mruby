@@ -1464,6 +1464,53 @@ set_s_create(mrb_state *mrb, mrb_value klass)
   return set;
 }
 
+static mrb_mt_entry set_rom_entries[] = {
+  MRB_MT_ENTRY(set_size,              MRB_SYM(size),              MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(set_size,              MRB_SYM(length),            MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(set_empty_p,           MRB_SYM_Q(empty),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(set_clear,             MRB_SYM(clear),             MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(set_to_a,              MRB_SYM(to_a),              MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(set_include_p,         MRB_SYM_Q(include),         MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_include_p,         MRB_SYM_Q(member),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_include_p,         MRB_OPSYM(eqq),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_add,               MRB_SYM(add),               MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_add,               MRB_OPSYM(lshift),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_add_p,             MRB_SYM_Q(add),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_delete,            MRB_SYM(delete),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_delete_p,          MRB_SYM_Q(delete),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_init,              MRB_SYM(__init),            MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(set_core_merge,        MRB_SYM(__merge),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_core_subtract,     MRB_SYM(__subtract),        MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_core_union,        MRB_SYM(__union),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_core_difference,   MRB_SYM(__difference),      MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_core_intersection, MRB_SYM(__intersection),    MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_core_xor,          MRB_SYM(__xor),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_equal,             MRB_OPSYM(eq),              MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_hash_m,            MRB_SYM(hash),              MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(set_join,              MRB_SYM(join),              MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_inspect,           MRB_SYM(inspect),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(set_inspect,           MRB_SYM(to_s),              MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(set_reset,             MRB_SYM(reset),             MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(set_add_all,           MRB_SYM(add_all),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_delete_all,        MRB_SYM(delete_all),        MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_include_all_p,     MRB_SYM_Q(include_all),     MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_include_any_p,     MRB_SYM_Q(include_any),     MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_superset_p,        MRB_SYM_Q(superset),        MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_superset_p,        MRB_OPSYM(ge),              MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_proper_superset_p, MRB_SYM_Q(proper_superset), MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_proper_superset_p, MRB_OPSYM(gt),              MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_subset_p,          MRB_SYM_Q(subset),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_subset_p,          MRB_OPSYM(le),              MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_proper_subset_p,   MRB_SYM_Q(proper_subset),   MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_proper_subset_p,   MRB_OPSYM(lt),              MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_intersect_p,       MRB_SYM_Q(intersect),       MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_disjoint_p,        MRB_SYM_Q(disjoint),        MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_cmp,               MRB_OPSYM(cmp),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(set_flatten,           MRB_SYM(flatten),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(set_flatten_bang,      MRB_SYM_B(flatten),         MRB_MT_FUNC|MRB_MT_NOARG),
+};
+static mrb_mt_tbl set_rom_mt = MRB_MT_ROM_TAB(set_rom_entries);
+
 void
 mrb_mruby_set_gem_init(mrb_state *mrb)
 {
@@ -1478,68 +1525,9 @@ mrb_mruby_set_gem_init(mrb_state *mrb)
 
   mrb_define_private_method(mrb, set, "initialize_copy", set_init_copy, MRB_ARGS_REQ(1));
 
-  mrb_define_method_id(mrb, set, MRB_SYM(size), set_size, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, set, MRB_SYM(length), set_size, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, set, MRB_SYM_Q(empty), set_empty_p, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, set, MRB_SYM(clear), set_clear, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, set, MRB_SYM(to_a), set_to_a, MRB_ARGS_NONE());
+  mrb_mt_init_rom(set, &set_rom_mt);
 
-  mrb_define_method_id(mrb, set, MRB_SYM_Q(include), set_include_p, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_SYM_Q(member), set_include_p, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_OPSYM(eqq), set_include_p, MRB_ARGS_REQ(1));
-
-  mrb_define_method_id(mrb, set, MRB_SYM(add), set_add, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_OPSYM(lshift), set_add, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_SYM_Q(add), set_add_p, MRB_ARGS_REQ(1));
-
-  mrb_define_method_id(mrb, set, MRB_SYM(delete), set_delete, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_SYM_Q(delete), set_delete_p, MRB_ARGS_REQ(1));
-
-  mrb_define_method_id(mrb, set, MRB_SYM(__init), set_init, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, set, MRB_SYM(__merge), set_core_merge, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_SYM(__subtract), set_core_subtract, MRB_ARGS_REQ(1));
-
-  mrb_define_method_id(mrb, set, MRB_SYM(__union), set_core_union, MRB_ARGS_REQ(1));
-
-  mrb_define_method_id(mrb, set, MRB_SYM(__difference), set_core_difference, MRB_ARGS_REQ(1));
-
-  mrb_define_method_id(mrb, set, MRB_SYM(__intersection), set_core_intersection, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_SYM(__xor), set_core_xor, MRB_ARGS_REQ(1));
-
-  mrb_define_method_id(mrb, set, MRB_OPSYM(eq), set_equal, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_SYM(hash), set_hash_m, MRB_ARGS_NONE());
   mrb_define_alias(mrb, set, "eql?", "==");
-
-  mrb_define_method_id(mrb, set, MRB_SYM(join), set_join, MRB_ARGS_OPT(1));
-  mrb_define_method_id(mrb, set, MRB_SYM(inspect), set_inspect, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, set, MRB_SYM(to_s), set_inspect, MRB_ARGS_NONE());
-
-  mrb_define_method_id(mrb, set, MRB_SYM(reset), set_reset, MRB_ARGS_NONE());
-
-  /* Bulk operation methods */
-  mrb_define_method_id(mrb, set, MRB_SYM(add_all), set_add_all, MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, set, MRB_SYM(delete_all), set_delete_all, MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, set, MRB_SYM_Q(include_all), set_include_all_p, MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, set, MRB_SYM_Q(include_any), set_include_any_p, MRB_ARGS_ANY());
-
-  /* Register our new C implementations */
-  mrb_define_method_id(mrb, set, MRB_SYM_Q(superset), set_superset_p, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_OPSYM(ge), set_superset_p, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_SYM_Q(proper_superset), set_proper_superset_p, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_OPSYM(gt), set_proper_superset_p, MRB_ARGS_REQ(1));
-
-  mrb_define_method_id(mrb, set, MRB_SYM_Q(subset), set_subset_p, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_OPSYM(le), set_subset_p, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_SYM_Q(proper_subset), set_proper_subset_p, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_OPSYM(lt), set_proper_subset_p, MRB_ARGS_REQ(1));
-
-  mrb_define_method_id(mrb, set, MRB_SYM_Q(intersect), set_intersect_p, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, set, MRB_SYM_Q(disjoint), set_disjoint_p, MRB_ARGS_REQ(1));
-
-  mrb_define_method_id(mrb, set, MRB_OPSYM(cmp), set_cmp, MRB_ARGS_REQ(1));
-
-  mrb_define_method_id(mrb, set, MRB_SYM(flatten), set_flatten, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, set, MRB_SYM_B(flatten), set_flatten_bang, MRB_ARGS_NONE());
 }
 
 void

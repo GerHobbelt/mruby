@@ -1,9 +1,11 @@
 #include <mruby.h>
+#include <mruby/class.h>
 #include <mruby/proc.h>
 #include <mruby/opcode.h>
 #include <mruby/array.h>
 #include <mruby/string.h>
 #include <mruby/debug.h>
+#include <mruby/internal.h>
 #include <mruby/presym.h>
 
 /*
@@ -241,17 +243,28 @@ mrb_proc_parameters(mrb_state *mrb, mrb_value self)
   return parameters;
 }
 
+/* ---------------------------*/
+static mrb_mt_entry proc_ext_rom_entries[] = {
+  MRB_MT_ENTRY(proc_inspect,         MRB_SYM(inspect),         MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(proc_lambda_p,        MRB_SYM_Q(lambda),        MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(mrb_proc_parameters,  MRB_SYM(parameters),      MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(proc_source_location, MRB_SYM(source_location), MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(proc_inspect,         MRB_SYM(to_s),            MRB_MT_FUNC|MRB_MT_NOARG),
+};
+static mrb_mt_tbl proc_ext_rom_mt = MRB_MT_ROM_TAB(proc_ext_rom_entries);
+
+static mrb_mt_entry kernel_ext_rom_entries[] = {
+  MRB_MT_ENTRY(kernel_proc, MRB_SYM(proc), MRB_MT_FUNC|MRB_MT_PRIVATE),
+};
+static mrb_mt_tbl kernel_ext_rom_mt = MRB_MT_ROM_TAB(kernel_ext_rom_entries);
+
 void
 mrb_mruby_proc_ext_gem_init(mrb_state* mrb)
 {
   struct RClass *p = mrb->proc_class;
-  mrb_define_method_id(mrb, p, MRB_SYM_Q(lambda),        proc_lambda_p,        MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, p, MRB_SYM(source_location), proc_source_location, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, p, MRB_SYM(to_s),            proc_inspect,         MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, p, MRB_SYM(inspect),         proc_inspect,         MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, p, MRB_SYM(parameters),      mrb_proc_parameters,  MRB_ARGS_NONE());
 
-  mrb_define_private_method_id(mrb, mrb->kernel_module, MRB_SYM(proc), kernel_proc,  MRB_ARGS_NONE()|MRB_ARGS_BLOCK());
+  mrb_mt_init_rom(p, &proc_ext_rom_mt);
+  mrb_mt_init_rom(mrb->kernel_module, &kernel_ext_rom_mt);
 }
 
 void

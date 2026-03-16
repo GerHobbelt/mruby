@@ -1,5 +1,7 @@
 #include <mruby.h>
 #include <mruby/range.h>
+#include <mruby/class.h>
+#include <mruby/internal.h>
 #include <mruby/presym.h>
 
 static mrb_bool
@@ -214,14 +216,19 @@ range_empty_p(mrb_state *mrb, mrb_value range)
   return mrb_bool_value(comp == -2 || comp > 0 || (comp == 0 && excl));
 }
 
+static mrb_mt_entry range_ext_rom_entries[] = {
+  MRB_MT_ENTRY(range_cover,   MRB_SYM_Q(cover),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(range_size,    MRB_SYM(size),             MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(range_empty_p, MRB_SYM_Q(__empty_range),  MRB_MT_FUNC),
+};
+static mrb_mt_tbl range_ext_rom_mt = MRB_MT_ROM_TAB(range_ext_rom_entries);
+
 void
 mrb_mruby_range_ext_gem_init(mrb_state* mrb)
 {
   struct RClass *s = mrb->range_class;
 
-  mrb_define_method_id(mrb, s, MRB_SYM_Q(cover), range_cover, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, s, MRB_SYM(size), range_size,  MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, s, MRB_SYM_Q(__empty_range), range_empty_p,  MRB_ARGS_REQ(3));
+  mrb_mt_init_rom(s, &range_ext_rom_mt);
 }
 
 void

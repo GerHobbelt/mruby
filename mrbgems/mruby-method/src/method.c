@@ -831,6 +831,52 @@ method_name(mrb_state *mrb, mrb_value self)
   return mrb_iv_get(mrb, self, MRB_SYM(_name));
 }
 
+/* ---------------------------*/
+static mrb_mt_entry method_ubm_rom_entries[] = {
+  MRB_MT_ENTRY(unbound_method_bind,  MRB_SYM(bind),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(method_super_method,  MRB_SYM(super_method),    MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_eql,           MRB_OPSYM(eq),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(method_eql,           MRB_SYM_Q(eql),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(method_to_s,          MRB_SYM(to_s),            MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_to_s,          MRB_SYM(inspect),         MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_arity,         MRB_SYM(arity),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_source_location, MRB_SYM(source_location), MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_parameters,    MRB_SYM(parameters),      MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_bcall,         MRB_SYM(bind_call),       MRB_MT_FUNC),
+  MRB_MT_ENTRY(method_owner,         MRB_SYM(owner),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_name,          MRB_SYM(name),            MRB_MT_FUNC|MRB_MT_NOARG),
+};
+static mrb_mt_tbl method_ubm_rom_mt = MRB_MT_ROM_TAB(method_ubm_rom_entries);
+
+static mrb_mt_entry method_mtd_rom_entries[] = {
+  MRB_MT_ENTRY(method_eql,            MRB_OPSYM(eq),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(method_eql,            MRB_SYM_Q(eql),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(method_to_s,           MRB_SYM(to_s),            MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_to_s,           MRB_SYM(inspect),         MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_call,           MRB_SYM(call),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(method_call,           MRB_OPSYM(aref),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(method_unbind,         MRB_SYM(unbind),          MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_super_method,   MRB_SYM(super_method),    MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_arity,          MRB_SYM(arity),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_source_location, MRB_SYM(source_location), MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_parameters,     MRB_SYM(parameters),      MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_owner,          MRB_SYM(owner),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_receiver,       MRB_SYM(receiver),        MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(method_name,           MRB_SYM(name),            MRB_MT_FUNC|MRB_MT_NOARG),
+};
+static mrb_mt_tbl method_mtd_rom_mt = MRB_MT_ROM_TAB(method_mtd_rom_entries);
+
+static mrb_mt_entry method_krn_rom_entries[] = {
+  MRB_MT_ENTRY(mrb_kernel_method,           MRB_SYM(method),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(mrb_kernel_singleton_method, MRB_SYM(singleton_method), MRB_MT_FUNC),
+};
+static mrb_mt_tbl method_krn_rom_mt = MRB_MT_ROM_TAB(method_krn_rom_entries);
+
+static mrb_mt_entry method_mod_rom_entries[] = {
+  MRB_MT_ENTRY(mrb_module_instance_method, MRB_SYM(instance_method), MRB_MT_FUNC),
+};
+static mrb_mt_tbl method_mod_rom_mt = MRB_MT_ROM_TAB(method_mod_rom_entries);
+
 void
 mrb_mruby_method_gem_init(mrb_state* mrb)
 {
@@ -840,41 +886,14 @@ mrb_mruby_method_gem_init(mrb_state* mrb)
   MRB_SET_INSTANCE_TT(unbound_method, MRB_TT_OBJECT);
   MRB_UNDEF_ALLOCATOR(unbound_method);
   mrb_undef_class_method_id(mrb, unbound_method, MRB_SYM(new));
-  mrb_define_method_id(mrb, unbound_method, MRB_SYM(bind), unbound_method_bind, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, unbound_method, MRB_SYM(super_method), method_super_method, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, unbound_method, MRB_OPSYM(eq), method_eql, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, unbound_method, MRB_SYM_Q(eql), method_eql, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, unbound_method, MRB_SYM(to_s), method_to_s, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, unbound_method, MRB_SYM(inspect), method_to_s, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, unbound_method, MRB_SYM(arity), method_arity, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, unbound_method, MRB_SYM(source_location), method_source_location, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, unbound_method, MRB_SYM(parameters), method_parameters, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, unbound_method, MRB_SYM(bind_call), method_bcall, MRB_ARGS_REQ(1)|MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, unbound_method, MRB_SYM(owner), method_owner, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, unbound_method, MRB_SYM(name), method_name, MRB_ARGS_NONE());
+  mrb_mt_init_rom(unbound_method, &method_ubm_rom_mt);
 
   MRB_SET_INSTANCE_TT(method, MRB_TT_OBJECT);
   MRB_UNDEF_ALLOCATOR(method);
   mrb_undef_class_method_id(mrb, method, MRB_SYM(new));
-  mrb_define_method_id(mrb, method, MRB_OPSYM(eq), method_eql, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, method, MRB_SYM_Q(eql), method_eql, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, method, MRB_SYM(to_s), method_to_s, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, method, MRB_SYM(inspect), method_to_s, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, method, MRB_SYM(call), method_call, MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, method, MRB_OPSYM(aref), method_call, MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, method, MRB_SYM(unbind), method_unbind, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, method, MRB_SYM(super_method), method_super_method, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, method, MRB_SYM(arity), method_arity, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, method, MRB_SYM(source_location), method_source_location, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, method, MRB_SYM(parameters), method_parameters, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, method, MRB_SYM(owner), method_owner, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, method, MRB_SYM(receiver), method_receiver, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, method, MRB_SYM(name), method_name, MRB_ARGS_NONE());
-
-  mrb_define_method_id(mrb, mrb->kernel_module, MRB_SYM(method), mrb_kernel_method, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, mrb->kernel_module, MRB_SYM(singleton_method), mrb_kernel_singleton_method, MRB_ARGS_REQ(1));
-
-  mrb_define_method_id(mrb, mrb->module_class, MRB_SYM(instance_method), mrb_module_instance_method, MRB_ARGS_REQ(1));
+  mrb_mt_init_rom(method, &method_mtd_rom_mt);
+  mrb_mt_init_rom(mrb->kernel_module, &method_krn_rom_mt);
+  mrb_mt_init_rom(mrb->module_class, &method_mod_rom_mt);
 }
 
 void

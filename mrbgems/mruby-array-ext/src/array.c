@@ -5,6 +5,7 @@
 #include <mruby/range.h>
 #include <mruby/hash.h>
 #include <mruby/data.h>
+#include <mruby/class.h>
 #include <mruby/internal.h>
 #include <mruby/presym.h>
 #include <mruby/khash.h>
@@ -1535,40 +1536,46 @@ ary_combination_next(mrb_state *mrb, mrb_value self)
   return result;
 }
 
+/* ---------------------------*/
+static mrb_mt_entry array_ext_rom_entries[] = {
+  MRB_MT_ENTRY(ary_assoc,             MRB_SYM(assoc),              MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_at,                MRB_SYM(at),                 MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_rassoc,            MRB_SYM(rassoc),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_values_at,         MRB_SYM(values_at),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_slice_bang,        MRB_SYM_B(slice),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_compact,           MRB_SYM(compact),            MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(ary_compact_bang,      MRB_SYM_B(compact),          MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(ary_rotate,            MRB_SYM(rotate),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_rotate_bang,       MRB_SYM_B(rotate),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_sub,               MRB_OPSYM(sub),              MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_difference,        MRB_SYM(difference),         MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_union,             MRB_OPSYM(or),               MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_union_multi,       MRB_SYM(union),              MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_intersection,      MRB_OPSYM(and),              MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_intersection_multi, MRB_SYM(intersection),      MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_intersect_p,       MRB_SYM_Q(intersect),        MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_fill_parse_arg,    MRB_SYM(__fill_parse_arg),   MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_fill_exec,         MRB_SYM(__fill_exec),        MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_uniq,              MRB_SYM(__uniq),             MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(ary_uniq_bang,         MRB_SYM_B(__uniq),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(ary_flatten,           MRB_SYM(flatten),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_flatten_bang,      MRB_SYM_B(flatten),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_normalize_index,   MRB_SYM(__normalize_index),  MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_fetch,             MRB_SYM(__fetch),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_insert,            MRB_SYM(insert),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_deconstruct,       MRB_SYM(deconstruct),        MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(ary_product_group,     MRB_SYM(__product_group),    MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_combination_init,  MRB_SYM(__combination_init), MRB_MT_FUNC),
+  MRB_MT_ENTRY(ary_combination_next,  MRB_SYM(__combination_next), MRB_MT_FUNC),
+};
+static mrb_mt_tbl array_ext_rom_mt = MRB_MT_ROM_TAB(array_ext_rom_entries);
+
 void
 mrb_mruby_array_ext_gem_init(mrb_state* mrb)
 {
   struct RClass * a = mrb->array_class;
 
-  mrb_define_method_id(mrb, a, MRB_SYM(assoc), ary_assoc,  MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, a, MRB_SYM(at), ary_at,     MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, a, MRB_SYM(rassoc), ary_rassoc, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, a, MRB_SYM(values_at), ary_values_at, MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, a, MRB_SYM_B(slice), ary_slice_bang, MRB_ARGS_ARG(1,1));
-  mrb_define_method_id(mrb, a, MRB_SYM(compact), ary_compact, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, a, MRB_SYM_B(compact), ary_compact_bang, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, a, MRB_SYM(rotate), ary_rotate, MRB_ARGS_OPT(1));
-  mrb_define_method_id(mrb, a, MRB_SYM_B(rotate), ary_rotate_bang, MRB_ARGS_OPT(1));
-  mrb_define_method_id(mrb, a, MRB_OPSYM(sub), ary_sub, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, a, MRB_SYM(difference), ary_difference, MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, a, MRB_OPSYM(or), ary_union, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, a, MRB_SYM(union), ary_union_multi, MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, a, MRB_OPSYM(and), ary_intersection, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, a, MRB_SYM(intersection), ary_intersection_multi, MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, a, MRB_SYM_Q(intersect), ary_intersect_p, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, a, MRB_SYM(__fill_parse_arg), ary_fill_parse_arg, MRB_ARGS_ARG(0,4));
-  mrb_define_method_id(mrb, a, MRB_SYM(__fill_exec), ary_fill_exec, MRB_ARGS_REQ(3));
-  mrb_define_method_id(mrb, a, MRB_SYM(__uniq), ary_uniq, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, a, MRB_SYM_B(__uniq), ary_uniq_bang, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, a, MRB_SYM(flatten), ary_flatten, MRB_ARGS_OPT(1));
-  mrb_define_method_id(mrb, a, MRB_SYM_B(flatten), ary_flatten_bang, MRB_ARGS_OPT(1));
-  mrb_define_method_id(mrb, a, MRB_SYM(__normalize_index), ary_normalize_index, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, a, MRB_SYM(__fetch), ary_fetch, MRB_ARGS_REQ(3));
-  mrb_define_method_id(mrb, a, MRB_SYM(insert), ary_insert, MRB_ARGS_ARG(1, -1));
-  mrb_define_method_id(mrb, a, MRB_SYM(deconstruct), ary_deconstruct, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, a, MRB_SYM(__product_group), ary_product_group, MRB_ARGS_REQ(4));
-  mrb_define_method_id(mrb, a, MRB_SYM(__combination_init), ary_combination_init, MRB_ARGS_REQ(2));
-  mrb_define_method_id(mrb, a, MRB_SYM(__combination_next), ary_combination_next, MRB_ARGS_REQ(1));
+  mrb_mt_init_rom(a, &array_ext_rom_mt);
 }
 
 void

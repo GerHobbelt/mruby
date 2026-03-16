@@ -91,7 +91,7 @@ intern_gen(parser_state *p, const char *s, size_t len)
 }
 #define intern(s,len) intern_gen(p,(s),(len))
 
-#define intern_op(op) MRB_OPSYM_2(p->mrb, op)
+#define intern_op(op) MRB_OPSYM(op)
 
 static mrb_sym
 intern_numparam_gen(parser_state *p, int num)
@@ -1215,7 +1215,7 @@ new_args_tail(parser_state *p, node *kws, mrb_sym kwrest, mrb_sym blk)
   }
 
   local_add_blk(p);
-  if (blk) local_add_f(p, blk);
+  if (blk && blk != MRB_SYM(nil)) local_add_f(p, blk);
 
   /* allocate register for keywords arguments */
   /* order is for Proc#parameters */
@@ -1414,14 +1414,14 @@ new_int_n(parser_state *p, int32_t val)
 static node*
 new_imaginary(parser_state *p, node *imaginary)
 {
-  return new_fcall(p, MRB_SYM_2(p->mrb, Complex),
+  return new_fcall(p, MRB_SYM(Complex),
                    new_callargs(p, list2(new_int_n(p, 0), imaginary), 0, 0));
 }
 
 static node*
 new_rational(parser_state *p, node *rational)
 {
-  return new_fcall(p, MRB_SYM_2(p->mrb, Rational), new_callargs(p, list1(rational), 0, 0));
+  return new_fcall(p, MRB_SYM(Rational), new_callargs(p, list1(rational), 0, 0));
 }
 
 /* Read integer into int32_t with overflow detection */
@@ -3805,11 +3805,11 @@ method_call     : operation paren_args
                     }
                 | primary_value call_op paren_args
                     {
-                      $$ = new_call(p, $1, MRB_SYM_2(p->mrb, call), $3, $2);
+                      $$ = new_call(p, $1, MRB_SYM(call), $3, $2);
                     }
                 | primary_value tCOLON2 paren_args
                     {
-                      $$ = new_call(p, $1, MRB_SYM_2(p->mrb, call), $3, tCOLON2);
+                      $$ = new_call(p, $1, MRB_SYM(call), $3, tCOLON2);
                     }
                 | keyword_super paren_args
                     {
@@ -4496,7 +4496,7 @@ var_ref         : variable
                     }
                 | keyword__ENCODING__
                     {
-                      $$ = new_fcall(p, MRB_SYM_2(p->mrb, __ENCODING__), 0);
+                      $$ = new_fcall(p, MRB_SYM(__ENCODING__), 0);
                     }
                 ;
 
@@ -4860,6 +4860,10 @@ blkarg_mark     : '&'
 f_block_arg     : blkarg_mark tIDENTIFIER
                     {
                       $$ = $2;
+                    }
+                | blkarg_mark keyword_nil
+                    {
+                      $$ = MRB_SYM(nil);
                     }
                 | blkarg_mark
                     {
@@ -8047,6 +8051,8 @@ dump_args(mrb_state *mrb, struct mrb_ast_args *args, int offset, uint16_t lineno
     dump_prefix(offset, lineno);
     if (blk == MRB_OPSYM(and))
       printf("blk=&\n");
+    else if (blk == MRB_SYM(nil))
+      printf("blk=&nil\n");
     else
       printf("blk=&%s\n", mrb_sym_name(mrb, blk));
   }

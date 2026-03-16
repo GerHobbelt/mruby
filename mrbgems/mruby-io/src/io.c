@@ -2196,6 +2196,47 @@ io_flush(mrb_state *mrb, mrb_value io)
   return io;
 }
 
+/* ---------------------------*/
+static mrb_mt_entry io_rom_entries[] = {
+  MRB_MT_ENTRY(io_init,              MRB_SYM(initialize),       MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_init_copy,         MRB_SYM(initialize_copy),  MRB_MT_FUNC|MRB_MT_PRIVATE),
+  MRB_MT_ENTRY(io_isatty,            MRB_SYM(isatty),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(io_eof,               MRB_SYM_Q(eof),            MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(io_getc,              MRB_SYM(getc),             MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(io_gets,              MRB_SYM(gets),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_read,              MRB_SYM(read),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_readchar,          MRB_SYM(readchar),         MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(io_readline,          MRB_SYM(readline),         MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_readlines,         MRB_SYM(readlines),        MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_sync,              MRB_SYM(sync),             MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(io_set_sync,          MRB_SYM_E(sync),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_sysread,           MRB_SYM(sysread),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_sysseek,           MRB_SYM(sysseek),          MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_syswrite,          MRB_SYM(syswrite),         MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_seek,              MRB_SYM(seek),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_close,             MRB_SYM(close),            MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(io_close_write,       MRB_SYM(close_write),      MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(io_set_close_on_exec, MRB_SYM_E(close_on_exec),  MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_close_on_exec_p,   MRB_SYM_Q(close_on_exec),  MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(io_closed,            MRB_SYM_Q(closed),         MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(io_flush,             MRB_SYM(flush),            MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(io_ungetc,            MRB_SYM(ungetc),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_ungetbyte,         MRB_SYM(ungetbyte),        MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_pos,               MRB_SYM(pos),              MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(io_pid,               MRB_SYM(pid),              MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(io_fileno,            MRB_SYM(fileno),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(io_write,             MRB_SYM(write),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_puts,              MRB_SYM(puts),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_print,             MRB_SYM(print),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_putc,              MRB_SYM(putc),             MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_lshift,            MRB_OPSYM(lshift),         MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_pread,             MRB_SYM(pread),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_pwrite,            MRB_SYM(pwrite),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(io_getbyte,           MRB_SYM(getbyte),          MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(io_readbyte,          MRB_SYM(readbyte),         MRB_MT_FUNC|MRB_MT_NOARG),
+};
+static mrb_mt_tbl io_rom_mt = MRB_MT_ROM_TAB(io_rom_entries);
+
 void
 mrb_init_io(mrb_state *mrb)
 {
@@ -2212,42 +2253,7 @@ mrb_init_io(mrb_state *mrb)
   mrb_define_class_method_id(mrb, io, MRB_SYM(_pipe), io_s_pipe, MRB_ARGS_NONE());
 #endif
 
-  mrb_define_method_id(mrb, io, MRB_SYM(initialize),      io_init, MRB_ARGS_ARG(1,2));
-  mrb_define_private_method_id(mrb, io, MRB_SYM(initialize_copy), io_init_copy, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, io, MRB_SYM(isatty),     io_isatty,     MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, io, MRB_SYM_Q(eof),      io_eof,        MRB_ARGS_NONE());   /* 15.2.20.5.6 */
-  mrb_define_method_id(mrb, io, MRB_SYM(getc),       io_getc,       MRB_ARGS_NONE());   /* 15.2.20.5.8 */
-  mrb_define_method_id(mrb, io, MRB_SYM(gets),       io_gets,       MRB_ARGS_OPT(2));   /* 15.2.20.5.9 */
-  mrb_define_method_id(mrb, io, MRB_SYM(read),       io_read,       MRB_ARGS_OPT(2));   /* 15.2.20.5.14 */
-  mrb_define_method_id(mrb, io, MRB_SYM(readchar),   io_readchar,   MRB_ARGS_NONE());   /* 15.2.20.5.15 */
-  mrb_define_method_id(mrb, io, MRB_SYM(readline),   io_readline,   MRB_ARGS_OPT(2));   /* 15.2.20.5.16 */
-  mrb_define_method_id(mrb, io, MRB_SYM(readlines),  io_readlines,  MRB_ARGS_OPT(2));   /* 15.2.20.5.17 */
-  mrb_define_method_id(mrb, io, MRB_SYM(sync),       io_sync,       MRB_ARGS_NONE());   /* 15.2.20.5.18 */
-  mrb_define_method_id(mrb, io, MRB_SYM_E(sync),     io_set_sync,   MRB_ARGS_REQ(1));   /* 15.2.20.5.19 */
-  mrb_define_method_id(mrb, io, MRB_SYM(sysread),    io_sysread,    MRB_ARGS_ARG(1,1));
-  mrb_define_method_id(mrb, io, MRB_SYM(sysseek),    io_sysseek,    MRB_ARGS_ARG(1,1));
-  mrb_define_method_id(mrb, io, MRB_SYM(syswrite),   io_syswrite,   MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, io, MRB_SYM(seek),       io_seek,       MRB_ARGS_ARG(1,1));
-  mrb_define_method_id(mrb, io, MRB_SYM(close),      io_close,      MRB_ARGS_NONE());   /* 15.2.20.5.1 */
-  mrb_define_method_id(mrb, io, MRB_SYM(close_write),    io_close_write,       MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, io, MRB_SYM_E(close_on_exec), io_set_close_on_exec, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, io, MRB_SYM_Q(close_on_exec), io_close_on_exec_p,   MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, io, MRB_SYM_Q(closed),   io_closed,     MRB_ARGS_NONE());   /* 15.2.20.5.2 */
-  mrb_define_method_id(mrb, io, MRB_SYM(flush),      io_flush,      MRB_ARGS_NONE());   /* 15.2.20.5.7 */
-  mrb_define_method_id(mrb, io, MRB_SYM(ungetc),     io_ungetc,     MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, io, MRB_SYM(ungetbyte),  io_ungetbyte,  MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, io, MRB_SYM(pos),        io_pos,        MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, io, MRB_SYM(pid),        io_pid,        MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, io, MRB_SYM(fileno),     io_fileno,     MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, io, MRB_SYM(write),      io_write,      MRB_ARGS_ANY());    /* 15.2.20.5.20 */
-  mrb_define_method_id(mrb, io, MRB_SYM(puts),       io_puts,       MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, io, MRB_SYM(print),      io_print,      MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, io, MRB_SYM(putc),       io_putc,       MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, io, MRB_OPSYM(lshift),   io_lshift,     MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, io, MRB_SYM(pread),      io_pread,      MRB_ARGS_ANY());    /* Ruby 2.5 feature */
-  mrb_define_method_id(mrb, io, MRB_SYM(pwrite),     io_pwrite,     MRB_ARGS_ANY());    /* Ruby 2.5 feature */
-  mrb_define_method_id(mrb, io, MRB_SYM(getbyte),    io_getbyte,    MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, io, MRB_SYM(readbyte),   io_readbyte,   MRB_ARGS_NONE());
+  mrb_mt_init_rom(io, &io_rom_mt);
 
   mrb_define_const_id(mrb, io, MRB_SYM(SEEK_SET), mrb_fixnum_value(SEEK_SET));
   mrb_define_const_id(mrb, io, MRB_SYM(SEEK_CUR), mrb_fixnum_value(SEEK_CUR));

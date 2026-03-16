@@ -8,6 +8,7 @@
 #include <mruby/array.h>
 #include <mruby/hash.h>
 #include <mruby/class.h>
+#include <mruby/internal.h>
 #include <mruby/presym.h>
 
 /*
@@ -366,18 +367,23 @@ hash_merge(mrb_state *mrb, mrb_value hash)
   return hash;
 }
 
+static mrb_mt_entry hash_ext_rom_entries[] = {
+  MRB_MT_ENTRY(hash_values_at, MRB_SYM(values_at), MRB_MT_FUNC),
+  MRB_MT_ENTRY(hash_slice,     MRB_SYM(slice),     MRB_MT_FUNC),
+  MRB_MT_ENTRY(hash_slice_bang, MRB_SYM_B(slice),  MRB_MT_FUNC),
+  MRB_MT_ENTRY(hash_except,    MRB_SYM(except),    MRB_MT_FUNC),
+  MRB_MT_ENTRY(hash_key,       MRB_SYM(key),       MRB_MT_FUNC),
+  MRB_MT_ENTRY(hash_merge,     MRB_SYM(__merge),   MRB_MT_FUNC),
+};
+static mrb_mt_tbl hash_ext_rom_mt = MRB_MT_ROM_TAB(hash_ext_rom_entries);
+
 void
 mrb_mruby_hash_ext_gem_init(mrb_state *mrb)
 {
   struct RClass *h;
 
   h = mrb->hash_class;
-  mrb_define_method_id(mrb, h, MRB_SYM(values_at), hash_values_at, MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, h, MRB_SYM(slice),     hash_slice, MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, h, MRB_SYM_B(slice),    hash_slice_bang, MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, h, MRB_SYM(except),    hash_except, MRB_ARGS_ANY());
-  mrb_define_method_id(mrb, h, MRB_SYM(key),       hash_key, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, h, MRB_SYM(__merge),   hash_merge, MRB_ARGS_ANY());
+  mrb_mt_init_rom(h, &hash_ext_rom_mt);
   mrb_define_class_method_id(mrb, h, MRB_OPSYM(aref), hash_s_create, MRB_ARGS_ANY());
 }
 

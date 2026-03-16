@@ -544,6 +544,16 @@ mrb_proc_merge_lvar(mrb_state *mrb, mrb_irep *irep, struct REnv *env, int num, c
   MRB_ENV_SET_LEN(env, irep->nlocals);
 }
 
+/* ---------------------------*/
+static mrb_mt_entry proc_rom_entries[] = {
+  MRB_MT_ENTRY(mrb_proc_init_copy, MRB_SYM(initialize_copy), MRB_MT_FUNC|MRB_MT_PRIVATE),
+  MRB_MT_ENTRY(proc_arity,         MRB_SYM(arity),           MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(proc_eql,           MRB_OPSYM(eq),            MRB_MT_FUNC),
+  MRB_MT_ENTRY(proc_eql,           MRB_SYM_Q(eql),           MRB_MT_FUNC),
+  MRB_MT_ENTRY(proc_hash,          MRB_SYM(hash),            MRB_MT_FUNC|MRB_MT_NOARG),
+};
+static mrb_mt_tbl proc_rom_mt = MRB_MT_ROM_TAB(proc_rom_entries);
+
 void
 mrb_init_proc(mrb_state *mrb)
 {
@@ -553,11 +563,7 @@ mrb_init_proc(mrb_state *mrb)
   MRB_SET_INSTANCE_TT(pc, MRB_TT_PROC);
   MRB_UNDEF_ALLOCATOR(pc);
   mrb_define_class_method_id(mrb, pc, MRB_SYM(new), mrb_proc_s_new, MRB_ARGS_NONE()|MRB_ARGS_BLOCK());
-  mrb_define_private_method_id(mrb, pc, MRB_SYM(initialize_copy), mrb_proc_init_copy, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, pc, MRB_SYM(arity), proc_arity, MRB_ARGS_NONE()); /* 15.2.17.4.2 */
-  mrb_define_method_id(mrb, pc, MRB_OPSYM(eq), proc_eql, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, pc, MRB_SYM_Q(eql), proc_eql, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, pc, MRB_SYM(hash), proc_hash, MRB_ARGS_NONE()); /* 15.2.17.4.2 */
+  mrb_mt_init_rom(pc, &proc_rom_mt);
 
   MRB_METHOD_FROM_PROC(m, &call_proc);
   mrb_define_method_raw(mrb, pc, MRB_SYM(call), m);   /* 15.2.17.4.3 */

@@ -9,6 +9,7 @@
 #include <mruby/string.h>
 #include <mruby/io.h>
 #include <mruby/error.h>
+#include <mruby/internal.h>
 #include <mruby/presym.h>
 #include "io_hal.h"
 
@@ -1120,6 +1121,17 @@ mrb_file_join(mrb_state *mrb, mrb_value klass)
   return result;
 }
 
+/* ---------------------------*/
+static mrb_mt_entry file_rom_entries[] = {
+  MRB_MT_ENTRY(mrb_file_flock,    MRB_SYM(flock),    MRB_MT_FUNC),
+  MRB_MT_ENTRY(mrb_file_atime,    MRB_SYM(_atime),   MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(mrb_file_ctime,    MRB_SYM(_ctime),   MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(mrb_file_mtime,    MRB_SYM(_mtime),   MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(mrb_file_size,     MRB_SYM(size),     MRB_MT_FUNC|MRB_MT_NOARG),
+  MRB_MT_ENTRY(mrb_file_truncate, MRB_SYM(truncate), MRB_MT_FUNC),
+};
+static mrb_mt_tbl file_rom_mt = MRB_MT_ROM_TAB(file_rom_entries);
+
 void
 mrb_init_file(mrb_state *mrb)
 {
@@ -1144,12 +1156,7 @@ mrb_init_file(mrb_state *mrb)
   mrb_define_class_method_id(mrb, file, MRB_SYM_Q(absolute_path), mrb_file_absolute_path_p, MRB_ARGS_REQ(1));
   mrb_define_class_method_id(mrb, file, MRB_SYM(expand_path),  mrb_file_expand_path, MRB_ARGS_REQ(1)|MRB_ARGS_OPT(1));
 
-  mrb_define_method_id(mrb, file, MRB_SYM(flock), mrb_file_flock, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, file, MRB_SYM(_atime), mrb_file_atime, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, file, MRB_SYM(_ctime), mrb_file_ctime, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, file, MRB_SYM(_mtime), mrb_file_mtime, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, file, MRB_SYM(size), mrb_file_size, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, file, MRB_SYM(truncate), mrb_file_truncate, MRB_ARGS_REQ(1));
+  mrb_mt_init_rom(file, &file_rom_mt);
 
   struct RClass *cnst = mrb_define_module_under_id(mrb, file, MRB_SYM(Constants));
   mrb_define_const_id(mrb, cnst, MRB_SYM(LOCK_SH), mrb_fixnum_value(LOCK_SH));
