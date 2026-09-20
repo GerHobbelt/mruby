@@ -39,6 +39,13 @@ enum re_opcode {
                         The executor rewinds by bytes against a binary subject
                         and by characters otherwise, and the sub-pattern body
                         starts past this instruction, at pc + 2. */
+  RE_ATOMIC,         /* atomic group (?>...): offset = nesting depth of the
+                        group, 1 for an outermost one. The body follows and
+                        ends at the RE_ATOMIC_END with the same depth; once
+                        the body has matched, a failure after it fails the
+                        whole group rather than backtracking into it. */
+  RE_ATOMIC_END,     /* end of an atomic group's body: offset = the depth of
+                        the RE_ATOMIC it closes */
 };
 
 /* Bytecode instruction (4 bytes each for alignment) */
@@ -128,8 +135,8 @@ typedef struct mrb_regexp_pattern {
 #define MRB_REGEXP_STEP_LIMIT 1000000
 #endif
 
-/* Recursion-depth limit for bt_match: bounds C stack growth on
-   patterns like `(?=)+` that recurse without consuming input. */
+/* Recursion-depth limit for bt_match, which recurses at every fork and
+   every capture: bounds C stack growth on a long subject or a deep pattern. */
 #ifndef MRB_REGEXP_RECURSION_LIMIT
 #define MRB_REGEXP_RECURSION_LIMIT 1000
 #endif

@@ -19,18 +19,26 @@ simulation) with backtracking fallback.
 - `(?#...)` comment group
 - `(?<name>...)`, `(?'name'...)` named capture group
 - `|` alternation
-- `\1`-`\9` backreferences
+- `\N` backreference: a digit run whose decimal value is at most 9 or at
+  most the number of groups opened before it; a run past both is an octal
+  escape (see below)
 - `\k<name>`, `\k'name'` named backreferences
 - `(?=...)` positive lookahead
 - `(?!...)` negative lookahead
 - `(?<=...)` positive lookbehind (fixed-length only)
 - `(?<!...)` negative lookbehind (fixed-length only)
+- `(?>...)` atomic group
+- `(?imx-imx)` options for the rest of the enclosing group,
+  `(?imx-imx:...)` options for the group's own body
 
 ### Character Escapes
 
 - `\n`, `\t`, `\r`, `\f`, `\v`, `\a`, `\e` control characters
-- `\NNN` octal, one to three digits
-- `\xHH` hex, one or two digits
+- `\NNN` octal, one to three digits, when the digits spell no
+  backreference: `\101` is `A`, `\12` is a newline before twelve groups
+  and a backreference after them, `\0NN` is always octal; `\8` and `\9`
+  that spell no backreference are the digits themselves
+- `\xHH` hex, one or two digits; `\x` with no digit raises `RegexpError`
 - `\uXXXX` Unicode codepoint, exactly four hex digits
 - `\u{...}` Unicode codepoints, one to six hex digits each, several of
   them separated by spaces: `/\u{61 62}/` is `ab`
@@ -38,8 +46,11 @@ simulation) with backtracking fallback.
 Outside a character class the list form is a sequence rather than one
 atom, so a quantifier after it repeats the last codepoint only:
 `/\u{61 62}+/` is `ab+`. Inside a class every codepoint is a member of
-its own, and the last one can still open a range: `/[\u{61 62}-z]/` is
-`a` plus `b-z`.
+its own, and the one next to a `-` still opens or closes a range: the
+last of the list before it and the first after it, so `/[\u{61 62}-z]/`
+is `a` plus `b-z` and `/[a-\u{63 7a}]/` is `a-c` plus `z`. A range
+written backwards, `[b-a]` or `[b-\u{61 63}]`, raises `RegexpError` as
+in CRuby.
 
 ### Anchors
 
@@ -143,13 +154,14 @@ $~                                # last MatchData
 The gem uses two execution engines:
 
 **Pike VM (NFA simulation)**: Used for patterns without
-backreferences, non-greedy quantifiers, or lookahead. Guarantees
-O(pattern x text) time complexity, making it immune to ReDoS
-attacks.
+backreferences, non-greedy quantifiers, lookaround or atomic groups.
+Guarantees O(pattern x text) time complexity, making it immune to
+ReDoS attacks.
 
 **Backtracking engine**: Used when patterns contain `\1`-`\9`
-backreferences, non-greedy quantifiers (`*?`, `+?`, `??`), or
-lookahead assertions (`(?=...)`, `(?!...)`). Protected by a
+backreferences, non-greedy quantifiers (`*?`, `+?`, `??`),
+lookaround assertions (`(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`)
+or atomic groups (`(?>...)`). Protected by a
 configurable step limit (`MRB_REGEXP_STEP_LIMIT`, default 1M) to
 prevent excessive backtracking.
 
@@ -171,7 +183,8 @@ pattern analysis.
 - **No Unicode properties**: `\p{Alpha}`, `\p{L}`, etc. are not
   supported.
 - **No `\x{...}` hex escape**: the hex escape is `\xHH`, so it reaches
-  `0xff` at most. Write `\u{...}` for a codepoint above that.
+  `0xff` at most, and `\x{...}` raises `RegexpError` as CRuby does, since
+  the brace is not a hex digit. Write `\u{...}` for a codepoint above that.
 - **No encodings**: a pattern is a byte string read the way the build reads a
   String, and there is no encoding to consult about a byte that starts no
   whole character. Such a byte is that byte, inside a character class as much
@@ -199,11 +212,6 @@ pattern analysis.
   start and keep the last match that qualifies. The cost grows with the
   number of positions a match starts at, where CRuby hands the search to
   Onig.
-- **No inline extended mode**: `(?x)` and `(?x:...)` raise a
-  `RegexpError`, because extended mode is applied to the whole pattern
-  before it is parsed. A `-x` is accepted and ignored, so inside a
-  pattern that is itself extended it does not bring back the
-  whitespace that pass removed.
 
 ## Named Captures
 
@@ -268,7 +276,10 @@ means the pattern wants a build that converts case by Unicode.
 Those two are the only foldings whose result is an ASCII letter, and both
 builds carry them, so that folding "ASCII only" covers the whole of the
 equivalence class an ASCII letter belongs to rather than the part of it that
-is ASCII.
+is ASCII. A class holding the letter only through `\w`, `[:word:]` or
+`[:ascii:]` does not reach them: those are sets ASCII defines, so `[\w]`
+under `/i` stays the ASCII word characters and `[^\w]` accepts `"K"` (U+212A),
+as in CRuby. A letter written out beside the shorthand (`[\ws]`) folds as usual.
 
 ## License
 
