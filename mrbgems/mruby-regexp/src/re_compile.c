@@ -85,7 +85,7 @@ patch(re_compiler *c, uint32_t pos, uint16_t offset)
 }
 
 /* Insert an instruction at position `pos` by shifting code.
-   Adjusts all jump offsets >= pos by +1. */
+   Adjusts jump targets so they still point at the same instructions. */
 static void
 insert_inst(re_compiler *c, uint32_t pos, uint8_t op, uint8_t a, uint16_t offset)
 {
@@ -96,16 +96,19 @@ insert_inst(re_compiler *c, uint32_t pos, uint8_t op, uint8_t a, uint16_t offset
   c->code[pos].a = a;
   c->code[pos].offset = offset;
 
-  /* Fix jump targets that point past the insertion point. An offset equal
-     to `pos` already points to the inserted instruction's new location and
-     must not be bumped -- bumping it would shift the target to whatever
-     code got displaced by the insertion (e.g. the body of the quantified
-     atom), corrupting "skip past this atom" jumps emitted earlier. */
+  /* Fix jump targets across the insertion. A target past `pos` shifts down by
+     one. A target equal to `pos` is ambiguous:
+     - code that moved (i > pos) is a backward jump -- e.g. the SPLIT that
+       loops `\d+` back to its class -- and meant the instruction now at
+       pos+1, so it must follow.
+     - code before the insertion (i < pos) is a forward "skip to here"
+       reference that should stay on the newly inserted instruction. */
   for (uint32_t i = 0; i < c->code_len; i++) {
     if (i == pos) continue;
     switch (c->code[i].op) {
     case RE_JMP: case RE_SPLIT: case RE_SPLITNG:
-      if (c->code[i].offset > pos && c->code[i].offset < 0xffff) {
+      if (c->code[i].offset >= 0xffff) break;
+      if (c->code[i].offset > pos || (c->code[i].offset == pos && i > pos)) {
         c->code[i].offset++;
       }
       break;
@@ -250,6 +253,42 @@ class_add_shorthand(re_charclass *cc, int ch)
   }
 }
 
+/* Set ASCII bits for a POSIX class name (e.g. "alpha") into a 128-bit map.
+   Returns FALSE for an unknown name. Semantics are ASCII, like this gem's
+   \w/\d shorthands; non-ASCII codepoints are not classified. */
+static mrb_bool
+posix_class_bits(uint8_t *bits, const char *name, uint16_t len)
+{
+#define NAME_IS(s) (len == sizeof(s) - 1 && memcmp(name, s, len) == 0)
+#define BSET(ch)   (bits[(ch) >> 3] |= (uint8_t)(1u << ((ch) & 7)))
+#define BRANGE(lo, hi) do { for (int i = (lo); i <= (hi); i++) BSET(i); } while (0)
+  if (NAME_IS("alpha")) { BRANGE('a','z'); BRANGE('A','Z'); }
+  else if (NAME_IS("digit")) { BRANGE('0','9'); }
+  else if (NAME_IS("alnum")) { BRANGE('a','z'); BRANGE('A','Z'); BRANGE('0','9'); }
+  else if (NAME_IS("upper")) { BRANGE('A','Z'); }
+  else if (NAME_IS("lower")) { BRANGE('a','z'); }
+  else if (NAME_IS("space")) { BSET(' '); BRANGE('\t','\r'); }
+  else if (NAME_IS("blank")) { BSET(' '); BSET('\t'); }
+  else if (NAME_IS("xdigit")) { BRANGE('0','9'); BRANGE('a','f'); BRANGE('A','F'); }
+  else if (NAME_IS("word")) { BRANGE('a','z'); BRANGE('A','Z'); BRANGE('0','9'); BSET('_'); }
+  else if (NAME_IS("cntrl")) { BRANGE(0, 0x1f); BSET(0x7f); }
+  else if (NAME_IS("print")) { BRANGE(0x20, 0x7e); }
+  else if (NAME_IS("graph")) { BRANGE(0x21, 0x7e); }
+  else if (NAME_IS("ascii")) { BRANGE(0, 0x7f); }
+  else if (NAME_IS("punct")) {
+    for (int i = 0x21; i <= 0x7e; i++) {
+      mrb_bool alnum = (i >= 'a' && i <= 'z') || (i >= 'A' && i <= 'Z') ||
+                       (i >= '0' && i <= '9');
+      if (!alnum) BSET(i);
+    }
+  }
+  else return FALSE;
+  return TRUE;
+#undef NAME_IS
+#undef BSET
+#undef BRANGE
+}
+
 static int
 parse_escape(re_compiler *c)
 {
@@ -346,6 +385,32 @@ compile_charclass(re_compiler *c)
     if (peek(c) < 0) compile_error(c, "unterminated character class");
     first = FALSE;
 
+    /* POSIX bracket class: [:name:] or negated [:^name:] inside [...]. */
+    if (peek(c) == '[' && c->p + 1 < c->src_end && c->p[1] == ':') {
+      const char *save = c->p;
+      next_char(c);  /* '[' */
+      next_char(c);  /* ':' */
+      mrb_bool neg = FALSE;
+      if (peek(c) == '^') { neg = TRUE; next_char(c); }
+      const char *name = c->p;
+      while (peek(c) >= 0 && peek(c) != ':' && peek(c) != ']') next_char(c);
+      if (peek(c) == ':' && c->p + 1 < c->src_end && c->p[1] == ']') {
+        uint8_t bits[16] = {0};
+        if (!posix_class_bits(bits, name, (uint16_t)(c->p - name))) {
+          compile_error(c, "invalid POSIX bracket class");
+        }
+        next_char(c);  /* ':' */
+        next_char(c);  /* ']' */
+        for (int i = 0; i < 128; i++) {
+          mrb_bool in = (bits[i >> 3] >> (i & 7)) & 1;
+          if (in != neg) class_set_bit(cc, (uint8_t)i);
+        }
+        if (neg) cc->utf8_any = TRUE;  /* [:^...:] matches non-ASCII too */
+        continue;
+      }
+      c->p = save;  /* not a POSIX class; treat '[' as a literal below */
+    }
+
     /* Shorthand classes (\d, \D, \w, \W, \s, \S, \h, \H) are handled
        before the codepoint-aware path so the single-byte semantics
        stay intact. */
@@ -399,9 +464,11 @@ parse_quantifier(re_compiler *c, int *min_out, int *max_out)
 {
   const char *save = c->p;
   int min = 0, max = -1;
+  mrb_bool has_digit = FALSE;
 
   while (peek(c) >= '0' && peek(c) <= '9') {
     min = min * 10 + (next_char(c) - '0');
+    has_digit = TRUE;
     if (min > RE_MAX_REPEAT) compile_error(c, "quantifier too large");
   }
   if (peek(c) == ',') {
@@ -410,6 +477,7 @@ parse_quantifier(re_compiler *c, int *min_out, int *max_out)
       max = 0;
       while (peek(c) >= '0' && peek(c) <= '9') {
         max = max * 10 + (next_char(c) - '0');
+        has_digit = TRUE;
         if (max > RE_MAX_REPEAT) compile_error(c, "quantifier too large");
       }
     }
@@ -418,7 +486,8 @@ parse_quantifier(re_compiler *c, int *min_out, int *max_out)
   else {
     max = min;  /* {n} means exactly n */
   }
-  if (peek(c) != '}') {
+  /* {} and {,} carry no count and are literals in Ruby, not quantifiers. */
+  if (!has_digit || peek(c) != '}') {
     c->p = save;  /* not a quantifier, treat { as literal */
     return FALSE;
   }
@@ -645,6 +714,45 @@ compile_atom(re_compiler *c)
       next_char(c);
       emit(c, RE_NWBOUND, 0, 0);
     }
+    else if (ch == 'k' && c->p + 1 < c->src_end &&
+             (c->p[1] == '<' || c->p[1] == '\'')) {
+      /* \k<name> / \k'name': backreference to a named group. Numeric forms
+         \k<2> (absolute) and \k<-1> (relative to the groups seen so far) are
+         also accepted, like the \g/\k family in Onigmo. */
+      next_char(c);  /* skip k */
+      int close = (peek(c) == '<') ? '>' : '\'';
+      next_char(c);  /* skip < or ' */
+      const char *name = c->p;
+      while (peek(c) != close && peek(c) >= 0) next_char(c);
+      if (peek(c) != close) compile_error(c, "unterminated backreference name");
+      uint16_t name_len = (uint16_t)(c->p - name);
+      next_char(c);  /* skip the closing > or ' */
+
+      int group = -1;
+      if (name_len > 0 && (name[0] == '-' || (name[0] >= '0' && name[0] <= '9'))) {
+        mrb_bool relative = (name[0] == '-');
+        int n = 0;
+        for (uint16_t i = (relative ? 1 : 0); i < name_len; i++) {
+          if (name[i] < '0' || name[i] > '9') compile_error(c, "invalid backreference");
+          n = n * 10 + (name[i] - '0');
+        }
+        group = relative ? (int)c->num_captures - n : n;
+      }
+      else {
+        for (uint16_t i = 0; i < c->num_named; i++) {
+          if (c->named_captures[i].name_len == name_len &&
+              memcmp(c->named_captures[i].name, name, name_len) == 0) {
+            group = c->named_captures[i].group;
+            break;
+          }
+        }
+      }
+      if (group < 1 || group >= (int)c->num_captures) {
+        compile_error(c, "undefined group name reference");
+      }
+      emit(c, RE_BACKREF, (uint8_t)group, 0);
+      c->has_backref = TRUE;
+    }
     else {
       ch = parse_escape(c);
       if (c->flags & RE_FLAG_IGNORECASE) {
@@ -667,8 +775,26 @@ compile_atom(re_compiler *c)
     }
     break;
 
+  case '{':
+    {
+      /* `{` opens a repeat only as a valid quantifier, which compile_quantified
+         consumes after an atom. Reaching it here means there is no atom to
+         repeat: a real quantifier (e.g. {2}) is an error, like CRuby, and
+         anything else (e.g. {a}, a lone {) is a literal `{`. parse_quantifier
+         consumes the `{...}` on success and restores the position on failure,
+         so without this case a literal `{` was never consumed and the
+         sequence loop spun forever (issue #6914). */
+      next_char(c);  /* consume `{` for the trial parse */
+      int qmin, qmax;
+      if (parse_quantifier(c, &qmin, &qmax)) {
+        compile_error(c, "target of repeat operator is not specified");
+      }
+      emit(c, RE_CHAR, '{', 0);
+    }
+    break;
+
   default:
-    if (ch < 0 || ch == ')' || ch == '|' || ch == '*' || ch == '+' || ch == '?' || ch == '{') {
+    if (ch < 0 || ch == ')' || ch == '|' || ch == '*' || ch == '+' || ch == '?') {
       return;  /* not an atom */
     }
     next_char(c);
@@ -690,6 +816,32 @@ compile_atom(re_compiler *c)
     }
     emit(c, RE_CHAR, (uint8_t)ch, 0);
     break;
+  }
+}
+
+/* Append a copy of the atom bytecode in [start, start+size) at the current
+   position. Internal jump/split targets are relocated to the copy, so a
+   repeated group like (a{2,3}){2} keeps each iteration self-contained instead
+   of jumping back into the first copy (which corrupted its captures). Capture
+   slots (RE_SAVE) are shared across copies on purpose: a repeated group keeps
+   only its last iteration, like CRuby. */
+static void
+emit_atom_copy(re_compiler *c, uint32_t start, uint32_t size)
+{
+  int32_t delta = (int32_t)c->code_len - (int32_t)start;
+  uint32_t atom_end = start + size;
+  for (uint32_t j = 0; j < size; j++) {
+    re_inst in = c->code[start + j];
+    switch (in.op) {
+    case RE_JMP: case RE_SPLIT: case RE_SPLITNG:
+      if (in.offset >= start && in.offset <= atom_end) {
+        in.offset = (uint16_t)((int32_t)in.offset + delta);
+      }
+      break;
+    default:
+      break;
+    }
+    emit(c, in.op, in.a, in.offset);
   }
 }
 
@@ -748,30 +900,41 @@ compile_quantified(re_compiler *c)
     uint32_t atom_end = c->code_len;
     uint32_t atom_size = atom_end - start;
 
-    /* First, we have one copy already. We need min-1 more mandatory copies. */
-    for (int i = 1; i < min; i++) {
-      for (uint32_t j = 0; j < atom_size; j++) {
-        emit(c, c->code[start + j].op, c->code[start + j].a, c->code[start + j].offset);
-      }
-    }
-    /* Then optional copies */
-    if (max < 0) {
-      /* {n,} = min copies + * */
-      uint32_t loop_start = c->code_len;
-      uint32_t split_pos = emit(c, nongreedy ? RE_SPLITNG : RE_SPLIT, 0, 0);
-      for (uint32_t j = 0; j < atom_size; j++) {
-        emit(c, c->code[start + j].op, c->code[start + j].a, c->code[start + j].offset);
-      }
-      emit(c, RE_JMP, 0, loop_start);
-      patch(c, split_pos, c->code_len);
+    if (min == 0 && max == 0) {
+      /* {0}: the atom matches zero times, so drop the copy we emitted. */
+      c->code_len = start;
     }
     else {
-      for (int i = min; i < max; i++) {
+      /* {0,m} and {0,} compile as {1,m}/{1,} wrapped in an optional, so the
+         single already-emitted copy is not forced to match. lo is the lower
+         bound used while laying out copies (1 in the wrapped case). */
+      mrb_bool wrap_optional = (min == 0);
+      int lo = wrap_optional ? 1 : min;
+
+      /* We have one copy already; emit lo-1 more mandatory copies. */
+      for (int i = 1; i < lo; i++) {
+        emit_atom_copy(c, start, atom_size);
+      }
+      /* Then optional copies */
+      if (max < 0) {
+        /* {n,} = lo copies + * */
+        uint32_t loop_start = c->code_len;
         uint32_t split_pos = emit(c, nongreedy ? RE_SPLITNG : RE_SPLIT, 0, 0);
-        for (uint32_t j = 0; j < atom_size; j++) {
-          emit(c, c->code[start + j].op, c->code[start + j].a, c->code[start + j].offset);
-        }
+        emit_atom_copy(c, start, atom_size);
+        emit(c, RE_JMP, 0, loop_start);
         patch(c, split_pos, c->code_len);
+      }
+      else {
+        for (int i = lo; i < max; i++) {
+          uint32_t split_pos = emit(c, nongreedy ? RE_SPLITNG : RE_SPLIT, 0, 0);
+          emit_atom_copy(c, start, atom_size);
+          patch(c, split_pos, c->code_len);
+        }
+      }
+      if (wrap_optional) {
+        /* Make the whole {1,m}/{1,} body skippable so it matches zero times. */
+        insert_inst(c, start, nongreedy ? RE_SPLITNG : RE_SPLIT, 0, 0);
+        c->code[start].offset = (uint16_t)c->code_len;
       }
     }
   }
@@ -829,12 +992,17 @@ compile_alt(re_compiler *c)
     }
   }
 
-  /* Now set up SPLIT chain: each SPLIT tries next instruction or jumps to alt */
+  /* Now set up the SPLIT chain. Each SPLIT falls through to the next, and the
+     chain's final fall-through reaches the first alternative, so the engines
+     (which rank a SPLIT's fall-through above its jump) explore alternative 0
+     first. The jump targets are then unwound in reverse, so SPLIT i must jump
+     to alternative (split_count - i) to keep the remaining alternatives in
+     source order -- i.e. leftmost-first across three or more branches. */
   for (uint32_t i = 0; i < split_count; i++) {
     uint32_t pos = alt_starts[0] - split_count + i;
     c->code[pos].op = RE_SPLIT;
     c->code[pos].a = 0;
-    c->code[pos].offset = (uint16_t)alt_starts[i + 1];
+    c->code[pos].offset = (uint16_t)alt_starts[split_count - i];
   }
 
   /* Patch JMPs (they are right before each alt_starts[1..n-1]) to point to end */

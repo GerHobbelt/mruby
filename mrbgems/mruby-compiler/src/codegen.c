@@ -1951,6 +1951,7 @@ gen_forward_arg(mrc_codegen_scope *s, mrc_sym sym, int val)
 static int
 gen_values(mrc_codegen_scope *s, mrc_node *tree, int val, int limit)
 {
+  if (tree == NULL) return 0;   /* no arguments (e.g. empty index `a[]`) */
   CAST(arguments);
   mrc_node *t;
 
@@ -2207,9 +2208,9 @@ scope_body(mrc_codegen_scope *s, mrc_node *tree, int val)
     }
     case PM_CLASS_NODE:
     {
-      CAST3(class, tree, class);
-      nlv = &class->locals;
-      statements = class->body;
+      CAST3(class, tree, cls);
+      nlv = &cls->locals;
+      statements = cls->body;
       break;
     }
     case PM_SINGLETON_CLASS_NODE:
@@ -2765,9 +2766,14 @@ codegen_pattern(mrc_codegen_scope *s, mrc_node *pattern, int target, uint32_t *f
       /* Try left pattern */
       codegen_pattern(s, (mrc_node *)pat_alt->left, target, &left_fail, known_array_len);
 
-      /* Optimize JMPNOT+JMP to JMPIF when possible */
+      /* Optimize JMPNOT+JMP to JMPIF when possible.
+         Only when the left pattern's tail is an OP_JMPNOT (BS format, so the
+         opcode sits at left_fail-2).  Patterns that emit a plain OP_JMP (e.g.
+         unimplemented patterns falling to the default case) must not be
+         rewritten, or a neighboring byte would be corrupted. */
       if (nint(pat_alt->left) != PM_ALTERNATION_PATTERN_NODE &&
-          left_fail != JMPLINK_START && left_fail >= 2 && left_fail + 2 == s->pc) {
+          left_fail != JMPLINK_START && left_fail >= 2 && left_fail + 2 == s->pc &&
+          s->iseq[left_fail - 2] == OP_JMPNOT) {
         /* Extract the previous link from the JMPNOT chain */
         int16_t prev_offset = (int16_t)PEEK_S(s->iseq + left_fail);
         int32_t next_addr = (int32_t)(left_fail + 2) + prev_offset;
@@ -3502,9 +3508,11 @@ lambda_body(mrc_codegen_scope *s, mrc_node *tree, mrc_node *body, pm_constant_id
     }
     // rest
     if (ra) {
-      if (((pm_rest_parameter_node_t *)parameters->rest)->name) {
+      if (nint(parameters->rest) == PM_REST_PARAMETER_NODE &&
+          ((pm_rest_parameter_node_t *)parameters->rest)->name) {
         mrc_constant_id_list_append(s, lv, ((pm_rest_parameter_node_t *)parameters->rest)->name);
       } else {
+        /* anonymous rest (*) or implicit rest from a trailing comma (|a,|) */
         pm_constant_id_t astr = MRC_OPSYM_2(mul);
         mrc_constant_id_list_append(s, lv, astr);
       }
@@ -3545,8 +3553,8 @@ lambda_body(mrc_codegen_scope *s, mrc_node *tree, mrc_node *body, pm_constant_id
             pm_constant_id_t dastr = MRC_OPSYM_2(pow);
             mrc_constant_id_list_append(s, lv, dastr);
             mrc_constant_id_list_append(s, lv, null_mark);
-            pm_constant_id_t and = MRC_OPSYM_2(and);
-            mrc_constant_id_list_append(s, lv, and);
+            pm_constant_id_t and_sym = MRC_OPSYM_2(and);
+            mrc_constant_id_list_append(s, lv, and_sym);
             block_reg = lv->size;
             break;
           }
@@ -3568,8 +3576,8 @@ lambda_body(mrc_codegen_scope *s, mrc_node *tree, mrc_node *body, pm_constant_id
         mrc_constant_id_list_append(s, lv, ((pm_block_parameter_node_t *)parameters->block)->name);
       }
       else {
-        pm_constant_id_t and = MRC_OPSYM_2(and);
-        mrc_constant_id_list_append(s, lv, and);
+        pm_constant_id_t and_sym = MRC_OPSYM_2(and);
+        mrc_constant_id_list_append(s, lv, and_sym);
       }
       block_reg = lv->size;
     }
@@ -5938,10 +5946,10 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
     {
       CAST(block_argument);
       if (!cast->expression) {
-        mrc_sym and = MRC_OPSYM_2(and);
-        int idx = lv_idx(s, and);
+        mrc_sym and_sym = MRC_OPSYM_2(and);
+        int idx = lv_idx(s, and_sym);
         if (idx == 0) {
-          gen_getupvar(s, cursp(), and);
+          gen_getupvar(s, cursp(), and_sym);
         }
         else {
           gen_move(s, cursp(), idx, val);

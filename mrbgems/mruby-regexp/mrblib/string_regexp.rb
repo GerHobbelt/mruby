@@ -37,8 +37,9 @@ class String
     parts = []
     pos = 0
     len = self.bytesize
+    binary = Regexp.__binary_string?(self)
     while pos <= len
-      md = pattern.match(self, pos)
+      md = pattern.__byte_match(self, pos)
       break unless md
       # gsub works in byte space (match pos, byteslice). begin/end report
       # character offsets (CRuby-compatible), so use the byte accessors.
@@ -47,11 +48,16 @@ class String
       parts << self.byteslice(pos, match_start - pos)
       parts << block.call(md[0]).to_s
       if match_start == match_end
-        rest = self.byteslice(match_end..-1)
-        if rest && rest.bytesize > 0
-          char = rest[0]
-          parts << char
-          pos = match_end + char.bytesize
+        if match_end < len
+          if binary
+            parts << self.byteslice(match_end, 1)
+            pos = match_end + 1
+          else
+            rest = self.byteslice(match_end..-1)
+            char = rest[0]
+            parts << char
+            pos = match_end + char.bytesize
+          end
         else
           pos = match_end + 1
         end
@@ -84,6 +90,16 @@ class String
 
     limit_given = args.length > 0
     limit = limit_given ? args[0] : 0
+    if limit_given && !limit.is_a?(Integer)
+      if limit.respond_to?(:to_int)
+        limit = limit.to_int
+        unless limit.is_a?(Integer)
+          raise TypeError, "no implicit conversion of #{limit.class} to Integer)"
+        end
+      else
+        limit = limit.__to_int
+      end
+    end
     if pattern.nil? || pattern.is_a?(String)
       return limit_given ? __split(pattern, limit) : __split(pattern)
     end
@@ -102,7 +118,7 @@ class String
         result << (self.byteslice(field_start..-1) || "")
         return result
       end
-      md = pattern.match(self, search_pos)
+      md = pattern.__byte_match(self, search_pos)
       break unless md
       match_start = md.__byte_begin(0)
       match_end = md.__byte_end(0)

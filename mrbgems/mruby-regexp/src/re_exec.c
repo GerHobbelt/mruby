@@ -84,6 +84,9 @@ typedef struct {
   const char *str_end;
   mrb_bool matched;
   mrb_bool match_only;    /* true: skip capture tracking (match? path) */
+  mrb_bool binary;        /* true: subject is byte-indexed ASCII-8BIT */
+  mrb_bool cut;           /* a higher-priority thread matched this step:
+                             stop adding/processing lower-priority threads */
   int *result_caps;       /* best match (ncap ints) */
 } pike_state;
 
@@ -118,6 +121,7 @@ add_thread(pike_state *s, re_threadlist *list,
            uint32_t pc, int cap_slot, const char *sp)
 {
   for (;;) {
+    if (s->cut) return;
     if (pc >= s->pat->code_len) return;
     if (s->visited[pc] == s->gen) return;
     s->visited[pc] = s->gen;
@@ -129,19 +133,30 @@ add_thread(pike_state *s, re_threadlist *list,
       continue;
 
     case RE_SPLIT:
+      /* Greedy fork: the fall-through (pc+1) outranks the jump target, the
+         same priority order the backtracking engine uses. Explore the
+         higher-priority branch first so it claims shared pcs (visited[]) and
+         reaches a match before the lower one. Snapshot the captures before
+         pc+1's closure can mutate the shared slot; the jump branch then runs
+         on that snapshot. */
       {
         int cp = s->match_only ? 0 : pool_copy(s, cap_slot);
-        add_thread(s, list, inst.offset, cp, sp);
+        add_thread(s, list, pc + 1, cap_slot, sp);
+        if (s->cut) return;
+        pc = inst.offset;
+        cap_slot = cp;
       }
-      pc++;
       continue;
 
     case RE_SPLITNG:
+      /* Non-greedy fork: the jump target outranks the fall-through. */
       {
         int cp = s->match_only ? 0 : pool_copy(s, cap_slot);
-        add_thread(s, list, pc + 1, cp, sp);
+        add_thread(s, list, inst.offset, cap_slot, sp);
+        if (s->cut) return;
+        pc = pc + 1;
+        cap_slot = cp;
       }
-      pc = inst.offset;
       continue;
 
     case RE_SAVE:
@@ -152,13 +167,18 @@ add_thread(pike_state *s, re_threadlist *list,
       continue;
 
     case RE_BOL:
-      if (sp == s->str || ((s->pat->flags & RE_FLAG_MULTILINE) && sp > s->str && sp < s->str_end && sp[-1] == '\n')) {
+      /* ^ always matches at a line start (string start or just after a \n);
+         Ruby's /m only affects `.`, not the line anchors. \A is RE_BOT. A
+         trailing \n does not open a final line, so ^ does not match at the
+         very end. */
+      if (sp == s->str || (sp != s->str_end && sp[-1] == '\n')) {
         pc++; continue;
       }
       return;
 
     case RE_EOL:
-      if (sp == s->str_end || ((s->pat->flags & RE_FLAG_MULTILINE) && *sp == '\n')) {
+      /* $ always matches at a line end (string end or just before a \n). */
+      if (sp == s->str_end || *sp == '\n') {
         pc++; continue;
       }
       return;
@@ -196,6 +216,11 @@ add_thread(pike_state *s, re_threadlist *list,
       if (s->result_caps) {
         memcpy(s->result_caps, CAP(s, cap_slot), sizeof(int) * s->ncap);
       }
+      /* Leftmost-first: this is the highest-priority thread to reach a match
+         this step (closures run in priority order), so cut every lower one.
+         A surviving higher-priority thread can still match later and override
+         this in a subsequent step, which is the correct greedy/longest case. */
+      s->cut = TRUE;
       return;
 
     default:
@@ -215,7 +240,7 @@ add_thread(pike_state *s, re_threadlist *list,
 static int
 pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
         const char *str, mrb_int len, mrb_int start,
-        int *captures, int captures_size)
+        int *captures, int captures_size, mrb_bool binary)
 {
   const char *sp = str + start;
   const char *str_end = str + len;
@@ -239,6 +264,8 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
   s.str_end = str_end;
   s.matched = FALSE;
   s.match_only = match_only;
+  s.binary = binary;
+  s.cut = FALSE;
   s.gen = 1;
   if (match_only) {
     s.pool_capa = 1;
@@ -288,41 +315,52 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
          a multi-byte char's interior is not a valid char boundary, and
          starting a thread there mis-decodes the char (e.g. a class-
          match on a stray 0x82 instead of the leader's full codepoint). */
-      if (curr.count == 0 && sp < str_end && ((uint8_t)*sp & 0xC0) == 0x80) {
+      if (!s.binary && curr.count == 0 && sp < str_end && mrb_re_utf8_continuation_p(sp)) {
         continue;
       }
       int slot = match_only ? 0 : pool_alloc(&s);
       if (!match_only) memset(CAP(&s, slot), -1, sizeof(int) * ncap);
       s.gen++;
+      s.cut = FALSE;
       add_thread(&s, &curr, 0, slot, sp);
       if (s.matched && curr.count == 0) break;
     }
 
     if (sp >= str_end) break;
 
-    if (!match_only) {
-      /* Compact: copy live thread captures to the front of the pool. */
+    if (!match_only && curr.count > 0) {
+      /* Renumber each live thread's capture slot to its list index so the
+         pool can be reset to curr.count. Stage the copies through freshly
+         allocated tail slots first: writing straight to CAP(i) would clobber
+         a low slot that a later thread (index j > i) still needs to read
+         whenever the slot assignment is a non-identity permutation -- which
+         happens once alternation reorders threads relative to their slot
+         numbers. Tail slots are disjoint from every source slot, and the
+         final block copy to the front is disjoint because pool_next >= count. */
+      int base = s.pool_next;
       for (int i = 0; i < curr.count; i++) {
-        if (curr.threads[i].cap_slot != i) {
-          memcpy(CAP(&s, i), CAP(&s, curr.threads[i].cap_slot),
-                 sizeof(int) * ncap);
-          curr.threads[i].cap_slot = i;
-        }
+        int dst = pool_alloc(&s);
+        memcpy(CAP(&s, dst), CAP(&s, curr.threads[i].cap_slot),
+               sizeof(int) * ncap);
+        curr.threads[i].cap_slot = i;
       }
+      memcpy(&s.cap_pool[0], &s.cap_pool[base * ncap],
+             sizeof(int) * ncap * curr.count);
       s.pool_next = curr.count;
     }
 
     s.gen++;
+    s.cut = FALSE;
     next.count = 0;
 
     int ch = (uint8_t)*sp;
-    int advance = mrb_re_utf8_charlen(sp, str_end);
+    int advance = mrb_re_charlen(sp, str_end, s.binary);
     /* Decoded codepoint of the current input char. Identical to `ch`
        for ASCII; lazily decoded only when the char is multi-byte. */
     uint32_t curr_cp = (uint32_t)ch;
-    if (advance > 1) {
+    if (!s.binary && advance > 1) {
       int dlen = 0;
-      curr_cp = mrb_re_utf8_decode(sp, &dlen);
+      curr_cp = mrb_re_decode_char(sp, &dlen, s.binary);
     }
 
     for (int i = 0; i < curr.count; i++) {
@@ -379,6 +417,10 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
       default:
         break;
       }
+
+      /* A higher-priority thread reached a match while building `next`; the
+         remaining (lower-priority) threads in `curr` are cut for this step. */
+      if (s.cut) break;
     }
 
     /* swap curr and next */
@@ -421,7 +463,7 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
 static mrb_bool
 bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
          const char *sp, uint32_t pc, int *captures, int ncap, int *steps,
-         int depth)
+         int depth, mrb_bool binary)
 {
   if (depth > MRB_REGEXP_RECURSION_LIMIT) return FALSE;
   while (pc < pat->code_len) {
@@ -436,21 +478,21 @@ bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
 
     case RE_ANY:
       if (sp >= str_end || *sp == '\n') return FALSE;
-      sp += mrb_re_utf8_charlen(sp, str_end); pc++;
+      sp += mrb_re_charlen(sp, str_end, binary); pc++;
       break;
 
     case RE_ANY_NL:
       if (sp >= str_end) return FALSE;
-      sp += mrb_re_utf8_charlen(sp, str_end); pc++;
+      sp += mrb_re_charlen(sp, str_end, binary); pc++;
       break;
 
     case RE_CLASS:
       if (sp >= str_end) return FALSE;
       {
         int dlen = 0;
-        uint32_t cp_ = mrb_re_utf8_decode(sp, &dlen);
+        uint32_t cp_ = mrb_re_decode_char(sp, &dlen, binary);
         if (!class_match(&pat->classes[inst.a], cp_)) return FALSE;
-        sp += mrb_re_utf8_charlen(sp, str_end);
+        sp += mrb_re_charlen(sp, str_end, binary);
       }
       pc++;
       break;
@@ -459,9 +501,9 @@ bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
       if (sp >= str_end) return FALSE;
       {
         int dlen = 0;
-        uint32_t cp_ = mrb_re_utf8_decode(sp, &dlen);
+        uint32_t cp_ = mrb_re_decode_char(sp, &dlen, binary);
         if (class_match(&pat->classes[inst.a], cp_)) return FALSE;
-        sp += mrb_re_utf8_charlen(sp, str_end);
+        sp += mrb_re_charlen(sp, str_end, binary);
       }
       pc++;
       break;
@@ -474,12 +516,12 @@ bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
       break;
 
     case RE_SPLIT:
-      if (bt_match(pat, str, str_end, sp, pc + 1, captures, ncap, steps, depth + 1)) return TRUE;
+      if (bt_match(pat, str, str_end, sp, pc + 1, captures, ncap, steps, depth + 1, binary)) return TRUE;
       pc = inst.offset;
       break;
 
     case RE_SPLITNG:
-      if (bt_match(pat, str, str_end, sp, inst.offset, captures, ncap, steps, depth + 1)) return TRUE;
+      if (bt_match(pat, str, str_end, sp, inst.offset, captures, ncap, steps, depth + 1, binary)) return TRUE;
       pc++;
       break;
 
@@ -489,19 +531,22 @@ bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
         if (slot < ncap) {
           int old = captures[slot];
           captures[slot] = (int)(sp - str);
-          if (bt_match(pat, str, str_end, sp, pc + 1, captures, ncap, steps, depth + 1)) return TRUE;
+          if (bt_match(pat, str, str_end, sp, pc + 1, captures, ncap, steps, depth + 1, binary)) return TRUE;
           captures[slot] = old;
         }
         return FALSE;
       }
 
     case RE_BOL:
-      if (sp != str && !(pat->flags & RE_FLAG_MULTILINE && sp > str && sp < str_end && sp[-1] == '\n')) return FALSE;
+      /* ^ always matches at a line start (see the Pike VM case); /m only
+         affects `.`. \A is RE_BOT. A trailing \n opens no final line. */
+      if (sp != str && (sp == str_end || sp[-1] != '\n')) return FALSE;
       pc++;
       break;
 
     case RE_EOL:
-      if (sp != str_end && !(pat->flags & RE_FLAG_MULTILINE && *sp == '\n')) return FALSE;
+      /* $ always matches at a line end. */
+      if (sp != str_end && *sp != '\n') return FALSE;
       pc++;
       break;
 
@@ -549,13 +594,13 @@ bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
       break;
 
     case RE_LOOKAHEAD:
-      if (!bt_match(pat, str, str_end, sp, pc + 1, captures, ncap, steps, depth + 1))
+      if (!bt_match(pat, str, str_end, sp, pc + 1, captures, ncap, steps, depth + 1, binary))
         return FALSE;
       pc = inst.offset;
       break;
 
     case RE_NEG_LOOKAHEAD:
-      if (bt_match(pat, str, str_end, sp, pc + 1, captures, ncap, steps, depth + 1))
+      if (bt_match(pat, str, str_end, sp, pc + 1, captures, ncap, steps, depth + 1, binary))
         return FALSE;
       pc = inst.offset;
       break;
@@ -564,7 +609,7 @@ bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
       {
         int lb_len = inst.a;
         if (sp - str < lb_len) return FALSE;  /* not enough text before */
-        if (!bt_match(pat, str, str_end, sp - lb_len, pc + 1, captures, ncap, steps, depth + 1))
+        if (!bt_match(pat, str, str_end, sp - lb_len, pc + 1, captures, ncap, steps, depth + 1, binary))
           return FALSE;
         pc = inst.offset;
       }
@@ -574,7 +619,7 @@ bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
       {
         int lb_len = inst.a;
         if (sp - str >= lb_len) {
-          if (bt_match(pat, str, str_end, sp - lb_len, pc + 1, captures, ncap, steps, depth + 1))
+          if (bt_match(pat, str, str_end, sp - lb_len, pc + 1, captures, ncap, steps, depth + 1, binary))
             return FALSE;
         }
         /* if not enough text before, negative lookbehind succeeds */
@@ -592,7 +637,7 @@ bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
 static int
 backtrack_exec(mrb_state *mrb, const mrb_regexp_pattern *pat,
                const char *str, mrb_int len, mrb_int start,
-               int *captures, int captures_size)
+               int *captures, int captures_size, mrb_bool binary)
 {
   const char *str_end = str + len;
   int ncap = pat->num_captures * 2;
@@ -611,10 +656,13 @@ backtrack_exec(mrb_state *mrb, const mrb_regexp_pattern *pat,
       while (sp < str_end && !FIRST_BYTE_OK(pat, (uint8_t)*sp)) sp++;
       if (sp > str_end) break;
     }
+    if (!binary && sp < str_end && mrb_re_utf8_continuation_p(sp)) {
+      continue;
+    }
     memset(caps, -1, sizeof(int) * ncap);
     int steps = 0;
 
-    if (bt_match(pat, str, str_end, sp, 0, caps, ncap, &steps, 0)) {
+    if (bt_match(pat, str, str_end, sp, 0, caps, ncap, &steps, 0, binary)) {
       if (captures) {
         int copy = ncap < captures_size ? ncap : captures_size;
         memcpy(captures, caps, sizeof(int) * copy);
@@ -657,13 +705,13 @@ literal_exec(const mrb_regexp_pattern *pat,
 int
 mrb_re_exec(mrb_state *mrb, const mrb_regexp_pattern *pat,
         const char *str, mrb_int len, mrb_int start,
-        int *captures, int captures_size)
+        int *captures, int captures_size, mrb_bool binary)
 {
   if (pat->is_literal) {
     return literal_exec(pat, str, len, start, captures, captures_size);
   }
   if (pat->has_backref || pat->needs_backtrack) {
-    return backtrack_exec(mrb, pat, str, len, start, captures, captures_size);
+    return backtrack_exec(mrb, pat, str, len, start, captures, captures_size, binary);
   }
-  return pike_vm(mrb, pat, str, len, start, captures, captures_size);
+  return pike_vm(mrb, pat, str, len, start, captures, captures_size, binary);
 }

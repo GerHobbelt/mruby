@@ -4,11 +4,6 @@ MRuby::Gem::Specification.new('mruby-test') do |spec|
   spec.summary = 'mruby test'
 
   spec.test_rbfiles = Dir.glob("#{MRUBY_ROOT}/test/t/*.rb")
-  # The Prism parser does not accept `&nil` block-forbidding parameters yet,
-  # so drop that test unless building with the legacy lrama compiler.
-  unless build.gems['mruby-compiler-lrama']
-    spec.test_rbfiles.reject! { |f| File.basename(f) == 'syntax_block_forbid.rb' }
-  end
 
   clib = "#{build_dir}/mrbtest.c"
   mlib = clib.ext(exts.object)
@@ -19,7 +14,7 @@ MRuby::Gem::Specification.new('mruby-test') do |spec|
   mrbtest_lib = libfile("#{build_dir}/mrbtest")
   mrbtest_objs = [assert_lib]
   driver_objs = srcs_to_objs(".")
-  spec.cc.defines << "MRBTEST_COMPILER_PRISM" unless build.gems["mruby-compiler-lrama"]
+  spec.cc.defines << "MRBTEST_COMPILER_PRISM"
 
   file assert_lib => assert_c
   file assert_c => [assert_rb, build.mrbcfile] do |t|

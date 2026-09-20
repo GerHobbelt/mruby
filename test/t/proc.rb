@@ -208,3 +208,15 @@ assert('identity check for proc object') do
   assert_false b[0] == b[1]
   assert_not_equal b[0].hash, b[1].hash
 end
+
+assert('block parameter with trailing comma (implicit rest)') do
+  # A trailing comma in a block parameter list (|a,|) is an implicit-rest
+  # parameter. It used to emit a bogus local-variable symbol that crashed the
+  # bytecode dumper. The exact destructuring is not asserted here because the
+  # bundled Prism parser builds the rest differently between the C and C++
+  # builds; this test only guards against the dumper crash.
+  assert_nothing_raised do
+    [[1, 2, 3]].each { |a,| a }
+    [[1, 2, 3, 4]].each { |a, b,| [a, b] }
+  end
+end

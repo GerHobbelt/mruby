@@ -23,16 +23,64 @@ assert("Regexp#match - no match") do
   assert_nil re.match("abc")
 end
 
+assert("Regexp#match - nil argument") do
+  $~ = /abc/.match("abc")
+  assert_nil /abc/.match(nil)
+  assert_nil $~
+end
+
+assert("Regexp#match - block") do
+  result = /bc/.match("abcd") { |md| [md[0], md.begin(0)] }
+  assert_equal ["bc", 1], result
+  assert_nil(/xyz/.match("abcd") { |md| md[0] })
+end
+
 assert("Regexp#match?") do
   re = Regexp.new("abc")
   assert_true re.match?("xabcy")
   assert_false re.match?("xyz")
+  assert_false re.match?(nil)
+end
+
+assert("Regexp#match? - does not update last match") do
+  $~ = /matched/.match("matched")
+  assert_true /abc/.match?("abc")
+  assert_equal "matched", $~[0]
+  assert_false /xyz/.match?("abc")
+  assert_equal "matched", $~[0]
 end
 
 assert("Regexp#=~") do
   re = Regexp.new("bc")
   assert_equal 1, re =~ "abcd"
   assert_nil re =~ "xyz"
+  assert_equal __ENCODING__ == "UTF-8" ? 1 : 3, /い/ =~ "あい"
+end
+
+assert("Regexp - dot advances by string mode") do
+  str = "\xC3\xA9x"
+  assert_equal [[0xC3, 0xA9], [0x78]], str.scan(/./).map { |m| m.bytes }
+  assert_equal [0x5A, 0x78], str.sub(/./, "Z").bytes
+  assert_equal "195,120,", str.gsub(/./) { |m| "#{m.bytes[0]}," }
+
+  if Object.const_defined?(:Encoding)
+    bin = str.dup.force_encoding("ASCII-8BIT")
+    md = /x/.match(bin, 2)
+    assert_equal "x", md[0]
+    assert_equal 2, md.begin(0)
+    assert_true /x/.match?(bin, 2)
+    assert_equal 2, /x/ =~ bin
+
+    assert_equal [[0xC3], [0xA9], [0x78]], bin.scan(/./).map { |m| m.bytes }
+    assert_equal [0x5A, 0xA9, 0x78], bin.sub(/./, "Z").bytes
+    assert_equal "195,169,120,", bin.gsub(/./) { |m| "#{m.bytes[0]}," }
+  end
+end
+
+assert("Regexp#=~ - nil argument clears last match") do
+  $~ = /abc/.match("abc")
+  assert_nil(/abc/ =~ nil)
+  assert_nil $~
 end
 
 assert("Regexp#===") do
@@ -48,6 +96,25 @@ assert("Regexp - character class") do
   re = Regexp.new("[a-z]+")
   md = re.match("123abc456")
   assert_equal "abc", md[0]
+end
+
+assert("Regexp - POSIX bracket classes") do
+  # ASCII semantics, like this gem's \w/\d shorthands.
+  assert_equal "abc", "123abc456".match(/[[:alpha:]]+/)[0]
+  assert_equal "123", "123abc".match(/[[:digit:]]+/)[0]
+  assert_equal "abc123", "abc123!".match(/[[:alnum:]]+/)[0]
+  assert_equal "deadBEEF", "deadBEEF".match(/[[:xdigit:]]+/)[0]
+  assert_equal "snake_case", "snake_case".match(/[[:word:]]+/)[0]
+  assert_equal "!", "ab!cd".match(/[[:punct:]]/)[0]
+  assert_equal "AB", "abAB".match(/[[:upper:]]+/)[0]
+  # combine with literals and other classes
+  assert_equal "a1", "a1-".match(/[a[:digit:]]+/)[0]
+  assert_equal "ab12", "ab12 ".match(/[[:alpha:][:digit:]]+/)[0]
+  # negated forms
+  assert_equal "abc", "abc123".match(/[[:^digit:]]+/)[0]
+  assert_equal "x", " x".match(/[^[:space:]]/)[0]
+  # an unknown class name is an error
+  assert_raise(RegexpError) { Regexp.new("[[:bogus:]]") }
 end
 
 assert("Regexp - \\b inside character class is backspace") do
@@ -71,11 +138,40 @@ assert("Regexp - alternation") do
   assert_equal "dog", re.match("I have a dog")[0]
 end
 
+assert("Regexp - alternation is leftmost-first") do
+  # Ruby tries alternatives left to right and keeps the first that lets the
+  # whole pattern match -- not the longest. The linear-time engine used to
+  # pick the longest branch instead.
+  assert_equal "a", "ab".match(/a|ab/)[0]
+  assert_equal "foo", "foobar".match(/foo|foobar/)[0]
+  assert_equal "ab", "ab".match(/ab|a/)[0]
+  assert_equal ["abc", "ab", "c"], "abcd".match(/(ab|abc)(c|cd)/).to_a
+  assert_equal "aa", "aaa".match(/aa|a/)[0]
+  # three or more branches keep source order, not just the first two
+  assert_equal "car", "cart".match(/cat|car|cart/)[0]
+  assert_equal "cart", "cart".match(/cat|cart|car/)[0]
+  assert_equal "a", "abc".match(/a|ab|abc/)[0]
+  assert_equal "abc", "abc".match(/abc|ab|a/)[0]
+  # greedy quantifiers stay longest-match
+  assert_equal "aaa", "aaa".match(/a+/)[0]
+end
+
 assert("Regexp - quantifiers") do
   assert_equal "aaa", Regexp.new("a+").match("aaa")[0]
   assert_equal "", Regexp.new("a*").match("bbb")[0]
   assert_equal "ab", Regexp.new("ab?").match("ab")[0]
   assert_equal "a", Regexp.new("ab?").match("ac")[0]
+end
+
+assert("Regexp - quantified first alternative does not leak into the next") do
+  # A quantifier loops back to its own atom. When the atom starts the first
+  # alternative, the alternation SPLIT is inserted in front of it; the
+  # loop-back must follow the atom, not land on the new SPLIT (which used to
+  # let /\d+|\w/ match "1b" by re-entering the alternation after "1").
+  assert_equal "1", "1b2c3".match(/\d+|\w/)[0]
+  assert_equal ["a", "1", "b", "2", "c", "3"], "a1b2c3".scan(/\d+|\w/)
+  assert_equal "aaa", "aaa".match(/a+|b/)[0]
+  assert_equal "123", "123abc".match(/\d+|\w+/)[0]
 end
 
 assert("Regexp - captures") do
@@ -84,6 +180,21 @@ assert("Regexp - captures") do
   assert_equal "user@host", md[0]
   assert_equal "user", md[1]
   assert_equal "host", md[2]
+end
+
+assert("String#scan return shape") do
+  # No capture group: an array of the matched strings.
+  assert_equal ["a", "b", "c"], "abc".scan(/\w/)
+  # Any capture group: an array per match holding that match's captures, so a
+  # single group still yields one-element arrays (not bare strings).
+  assert_equal [["x"], ["x"]], "xyxy".scan(/(x|xy)+/)
+  assert_equal [["a", "1"], ["b", "2"]], "a1b2".scan(/(\w)(\d)/)
+  assert_equal [["cat"], ["dog"]], "cats dogs".scan(/(cat|dog)s?/)
+  # A group that did not participate is nil inside the per-match array.
+  assert_equal [[nil]], "".scan(/(a|ab)*/)
+  collected = []
+  "foo".scan(/(o)/) { |m| collected << m }
+  assert_equal [["o"], ["o"]], collected
 end
 
 assert("Regexp - \\d \\w \\s") do
@@ -113,6 +224,24 @@ assert("Regexp - anchors") do
   assert_false Regexp.new("abc$").match?("abcx")
 end
 
+assert("Regexp - ^ and $ always match at line boundaries") do
+  # In Ruby ^ and $ are line anchors regardless of /m (which only makes `.`
+  # match a newline). \A and \z stay anchored to the whole string.
+  assert_equal "bar", "foo\nbar".match(/^bar/)[0]
+  assert_equal "foo", "foo\nbar".match(/foo$/)[0]
+  assert_equal ["a", "b", "c"], "a\nb\nc".scan(/^./)
+  assert_equal ["a", "b", "c"], "a\nb\nc".scan(/.$/)
+  assert_equal 3, "a\nb\nc".scan(/^/).size
+  # a trailing newline opens no final line, so ^ does not match at the end
+  assert_equal 1, "a\n".scan(/^/).size
+  assert_equal ">a\n>b\n>c", "a\nb\nc".gsub(/^/, ">")
+  assert_equal ["a\n", "b\n", "c"], "a\nb\nc".split(/^/)
+  # \A / \z remain absolute
+  assert_nil(/\Abar/.match("foo\nbar"))
+  assert_nil(/foo\z/.match("foo\nbar"))
+  assert_equal "bar", "foo\nbar".match(/bar\z/)[0]
+end
+
 assert("Regexp - case insensitive") do
   re = Regexp.new("abc", Regexp::IGNORECASE)
   assert_true re.match?("ABC")
@@ -125,10 +254,62 @@ assert("Regexp - repetition {n,m}") do
   assert_equal "aaa", Regexp.new("a{2,3}").match("aaaa")[0]
 end
 
+assert("Regexp - repeated group keeps each iteration self-contained") do
+  # Copying a grouped quantifier body must relocate its internal jumps, or a
+  # later copy jumps back into the first and reports the wrong capture span.
+  m = "aaaaab".match(/(a{2,3}){2}/)
+  assert_equal "aaaaa", m[0]
+  assert_equal "aa", m[1]
+  assert_equal "ab", "ababab".match(/(ab){2}/)[1]
+  assert_equal "a", "abab".match(/(a|b){3}/)[1]
+  assert_equal ["abab", "ab"], "abab".match(/((a)(b)){2}/).to_a[0, 2]
+  assert_equal "34", "1234".match(/(\d{2}){2}/)[1]
+end
+
+assert("Regexp - repetition with a zero lower bound") do
+  # A zero lower bound must not force the one already-compiled copy: {0,m}
+  # caps at m (it used to match m+1), {0} matches nothing, {0,} is just *.
+  assert_equal "aaa", "aaaa".match(/a{0,3}/)[0]
+  assert_equal "aaa", "aaaa".match(/a{,3}/)[0]
+  assert_equal "", "aaa".match(/a{0}/)[0]
+  assert_equal "b", "b".match(/a{0}b/)[0]
+  assert_equal "aaaa", "aaaa".match(/a{0,}/)[0]
+  assert_equal "bc", "bc".match(/ba{0,2}c/)[0]
+  assert_equal "baac", "baac".match(/ba{0,2}c/)[0]
+  assert_nil "baaac".match(/\Aba{0,2}c\z/)
+end
+
+assert("Regexp - a curly brace that is not a quantifier is a literal") do
+  # An invalid {...} used to spin the compiler forever (issue #6914); it must
+  # be treated as a literal brace, matching CRuby. A well-formed quantifier
+  # with nothing to repeat is an error instead.
+  assert_equal "{a}", "x{a}y".match(/{a}/)[0]
+  assert_equal "{", "a{b".match(/{/)[0]
+  assert_equal "{}", "a{}b".match(/{}/)[0]
+  assert_equal "a{}", "a{}".match(/a{}/)[0]
+  assert_equal "{,}", "x{,}y".match(/{,}/)[0]
+  assert_equal "a{b}c", "a{b}c".match(/a{b}c/)[0]
+  assert_raise(RegexpError) { Regexp.new("{2}") }
+end
+
 assert("MatchData#captures") do
   re = Regexp.new("(a)(b)(c)")
   md = re.match("abc")
   assert_equal ["a", "b", "c"], md.captures
+end
+
+assert("MatchData captures across alternation branches") do
+  # The branch that matches must record its own capture, whichever side of
+  # the alternation it is on (regression: the left branch used to come back
+  # nil because the Pike VM clobbered its capture slot during compaction).
+  md = /(\d)|(x)/.match("1")
+  assert_equal "1", md[1]
+  assert_nil md[2]
+  md = /(\d)|(x)/.match("x")
+  assert_nil md[1]
+  assert_equal "x", md[2]
+  md = /(cat)|(dog)/.match("cat")
+  assert_equal ["cat", nil], md.captures
 end
 
 assert("MatchData#pre_match / #post_match") do
@@ -181,6 +362,25 @@ assert("Regexp - multibyte (UTF-8) match extraction") do
   assert_equal [1, 2], [m.begin(1), m.end(1)]
   assert_equal [2, 3], [m.begin(2), m.end(2)]
   assert_equal 2, "あいう".match(/う/).begin(0)
+
+  assert_equal 2, /あ/.match("あいあ", 2).begin(0)
+  assert_equal 2, /あ/.match("あいあ", -1).begin(0)
+  assert_nil /い/.match("あいあ", 2)
+  assert_nil /あ/.match("あいあ", 4)
+  assert_nil /あ/.match("あいあ", -4)
+  assert_true /あ/.match?("あいあ", 2)
+  assert_false /い/.match?("あいあ", 2)
+end
+
+assert("String#gsub - regexp search position is byte-based internally") do
+  skip unless __ENCODING__ == "UTF-8"
+  assert_equal "あ-い-う", "あ,い,う".gsub(/,/, "-")
+end
+
+assert("String#split - regexp search position is byte-based internally") do
+  skip unless __ENCODING__ == "UTF-8"
+  assert_equal ["あ", "い", "う"], "あ,い,う".split(/,/)
+  assert_equal ["あ", ",", "い", ",", "う"], "あ,い,う".split(/(,)/)
 end
 
 assert("Regexp.escape") do
@@ -396,6 +596,11 @@ assert("String#gsub with block and zero-width match") do
     assert_equal "い！ろは", "いろは".gsub(/(?=ろ)/) { "！" }
     assert_equal "！い！ろ！は！", "いろは".gsub(//) { "！" }
   end
+  bin = "\xC3\xA9x".b
+  assert_equal [45, 195, 45, 169, 45, 120, 45], bin.gsub(//, "-").bytes
+  assert_equal [45, 195, 45, 169, 45, 120, 45], bin.gsub(//) { "-" }.bytes
+  assert_equal [45, 195, 45, 169, 45, 120], bin.gsub(/(?=.)/, "-").bytes
+  assert_equal [45, 195, 45, 169, 45, 120], bin.gsub(/(?=.)/) { "-" }.bytes
 end
 
 assert("String#gsub date reformat") do
@@ -425,6 +630,16 @@ assert("String#split with regexp limit") do
   assert_equal ["a", ""], "a,".split(/,/, -1)
   assert_equal ["a", ""], "a,".split(/,/, 2)
   assert_equal ["a,b,"], "a,b,".split(/,/, 1)
+  assert_raise(TypeError) { "a,b".split(/,/, nil) }
+  assert_equal ["a,b"], "a,b".split(/,/, 1.5)
+
+  limit = Object.new
+  def limit.to_int; 2; end
+  assert_equal ["a", "b"], "a,b".split(/,/, limit)
+
+  limit = Object.new
+  def limit.to_int; 1.5; end
+  assert_raise(TypeError) { "a,b".split(/,/, limit) }
 end
 
 assert("String#split with empty regexp") do
@@ -451,6 +666,8 @@ assert("String#split with regexp captures") do
   assert_equal ["a", "1", "b2c"], "a1b2c".split(/(\d)/, 2)
   assert_equal ["a", "1", "b", "2", "c"], "a1b2c".split(/(\d)/, 3)
   assert_equal ["a", "1", "b", "2", "c"], "a1b2c".split(/(\d)/, -1)
+  assert_equal ["hell"], "hello".split(/(x)?o/)
+  assert_equal ["hell", ""], "hello".split(/(x)?o/, -1)
 end
 
 assert("String#split with zero-width regexp") do
@@ -500,6 +717,18 @@ assert("Regexp - named captures") do
   assert_equal "03", md[:month]
   assert_equal "21", md[:day]
   assert_equal "2026", md["year"]
+end
+
+assert("Regexp - named backreference \\k") do
+  assert_equal "aa", "aa".match(/(?<n>\w)\k<n>/)[0]
+  assert_equal "abba", "abba".match(/(?<a>.)(?<b>.)\k<b>\k<a>/)[0]
+  assert_equal "1212", "1212".match(/(?<x>\d+)\k'x'/)[0]
+  assert_nil "ab".match(/(?<n>\w)\k<n>/)
+  # numeric and relative forms
+  assert_equal "aa", "aa".match(/(a)\k<1>/)[0]
+  assert_equal "abba", "abba".match(/(.)(.)\k<-1>\k<-2>/)[0]
+  # an unknown name is an error
+  assert_raise(RegexpError) { Regexp.new("\\k<missing>") }
 end
 
 assert("MatchData#named_captures") do

@@ -179,8 +179,16 @@ static mrb_int
 re_byte_to_char(mrb_state *mrb, mrb_value str, mrb_int byte_off)
 {
   (void)mrb;
+  if (byte_off < 0) return byte_off;
+
 #ifdef MRB_UTF8_STRING
-  const char *p = RSTRING_PTR(str);
+  struct RString *s = RSTRING(str);
+  if (RSTR_SINGLE_BYTE_P(s) || RSTR_BINARY_P(s)) return byte_off;
+
+  mrb_int len = RSTR_LEN(s);
+  if (byte_off > len) byte_off = len;
+
+  const char *p = RSTR_PTR(s);
   mrb_int chars = 0;
   for (mrb_int i = 0; i < byte_off; i++) {
     if (((unsigned char)p[i] & 0xC0) != 0x80) chars++;
@@ -190,6 +198,67 @@ re_byte_to_char(mrb_state *mrb, mrb_value str, mrb_int byte_off)
   (void)str;
   return byte_off;
 #endif
+}
+/* Normalize Regexp#match positional argument for the regexp engine.
+   For UTF-8 multibyte strings, Ruby's public pos is a character offset and
+   must be converted to a byte offset. For single-byte or binary strings,
+   the public pos is already byte-compatible. Returns -1 for out-of-range
+   offsets, which Ruby treats as no match. */
+static mrb_int
+re_char_to_byte(mrb_state *mrb, mrb_value str, mrb_int char_off)
+{
+  (void)mrb;
+#ifdef MRB_UTF8_STRING
+  struct RString *s = RSTRING(str);
+  mrb_int len = RSTR_LEN(s);
+  if (RSTR_SINGLE_BYTE_P(s) || RSTR_BINARY_P(s)) {
+    if (char_off < 0) char_off += len;
+    if (char_off < 0 || char_off > len) return -1;
+    return char_off;
+  }
+
+  const char *p = RSTR_PTR(s);
+  const char *e = p + len;
+  mrb_int chars = 0;
+
+  if (char_off < 0) {
+    mrb_int char_len = re_byte_to_char(mrb, str, len);
+    char_off += char_len;
+    if (char_off < 0) return -1;
+  }
+  else if (char_off > len) {
+    return -1;
+  }
+  while (p < e && chars < char_off) {
+    p++;
+    while (p < e && (((unsigned char)*p & 0xC0) == 0x80)) {
+      p++;
+    }
+    chars++;
+  }
+  if (chars < char_off) return -1;
+  return (mrb_int)(p - RSTR_PTR(s));
+#else
+  mrb_int len = RSTRING_LEN(str);
+  if (char_off < 0) char_off += len;
+  if (char_off < 0 || char_off > len) return -1;
+  return char_off;
+#endif
+}
+
+static mrb_bool
+re_binary_string_p(mrb_value str)
+{
+  return RSTR_BINARY_P(RSTRING(str));
+}
+
+static mrb_value
+regexp_binary_string_p(mrb_state *mrb, mrb_value self)
+{
+  (void)self;
+  mrb_value str;
+  mrb_get_args(mrb, "S", &str);
+  return mrb_bool_value(re_binary_string_p(str));
 }
 
 /* Create MatchData from captures */
@@ -240,7 +309,7 @@ exec_match(mrb_state *mrb, mrb_value self, mrb_value str, mrb_int pos)
   int *captures = (int*)mrb_malloc(mrb, sizeof(int) * cap_size);
   memset(captures, -1, sizeof(int) * cap_size);
   int ncap = mrb_re_exec(mrb, pat, RSTRING_PTR(str), RSTRING_LEN(str), pos,
-                     captures, cap_size);
+                     captures, cap_size, re_binary_string_p(str));
 
   if (ncap == 0) {
     mrb_free(mrb, captures);
@@ -259,6 +328,33 @@ static mrb_value
 regexp_match(mrb_state *mrb, mrb_value self)
 {
   mrb_value str;
+  mrb_value block = mrb_nil_value();
+  mrb_int pos = 0;
+  mrb_value md;
+
+  mrb_get_args(mrb, "o|i&", &str, &pos, &block);
+  if (mrb_nil_p(str)) {
+    clear_match_globals(mrb);
+    return mrb_nil_value();
+  }
+  str = mrb_ensure_string_type(mrb, str);
+  pos = re_char_to_byte(mrb, str, pos);
+  if (pos < 0) {
+    clear_match_globals(mrb);
+    return mrb_nil_value();
+  }
+
+  md = exec_match(mrb, self, str, pos);
+  if (!mrb_nil_p(md) && !mrb_nil_p(block)) {
+    return mrb_yield(mrb, block, md);
+  }
+  return md;
+}
+
+static mrb_value
+regexp_match_byte(mrb_state *mrb, mrb_value self)
+{
+  mrb_value str;
   mrb_int pos = 0;
   mrb_get_args(mrb, "S|i", &str, &pos);
   return exec_match(mrb, self, str, pos);
@@ -272,12 +368,17 @@ regexp_match_p(mrb_state *mrb, mrb_value self)
 {
   mrb_value str;
   mrb_int pos = 0;
-  mrb_get_args(mrb, "S|i", &str, &pos);
+  mrb_get_args(mrb, "o|i", &str, &pos);
+  if (mrb_nil_p(str)) return mrb_false_value();
+  str = mrb_ensure_string_type(mrb, str);
+  pos = re_char_to_byte(mrb, str, pos);
+  if (pos < 0) return mrb_false_value();
 
   mrb_regexp_pattern *pat = DATA_GET_PTR(mrb, self, &regexp_type, mrb_regexp_pattern);
   if (!pat) mrb_raise(mrb, E_ARGUMENT_ERROR, "uninitialized Regexp");
 
-  int ncap = mrb_re_exec(mrb, pat, RSTRING_PTR(str), RSTRING_LEN(str), pos, NULL, 0);
+  int ncap = mrb_re_exec(mrb, pat, RSTRING_PTR(str), RSTRING_LEN(str), pos, NULL, 0,
+                         re_binary_string_p(str));
   return mrb_bool_value(ncap > 0);
 }
 
@@ -289,14 +390,17 @@ regexp_match_op(mrb_state *mrb, mrb_value self)
 {
   mrb_value str;
   mrb_get_args(mrb, "o", &str);
-  if (mrb_nil_p(str)) return mrb_nil_value();
-  mrb_ensure_string_type(mrb, str);
+  if (mrb_nil_p(str)) {
+    clear_match_globals(mrb);
+    return mrb_nil_value();
+  }
+  str = mrb_ensure_string_type(mrb, str);
 
   mrb_value md = exec_match(mrb, self, str, 0);
   if (mrb_nil_p(md)) return mrb_nil_value();
 
   mrb_match_data *m = DATA_GET_PTR(mrb, md, &matchdata_type, mrb_match_data);
-  return mrb_int_value(mrb, m->captures[0]);
+  return mrb_int_value(mrb, re_byte_to_char(mrb, m->source, m->captures[0]));
 }
 
 /*
@@ -779,6 +883,7 @@ regexp_gsub_str(mrb_state *mrb, mrb_value self)
   const char *rep = RSTRING_PTR(replacement);
   mrb_int rep_len = RSTRING_LEN(replacement);
   mrb_bool need_expand = has_backslash(rep, rep_len);
+  mrb_bool binary = re_binary_string_p(str);
 
   int ncap = pat->num_captures;
   int cap_size = ncap * 2;
@@ -792,7 +897,7 @@ regexp_gsub_str(mrb_state *mrb, mrb_value self)
 
   while (pos <= slen) {
     memset(captures, -1, sizeof(int) * cap_size);
-    int n = mrb_re_exec(mrb, pat, s, slen, pos, captures, cap_size);
+    int n = mrb_re_exec(mrb, pat, s, slen, pos, captures, cap_size, binary);
     if (n == 0) break;
 
     /* save last match for $~ */
@@ -812,17 +917,22 @@ regexp_gsub_str(mrb_state *mrb, mrb_value self)
       mrb_str_cat(mrb, result, rep, rep_len);
     }
 
-    /* advance position */
-    int match_end = captures[1];
-    if (match_end == pos) {
-      /* zero-length match: copy one char and advance */
-      if (pos < slen) {
-        mrb_str_cat(mrb, result, s + pos, 1);
+    /* advance position. A zero-width match (start == end) must step past the
+       match position -- even when it was found ahead of `pos`, e.g. `^` at the
+       next line start -- otherwise the next search re-applies it there. Copy
+       the whole character so multibyte text is not split. */
+    if (captures[1] == captures[0]) {
+      if (captures[1] < slen) {
+        int clen = mrb_re_charlen(s + captures[1], s + slen, binary);
+        mrb_str_cat(mrb, result, s + captures[1], clen);
+        pos = captures[1] + clen;
       }
-      pos++;
+      else {
+        pos = captures[1] + 1;
+      }
     }
     else {
-      pos = match_end;
+      pos = captures[1];
     }
     mrb_gc_arena_restore(mrb, ai);
   }
@@ -866,7 +976,7 @@ regexp_sub_str(mrb_state *mrb, mrb_value self)
   int *captures = (int*)mrb_malloc(mrb, sizeof(int) * cap_size);
   memset(captures, -1, sizeof(int) * cap_size);
 
-  int n = mrb_re_exec(mrb, pat, s, slen, 0, captures, cap_size);
+  int n = mrb_re_exec(mrb, pat, s, slen, 0, captures, cap_size, re_binary_string_p(str));
   if (n == 0) {
     mrb_free(mrb, captures);
     clear_match_globals(mrb);
@@ -912,6 +1022,7 @@ regexp_scan(mrb_state *mrb, mrb_value self)
 
   const char *s = RSTRING_PTR(str);
   mrb_int slen = RSTRING_LEN(str);
+  mrb_bool binary = re_binary_string_p(str);
   int ncap = pat->num_captures;
   int cap_size = ncap * 2;
   int *captures = (int*)mrb_malloc(mrb, sizeof(int) * cap_size);
@@ -924,29 +1035,22 @@ regexp_scan(mrb_state *mrb, mrb_value self)
 
   while (pos <= slen) {
     memset(captures, -1, sizeof(int) * cap_size);
-    int n = mrb_re_exec(mrb, pat, s, slen, pos, captures, cap_size);
+    int n = mrb_re_exec(mrb, pat, s, slen, pos, captures, cap_size, binary);
     if (n == 0) break;
 
     last_ncap = cap_size;
     memcpy(last_captures, captures, sizeof(int) * cap_size);
 
     if (ncap <= 1) {
-      /* no captures or just group 0: push matched string */
+      /* no capture groups: push the matched string */
       mrb_ary_push(mrb, ary,
         re_byte_substr(mrb, str, captures[0], captures[1] - captures[0]));
     }
-    else if (ncap == 2) {
-      /* single capture group: push capture string */
-      if (captures[2] >= 0) {
-        mrb_ary_push(mrb, ary,
-          re_byte_substr(mrb, str, captures[2], captures[3] - captures[2]));
-      }
-      else {
-        mrb_ary_push(mrb, ary, mrb_nil_value());
-      }
-    }
     else {
-      /* multiple captures: push array of captures */
+      /* one or more capture groups: push an array of the captures. CRuby
+         returns an array per match whenever the pattern has any group, so a
+         single group yields a one-element array (e.g. [["x"]]), not a bare
+         string. */
       mrb_value sub = mrb_ary_new_capa(mrb, ncap - 1);
       for (int i = 1; i < ncap; i++) {
         if (captures[i * 2] >= 0) {
@@ -960,12 +1064,15 @@ regexp_scan(mrb_state *mrb, mrb_value self)
       mrb_ary_push(mrb, ary, sub);
     }
 
-    int match_end = captures[1];
-    if (match_end == pos) {
-      pos++;
+    /* Advance past the match. A zero-width match (start == end) must step
+       one byte forward, even when it landed ahead of `pos` (e.g. `^` found
+       at the next line start), otherwise the next search re-reports the same
+       position. */
+    if (captures[1] == captures[0]) {
+      pos = captures[1] + 1;
     }
     else {
-      pos = match_end;
+      pos = captures[1];
     }
     mrb_gc_arena_restore(mrb, ai);
   }
@@ -1000,9 +1107,11 @@ mrb_mruby_regexp_gem_init(mrb_state *mrb)
   /* compile is defined in Ruby (mrblib) as alias for new */
   mrb_define_class_method(mrb, re, "escape", regexp_escape, MRB_ARGS_REQ(1));
   mrb_define_class_method(mrb, re, "quote", regexp_escape, MRB_ARGS_REQ(1));
+  mrb_define_class_method(mrb, re, "__binary_string?", regexp_binary_string_p, MRB_ARGS_REQ(1));
 
   /* Instance methods */
-  mrb_define_method(mrb, re, "match", regexp_match, MRB_ARGS_ARG(1, 1));
+  mrb_define_method(mrb, re, "match", regexp_match, MRB_ARGS_ARG(1, 1)|MRB_ARGS_BLOCK());
+  mrb_define_method(mrb, re, "__byte_match", regexp_match_byte, MRB_ARGS_ARG(1, 1));
   mrb_define_method(mrb, re, "match?", regexp_match_p, MRB_ARGS_ARG(1, 1));
   mrb_define_method(mrb, re, "=~", regexp_match_op, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, re, "===", regexp_case_match, MRB_ARGS_REQ(1));
