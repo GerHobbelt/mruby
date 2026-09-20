@@ -1035,6 +1035,213 @@ assert('Hash lookup with entries deleted by an eql? callback') do
   assert_equal(2, q.rehash.size)
 end
 
+assert('Hash lookup with the matched entry vacated by an eql? callback') do
+  # A companion to the case above, with the callback returning true. It deletes
+  # the very entry the search matched and inserts another, which puts the count
+  # back: the guard watches the count and the pointers and so sees nothing, and
+  # the slot the search is standing on has been vacated all the same. Answering
+  # from it hands #[] the value of an entry the collector no longer keeps and
+  # lets #delete take it a second time, dropping the count below the entries the
+  # table still holds. Each operation has to report the change, not answer from
+  # the vacated slot.
+  swapper = Class.new do
+    def initialize(h) @h, @fired = h, false end
+    def eql?(other)
+      unless @fired
+        @fired = true
+        @h.delete(other)
+        @h[:added] = :added_value
+      end
+      true
+    end
+    def hash; 42 end
+  end
+  # The indexed (HT) shape, and the AR shape with a leading hole: word boxing
+  # reads an AR hash's first slot as the pointer the guard watches, so only a
+  # hole ahead of that slot exposes the AR path the way HT is already exposed.
+  ht = lambda { h = {}; 20.times { |i| h[i] = i }; h }
+  ar = lambda { h = {}; 12.times { |i| h[i] = i }; h.delete(0); h }
+
+  [ht, ar].each do |build|
+    [ lambda { |h, k| h.delete(k) },
+      lambda { |h, k| h[k] },
+      lambda { |h, k| h[k] = :stored },
+      lambda { |h, k| h.key?(k) } ].each do |op|
+      h = build.call
+      assert_raise(RuntimeError) { op.call(h, swapper.new(h)) }
+      # What the table can find and what it iterates stay the same entries.
+      h.keys.each { |k| assert_true(h.key?(k)) }
+      assert_equal(h.key?(:added), h.keys.include?(:added))
+    end
+  end
+end
+
+assert('Hash scans with the matched entry vacated by an eql? callback') do
+  # The same delete-and-reinsert from eql?, reached from the scans that read
+  # the entry after the comparison: #assoc and #rassoc build a pair from it,
+  # #== and #eql? compare its value. In #assoc the STORED key answers eql?,
+  # in #rassoc the stored value does, and in #== / #eql? the key of the
+  # receiver hash does while it is looked up in the other hash.
+  swapper = Class.new do
+    attr_accessor :armed
+    def initialize(h, key) @h, @key, @armed = h, key, false end
+    def eql?(other)
+      if @armed
+        @armed = false
+        @h.delete(@key || self)
+        @h[:added] = :added_value
+      end
+      other.class == self.class
+    end
+    def hash; 42 end
+  end
+
+  h = {}
+  20.times { |i| h[i] = i }
+  k = swapper.new(h, nil)
+  h[k] = "value"
+  k.armed = true
+  assert_raise(RuntimeError) { h.assoc(swapper.new(h, nil)) }
+  h.keys.each { |x| assert_true(h.key?(x)) }
+
+  h = {}
+  20.times { |i| h[i] = i }
+  v = swapper.new(h, :k)
+  h[:k] = v
+  v.armed = true
+  assert_raise(RuntimeError) { h.rassoc(swapper.new(h, nil)) }
+  h.keys.each { |x| assert_true(h.key?(x)) }
+
+  [:==, :eql?].each do |op|
+    h1 = {}
+    20.times { |i| h1[i] = i }
+    k = swapper.new(h1, nil)
+    h1[k] = "value"
+    h2 = {}
+    20.times { |i| h2[i] = i }
+    h2[swapper.new(h2, nil)] = "value"
+    k.armed = true
+    assert_raise(RuntimeError) { h1.__send__(op, h2) }
+    h1.keys.each { |x| assert_true(h1.key?(x)) }
+  end
+end
+
+assert('Hash scans that read the entry back after a callback') do
+  # The same delete-and-reinsert, reached from the scans that read an entry
+  # again once a callback has returned: #inspect prints the value after the
+  # key printed itself, the walk behind `**rest` stores the pair after the key
+  # answered #==, and #rehash moves the pair after the #eql? that asked
+  # whether an earlier key is the same one. A rehash reads two entries, and
+  # the #eql? can vacate either: the one it is moving, or the one it matched.
+  swapper = Class.new do
+    attr_accessor :armed
+    def initialize(h, victim) @h, @victim, @armed = h, victim, false end
+    def fire
+      return false unless @armed
+      @armed = false
+      @h.delete(@victim || self)
+      @h[:added] = :added_value
+      true
+    end
+    def inspect; fire; "swapper" end
+    def ==(other) fire; false end
+    def eql?(other)
+      return true if (@victim.nil? || @victim.equal?(other)) && fire
+      equal?(other)
+    end
+    def hash; 42 end
+  end
+
+  h = {}
+  20.times { |i| h[i] = i }
+  k = swapper.new(h, nil)
+  h[k] = "value"
+  k.armed = true
+  assert_raise(RuntimeError) { h.inspect }
+  h.keys.each { |x| assert_true(h.key?(x)) }
+
+  h = {}
+  20.times { |i| h[i] = i }
+  k = swapper.new(h, nil)
+  h[k] = "value"
+  k.armed = true
+  assert_raise(RuntimeError) { h.__except([:absent]) }
+  h.keys.each { |x| assert_true(h.key?(x)) }
+
+  # The list (AR) shape, where the duplicate is looked for by walking the
+  # entries already moved.
+  h = {first: "value"}
+  k = swapper.new(h, nil)
+  h[k] = "dup"
+  k.armed = true
+  assert_raise(RuntimeError) { h.rehash }
+  h.keys.each { |x| assert_true(h.key?(x)) }
+
+  # The indexed (HT) shape. Only an entry already moved is in the new index,
+  # so that is the one a callback can take away, and it is the entry the
+  # duplicate is about to be written into.
+  h = {}
+  20.times { |i| h[i] = i }
+  first = swapper.new(h, nil)
+  h[first] = "value"
+  k = swapper.new(h, first)
+  h[k] = "dup"
+  k.armed = true
+  assert_raise(RuntimeError) { h.rehash }
+  # What a rehash stopped part way through leaves is what it left before: the
+  # entries it had not reached yet are out of the index it is rebuilding.
+  assert_true(h.key?(:added))
+end
+
+assert('Hash scans that carry a pair into a set the hash no longer holds') do
+  # A scan that stores the pair it is standing on somewhere else hands it to a
+  # set, and the set asks the key for its hash code before it stores anything.
+  # Ruby there can take the pair out of the hash the scan is reading, and the
+  # only reference left is the one the scan holds in C, which the collector
+  # does not scan. The pair has to survive the set that is carrying it.
+  thief = Class.new do
+    attr_accessor :armed
+    def initialize(h) @h, @armed = h, false end
+    def hash
+      if @armed
+        @armed = false
+        @h.delete(self)
+        @h[:added] = :added_value
+        GC.start
+      end
+      42
+    end
+    def eql?(other) equal?(other) end
+    # The value is built here and not in the assertion so that returning drops
+    # it from the arena: what keeps it alive from then on is the entry alone,
+    # which is what the callback takes away.
+    def self.armed_hash
+      h = {}
+      20.times { |i| h[i] = i }
+      k = new(h)
+      h[k] = "the value only that entry holds"
+      k.armed = true
+      [h, k]
+    end
+  end
+
+  # The hash being written into holds enough entries to be indexed, which is
+  # what asks a key for its hash code in the first place. `armed` goes back
+  # down when the callback has run, so the assertion says the set reached it
+  # and the value is not being answered from a walk that never ran Ruby.
+  h2, k = thief.armed_hash
+  h1 = {}
+  20.times { |i| h1[i + 100] = i }
+  merged = h1.merge(h2)
+  assert_false(k.armed)
+  assert_equal("the value only that entry holds", merged[k])
+
+  h, k = thief.armed_hash
+  excepted = h.__except([:absent])
+  assert_false(k.armed)
+  assert_equal("the value only that entry holds", excepted[k])
+end
+
 assert('Hash#assoc, Hash#rassoc') do
   h = {foo: 0, bar: 1, baz: 2}
   assert_equal([:bar, 1], h.assoc(:bar))

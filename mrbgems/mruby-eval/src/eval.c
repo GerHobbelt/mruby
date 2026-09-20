@@ -249,6 +249,12 @@ binding_eval_prepare(mrb_state *mrb, mrb_value binding, const char *expr, mrb_in
   const struct RProc *proc = mrb_binding_extract_proc(mrb, binding);
   mrb_assert(!MRB_PROC_CFUNC_P(proc));
 
+  /* the parser interns the filename; refuse it here, as
+     create_proc_from_string() does, rather than from under the parser */
+  if (file && strlen(file) >= UINT16_MAX) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "filename too long");
+  }
+
   d.cxt = mrb_ccontext_new(mrb);
   d.file = mrb_ccontext_filename(mrb, d.cxt, file ? file : "(eval)");
   d.cxt->capture_errors = TRUE;
@@ -375,6 +381,14 @@ object_eval(mrb_state *mrb, mrb_value self, mrb_bool class_eval)
   MRB_PROC_SET_TARGET_CLASS(proc, c);
   proc->flags |= MRB_PROC_CREF;
   mrb_assert(!MRB_PROC_CFUNC_P(proc));
+#ifdef MRB_USE_REFINEMENTS
+  /* a scope of its own ends the walk for refinements too, so the string
+     is given the refinements active where it was written */
+  {
+    struct RArray *scope = mrb_vm_caller_refinements(mrb);
+    if (scope) mrb_proc_set_refscope(mrb, proc, scope);
+  }
+#endif
   mrb_vm_ci_target_class_set(mrb->c->ci, c);
   /* The frame carries one class, and it is given to `c` here so that a `def`
      in the string lands on the receiver. A `super` reads that same field for

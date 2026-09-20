@@ -504,7 +504,12 @@ mrb_gc_add_region(mrb_state *mrb, void *start, size_t size)
   /* align base to pointer size */
   uintptr_t align = sizeof(void*);
   uintptr_t offset = ((uintptr_t)base + align - 1) & ~(align - 1);
-  size -= (size_t)(offset - (uintptr_t)base);
+  size_t pad = (size_t)(offset - (uintptr_t)base);
+  /* A buffer smaller than the alignment padding leaves nothing behind: bail
+     out before the subtraction, which would otherwise wrap `size` and carve
+     pages out past the end of the region. */
+  if (size < pad) return 0;
+  size -= pad;
   base = (uint8_t*)offset;
 
   page_count = (uint16_t)(size / sizeof(mrb_heap_page));
@@ -993,6 +998,15 @@ gc_mark_children(mrb_state *mrb, mrb_gc *gc, struct RBasic *obj)
       mrb_gc_mark(mrb, (struct RBasic*)p->upper);
       mrb_gc_mark(mrb, (struct RBasic*)p->e.env);
       children+=2;
+#ifdef MRB_USE_REFINEMENTS
+      {
+        uint32_t idx = MRB_PROC_REFSCOPE(p);
+        if (idx) {
+          mrb_gc_mark(mrb, (struct RBasic*)mrb_refscope_at(mrb, idx));
+          children++;
+        }
+      }
+#endif
     }
     break;
 
@@ -1638,6 +1652,11 @@ incremental_gc(mrb_state *mrb, mrb_gc *gc, size_t limit)
       uint64_t fm0 = gc_prof_now_us();
 #endif
       final_marking_phase(mrb, gc);
+#ifdef MRB_USE_REFINEMENTS
+      /* marking is complete: a refinement scope no proc marked is dropped
+         from the weak table before the sweep frees it */
+      mrb_gc_clear_dead_refscopes(mrb);
+#endif
 #ifdef MRB_GC_PROFILE
       {
         uint64_t fmdt = gc_prof_now_us() - fm0;
@@ -2075,6 +2094,9 @@ gc_interval_ratio_set(mrb_state *mrb, mrb_value obj)
   mrb_int ratio;
 
   mrb_get_args(mrb, "i", &ratio);
+  if (ratio < 0 || ratio > INT_MAX) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "interval_ratio out of range");
+  }
   mrb->gc.interval_ratio = (int)ratio;
   return mrb_nil_value();
 }
@@ -2109,7 +2131,7 @@ gc_step_ratio_set(mrb_state *mrb, mrb_value obj)
   mrb_int ratio;
 
   mrb_get_args(mrb, "i", &ratio);
-  if (ratio <= 0) {
+  if (ratio <= 0 || ratio > INT_MAX) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "step_ratio must be positive");
   }
   mrb->gc.step_ratio = (int)ratio;

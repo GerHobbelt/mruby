@@ -369,6 +369,7 @@ assert('alias and undef reject a dynamic symbol') do
 end
 
 assert('symbol GC keeps the names of live global variables') do
+  stress
   # The global outlives the code that set it: once that code is collected its
   # name is reachable from the global variable table alone, which is a root
   # the sweep has to walk in its own right.
@@ -808,6 +809,7 @@ assert('the constant cache forgets an irep when the irep is freed') do
 end
 
 assert('eval of a pattern deeper than the compiler walks') do
+  stress
   # A pattern is walked by a recursion of its own, which nothing bounded: a
   # pattern nested as deep as it is written ran the compiler off the C stack,
   # and the walk that gave the tree back afterwards would have too. It goes
@@ -899,4 +901,31 @@ assert('eval of a multiple assignment with more post-splat targets than fit') do
   end
   assert_equal 255, eval(masgn.call(255) + "; @masgn_post254")
   assert_raise(SyntaxError) { eval(masgn.call(256)) }
+end
+
+assert('eval of a local variable whose name is too long for a symbol') do
+  # The lv table is dumped with a 16-bit name length, and every lv name is
+  # interned into an mrb_sym, which refuses 0xffff bytes and up. A name that
+  # long used to leave codegen as a valid irep and raise ArgumentError from the
+  # glue instead, leaking the parser it raised past; now it is a codegen error
+  # like a method name of the same length already was.
+  name = "lv_too_long_" + "x" * 0x10000
+  assert_raise(SyntaxError) { eval("#{name} = 1") }
+  assert_raise(SyntaxError) { eval("#{name} = 1", binding) }
+  assert_raise(SyntaxError) { eval("[1].each { |#{name}| }") }
+  # One byte short of the bound is an ordinary local variable.
+  short = "lv_just_fits_" + "x" * (0xfffe - "lv_just_fits_".size)
+  assert_equal 1, eval("#{short} = 1; #{short}")
+end
+
+assert('eval with a filename too long for a symbol') do
+  # The filename is interned too. Without a binding it was already refused
+  # before anything was allocated; with one, the binding pass parsed first and
+  # the parser raised from under itself, leaking its state.
+  # The message tells the two apart: "symbol length too long" is the parser
+  # raising from under itself, "filename too long" is eval refusing up front.
+  file = "f" * 0x10000
+  assert_raise_with_message(ArgumentError, "filename too long") { eval("1", nil, file) }
+  assert_raise_with_message(ArgumentError, "filename too long") { eval("1", binding, file) }
+  assert_equal 1, eval("1", binding, "f" * 0xfffe)
 end
