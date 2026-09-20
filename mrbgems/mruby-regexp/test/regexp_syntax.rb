@@ -802,6 +802,22 @@ assert("Regexp - repetition {n,m}") do
   assert_equal "aaa", Regexp.new("a{2,3}").match("aaaa")[0]
 end
 
+assert("Regexp - a repeat count above what the engine takes") do
+  # The ceiling here is 32768 and CRuby's is 100000, so between them stand
+  # counts this engine refuses and CRuby compiles. Above both the two
+  # refuse the same pattern, and what they say of it is the same.
+  ["a{100001}", "a{1,100001}", "a{100001,}", "a{10000000000}"].each do |src|
+    assert_raise_with_message(RegexpError,
+                              "too big number for repeat range: /#{src}/", src) do
+      Regexp.new(src)
+    end
+  end
+  assert_raise_with_message(RegexpError,
+                            "too big number for repeat range: /a{32769}/") do
+    Regexp.new("a{32769}")
+  end
+end
+
 assert("Regexp - an upper bound below the lower one is an error") do
   # `{n,m}` with m < n names no repeat count, and CRuby raises rather than
   # compiling it; it used to compile as `{n}` and match exactly n repeats.
@@ -1488,6 +1504,18 @@ assert("Regexp - empty pattern") do
   assert_true //.match?("abc")
 end
 
+assert("Regexp - more capture groups than the engine holds") do
+  # This engine holds 31 of them, group 0 taking the last of the 32 slots,
+  # where CRuby holds thousands. The pattern that reaches the limit is not
+  # the same one, so what is shared is the wording, which is CRuby's.
+  src = "(a)" * 32
+  assert_raise_with_message(RegexpError,
+                            "too many capture groups are specified: /#{src}/") do
+    Regexp.new(src)
+  end
+  assert_equal 32, Regexp.new("(a)" * 31).match("a" * 31).size
+end
+
 assert("Regexp - nested captures") do
   md = /((a)(b))c/.match("abc")
   assert_equal "abc", md[0]
@@ -1544,9 +1572,10 @@ assert("Regexp - a (?...) prefix the pattern ends inside says which it was") do
     end
   end
   # A character that names no group is that failure rather than this one,
-  # whether or not the pattern goes on.
-  ["(?z", "(?z)"].each do |src|
-    assert_raise_with_message(RegexpError, "undefined (?...) sequence: /#{src}/", src) do
+  # whether or not the pattern goes on. `(?P<name>x)` is Python's spelling
+  # of a named group and no group of Ruby's, so it is one of these too.
+  ["(?z", "(?z)", "(?P", "(?P<a>x)"].each do |src|
+    assert_raise_with_message(RegexpError, "undefined group option: /#{src}/", src) do
       Regexp.new(src)
     end
   end
@@ -1674,6 +1703,19 @@ assert("Regexp - an atomic group the parser refuses") do
   assert_raise(RegexpError) { Regexp.new("(?>") }
   # not a fixed-length construct, so not allowed in a lookbehind
   assert_raise(RegexpError) { Regexp.new("(?<=(?>a))b") }
+end
+
+assert("Regexp - a lookbehind body of no fixed width says which it was") do
+  # This engine rewinds a lookbehind by a width it measures at compile
+  # time, so a body that has none is refused. CRuby refuses the same
+  # bodies, and what it says of them is `invalid pattern in look-behind`.
+  ["(?<=a+)b", "(?<=a*)b", "(?<=a?)b", "(?<=a{1,2})b", "(?<!a+)b",
+   "(?<=(?>a))b"].each do |src|
+    assert_raise_with_message(RegexpError,
+                              "invalid pattern in look-behind: /#{src}/", src) do
+      Regexp.new(src)
+    end
+  end
 end
 
 assert("Regexp - a named group makes plain groups non-capturing") do
@@ -2182,10 +2224,10 @@ end
 assert("Regexp - a nest level on a \\k reference is refused") do
   need_backtracking_stack
   # `\k<name+n>` reads the group as the enclosing recursion left it n levels
-  # up, which goes with the `\g` subexpression call this engine refuses. Taking
-  # the sign into the name made each a name no group carried, so
-  # /(?<a>c)\k<a+0>/ raised `undefined name <a+0> reference` where CRuby
-  # matched "cc".
+  # up, which asks for a capture memory per call level that this engine's flat
+  # slots do not carry, `\g` calls themselves being supported. Taking the sign
+  # into the name made each a name no group carried, so /(?<a>c)\k<a+0>/
+  # raised `undefined name <a+0> reference` where CRuby matched "cc".
   msg = "backreference with nest level is not supported"
   assert_raise_with_message(RegexpError, "#{msg}: /(?<a>c)\\k<a+0>/") do
     Regexp.new("(?<a>c)\\k<a+0>")
@@ -2243,10 +2285,33 @@ assert("Regexp - a nest level on a \\k reference is refused") do
     Regexp.new("(?<a>c)\\k<a+0)>")
   end
 
-  # An unterminated name is still that, and not a level with nothing behind it
+  # An unterminated name is still that, and not a level with nothing behind
+  # it, so it reaches the message an unclosed name gets rather than the level
+  # one: the pattern never closed the name, which is not a level either.
   assert_raise_with_message(RegexpError,
-                            "unterminated backreference name: /(?<a>c)\\k<a+/") do
+                            "invalid group name <a+>: /(?<a>c)\\k<a+/") do
     Regexp.new("(?<a>c)\\k<a+")
+  end
+end
+
+assert("Regexp - a name the pattern ends inside says which it was") do
+  # A name the pattern ends before the delimiter of is `invalid group name`
+  # in CRuby, quoted as far as the scan got, and a name that never began is
+  # the empty one. Both spellings of a definition and both of a reference
+  # read the name the same way.
+  {
+    "(?<a" => "invalid group name <a>",
+    "(?'a" => "invalid group name <a>",
+    "(?<ab" => "invalid group name <ab>",
+    "(?'" => "group name is empty",
+    "(a)\\k<b" => "invalid group name <b>",
+    "(a)\\k'b" => "invalid group name <b>",
+    "(a)\\k<" => "group name is empty",
+    "(a)\\k'" => "group name is empty",
+  }.each do |src, msg|
+    assert_raise_with_message(RegexpError, "#{msg}: /#{src}/", src) do
+      Regexp.new(src)
+    end
   end
 end
 
@@ -2659,6 +2724,18 @@ assert("Regexp - octal and hex escapes") do
   end
 end
 
+assert("Regexp - a backslash the pattern ends after says which it was") do
+  # A `\\` with nothing after it is an escape that ends early, which is what
+  # CRuby calls it, and the same one it calls a `\\u` with no digits after
+  # it. Inside a class as well: the member reads its escape the same way.
+  ["a\\", "\\", "[a\\", "(?:a\\"].each do |src|
+    assert_raise_with_message(RegexpError,
+                              "too short escape sequence: /#{src}/", src) do
+      Regexp.new(src)
+    end
+  end
+end
+
 assert("Regexp - a hex escape needs at least one digit") do
   # `\x` followed by no hex digit used to read as `\x00`, so `\x{41}` was a
   # NUL and a quantifier, and matched 41 NUL bytes. A regexp literal never
@@ -2835,17 +2912,10 @@ end
 assert("Regexp - the escapes this engine does not carry are refused") do
   # Each means something in CRuby that this engine does not do, and as an
   # unknown escape each was simply its own letter: /\R/ matched an R rather
-  # than a newline, and /(a)\g<1>/ matched "ag<1>" rather than "aa".
+  # than a newline.
   assert_raise_with_message(RegexpError, "\\G is not supported: /\\G/") { Regexp.new("\\G") }
   assert_raise_with_message(RegexpError, "\\K is not supported: /a\\Kb/") { Regexp.new("a\\Kb") }
   ["\\R", "\\X", "x\\G", "\\K"].each do |src|
-    assert_raise(RegexpError, src) { Regexp.new(src) }
-  end
-  assert_raise_with_message(RegexpError,
-                            "subexpression call is not supported: /(a)\\g<1>/") do
-    Regexp.new("(a)\\g<1>")
-  end
-  ["(?<n>a)\\g<n>", "(a)\\g'1'", "\\g<0>"].each do |src|
     assert_raise(RegexpError, src) { Regexp.new(src) }
   end
 
@@ -2855,7 +2925,8 @@ assert("Regexp - the escapes this engine does not carry are refused") do
   assert_equal "X", "X"[/[\X]/]
   assert_equal "g", "g"[/[\g]/]
 
-  # and a bare `\g` is the letter outside one too
+  # and a bare `\g`, which calls a group only with a <name> or 'name' after
+  # it, is the letter outside one too
   assert_equal "g", "g"[/\g/]
 end
 

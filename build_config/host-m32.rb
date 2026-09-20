@@ -10,6 +10,7 @@ MRuby::Build.new('host-m32') do |conf|
   conf.cc.flags << '-m32'
   conf.linker.flags << '-m32'
 
+
   # Turn on `enable_debug` for better debugging
   conf.enable_debug
   conf.enable_test

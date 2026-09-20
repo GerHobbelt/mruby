@@ -163,6 +163,8 @@ module MRuby
         @enable_test = false
         @enable_lock = true
         @enable_benchmark = true
+        @enable_compile_commands = true
+        @compile_commands_default = false
         @mrbcfile_external = false
         @file_prefix_map = nil
         @internal = internal
@@ -283,6 +285,49 @@ module MRuby
 
     def lock_enabled?
       Lockfile.enabled? && @enable_lock
+    end
+
+    # Whether this build writes a `compile_commands.json` of its own compiles
+    # into its build directory.
+    def compile_commands_enabled?
+      @enable_compile_commands
+    end
+
+    # Whether this build is the one the tree's own `compile_commands.json`
+    # is written from. A tool opening a source without being told which build
+    # to read it as wants one answer, and a config with several builds is the
+    # only thing that knows which of them a reader of this tree means.
+    def compile_commands_default?
+      @compile_commands_default
+    end
+
+    # +default:+ makes this build the one the tree's `compile_commands.json`
+    # is written from. Two builds claiming it would leave the answer to
+    # declaration order, so the second to claim it says so.
+    #
+    # Almost no configuration needs to call this. Every build keeps its
+    # records already, and which one speaks for the tree is settled without
+    # being told: a build named `host`, or failing that the first one the
+    # configuration declares. A config with several builds says which it means
+    # by declaring that one first, which is what `build_config/boxing.rb`
+    # does. What is left for +default:+ is the case where the build that
+    # should speak cannot be the first one declared -- an order the
+    # configuration needs for another reason -- and there is no such config in
+    # this tree.
+    def enable_compile_commands(default: false)
+      @enable_compile_commands = true
+      return unless default
+
+      claimed = MRuby.targets.each_value.find do |build|
+        !build.equal?(self) && !build.internal? && build.compile_commands_default?
+      end
+      fail "compile_commands default is already '#{claimed.name}'" if claimed
+      @compile_commands_default = true
+    end
+
+    def disable_compile_commands
+      @enable_compile_commands = false
+      @compile_commands_default = false
     end
 
     def disable_cxx_exception

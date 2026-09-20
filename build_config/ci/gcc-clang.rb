@@ -8,6 +8,7 @@ MRuby::Build.new('full-debug') do |conf|
   conf.gembox 'full-core'
   conf.cc.defines += %w(MRB_GC_STRESS MRB_USE_DEBUG_HOOK)
 
+
   conf.enable_test
 end
 
