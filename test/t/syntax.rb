@@ -48,6 +48,22 @@ assert('yield', '11.3.5') do
   end
 end
 
+assert('yield with keyword arguments') do
+  # keywords must reach the block, alone and mixed with positional/splat args
+  def ky_kw; yield b: true; end
+  assert_equal [{b: true}], ky_kw { |*a| a }
+
+  def ky_pos_kw; yield 1, b: true; end
+  assert_equal [1, {b: true}], ky_pos_kw { |*a| a }
+
+  def ky_splat_kw; yield 1, *[2], b: true; end
+  assert_equal [1, 2, {b: true}], ky_splat_kw { |*a| a }
+
+  # a block declaring keyword parameters receives them as keywords
+  def ky_decl; yield 1, x: 2, y: 3; end
+  assert_equal [1, 2, 3], ky_decl { |a, x:, y:| [a, x, y] }
+end
+
 assert('break', '11.5.2.4.3') do
   n = 0
   a = []
@@ -128,6 +144,65 @@ assert('break', '11.5.2.4.3') do
     a.push 4
   end
   assert_equal [1, 2, 3, 4], a
+end
+
+assert('next with value from a block') do
+  def next_yield; yield; end
+  # next v returns v itself, not [v]
+  assert_equal 234, (next_yield { next 234 })
+  # multiple values become an array
+  assert_equal [1, 2], (next_yield { next 1, 2 })
+  # a splat argument is expanded, not double-wrapped
+  assert_equal [7, 8], (next_yield { next *[7, 8] })
+  # bare next yields nil
+  assert_nil (next_yield { next })
+  # next as loop control still discards its value
+  assert_equal [1, 20, 3], [1, 2, 3].map { |x| next x * 10 if x == 2; x }
+end
+
+assert('safe navigation operator-assignment short-circuits on nil') do
+  # a nil receiver yields nil without invoking the read or write method
+  assert_nil (nil&.foo += 5)
+  assert_nil (nil&.foo ||= 5)
+  assert_nil (nil&.foo &&= 5)
+
+  # the right-hand side is not evaluated when the receiver is nil
+  evaluated = false
+  nil&.foo += (evaluated = true; 1)
+  assert_false evaluated
+
+  # a non-nil receiver still performs the operation
+  acc = Class.new { attr_accessor :x }
+  c = acc.new
+  c.x = 10
+  assert_equal 15, (c&.x += 5)
+  assert_equal 15, c.x
+
+  d = acc.new
+  d&.x ||= 7
+  assert_equal 7, d.x
+end
+
+assert('attribute or/and-assignment persists the write in a value context') do
+  acc = Class.new { attr_accessor :x }
+
+  # ||= writing when the value is used (e.g. as a method argument): the
+  # peephole must not hoist the RHS out of the write's argument register
+  c = acc.new
+  assert_equal 7, (c.x ||= 7)
+  assert_equal 7, c.x
+
+  # ||= skipping when the attribute is already truthy
+  c2 = acc.new
+  c2.x = 5
+  assert_equal 5, (c2.x ||= 7)
+  assert_equal 5, c2.x
+
+  # &&= writing when truthy
+  c3 = acc.new
+  c3.x = 3
+  assert_equal 9, (c3.x &&= 9)
+  assert_equal 9, c3.x
 end
 
 assert('redo', '11.5.2.4.5') do
@@ -386,6 +461,23 @@ end
 assert('multiple assignment (rest)') do
   *a = 0
   assert_equal [0], a
+end
+
+assert('multiple assignment (index targets)') do
+  a = [1, 2]
+  a[0], a[1] = 9, 8
+  assert_equal [9, 8], a
+
+  a[0], a[1] = a[1], a[0]
+  assert_equal [8, 9], a
+
+  h = {}
+  h[:x], h[:y] = 1, 2
+  assert_equal({:x => 1, :y => 2}, h)
+
+  b = Array.new(4, 0)
+  b[0, 2], b[2, 2] = [1, 2], [3, 4]
+  assert_equal [1, 2, 3, 4], b
 end
 
 assert('multiple assignment (rest+post)') do
@@ -1352,6 +1444,108 @@ assert('pattern matching - complex patterns') do
     assert_equal 1, a
     assert_equal [2, 3], rest
   end
+end
+
+assert('defined? on statically-decidable operands') do
+  # literals and pure expressions
+  assert_equal 'expression', defined?(1)
+  assert_equal 'expression', defined?("s")
+  assert_equal 'expression', defined?(:sym)
+  assert_equal 'expression', defined?([1, 2])
+  assert_equal 'expression', defined?({a: 1})
+  assert_equal 'expression', defined?(nil)
+  assert_equal 'expression', defined?(true)
+  assert_equal 'expression', defined?(false)
+  assert_equal 'expression', defined?(1..2)
+  assert_equal 'expression', defined?(defined?(x))
+
+  # self
+  assert_equal 'self', defined?(self)
+
+  # a local variable in scope
+  lv = 1
+  assert_equal 'local-variable', defined?(lv)
+
+  # assignments report "assignment" without being evaluated
+  assert_equal 'assignment', defined?(unset = 1)
+  assert_nil unset
+  n = 5
+  assert_equal 'assignment', defined?(n += 100)
+  assert_equal 5, n
+end
+
+DEFINED_TEST_CONST = 1
+
+assert('defined? on operands resolved at run time') do
+  # constants (in the lexical scope of this method)
+  assert_equal 'constant', defined?(DEFINED_TEST_CONST)
+  assert_equal 'constant', defined?(Object)
+  assert_nil defined?(NoSuchConstantHere)
+
+  # methods reachable from self, including private ones
+  assert_equal 'method', defined?(assert)          # available here
+  assert_nil defined?(no_such_method_at_all)
+
+  # instance variables of self
+  o = Object.new
+  o.instance_eval { @ivar_present = 1 }
+  assert_equal 'instance-variable', o.instance_eval { defined?(@ivar_present) }
+  assert_nil o.instance_eval { defined?(@ivar_absent) }
+
+  # yield depends on whether the enclosing method got a block
+  m = Object.new
+  def m.with_block; defined?(yield); end
+  assert_equal 'yield', m.with_block {}
+  assert_nil m.with_block
+
+  # the operand is not evaluated
+  evaluated = false
+  defined?(no_such_method_at_all(evaluated = true))
+  assert_false evaluated
+end
+
+$defined_test_gvar = 1
+
+assert('defined? on global/class variables and super') do
+  # global variables (defined once assigned)
+  assert_equal 'global-variable', defined?($defined_test_gvar)
+  assert_nil defined?($no_such_global_anywhere)
+
+  # class variables, in the lexical class scope
+  cls = Class.new do
+    @@cv_present = 1
+    def read_present; defined?(@@cv_present); end
+    def read_absent;  defined?(@@cv_absent); end
+  end
+  obj = cls.new
+  assert_equal 'class variable', obj.read_present
+  assert_nil obj.read_absent
+
+  # super depends on whether the method has a super method
+  base = Class.new { def greet; end }
+  derived = Class.new(base) { def greet; defined?(super); end }
+  assert_equal 'super', derived.new.greet
+  standalone = Class.new { def solo; defined?(super); end }
+  assert_nil standalone.new.solo
+end
+
+module DefinedPathOuter
+  Inner = 1
+end
+
+class DefinedPathBase; Sub = 2; end
+class DefinedPathChild < DefinedPathBase; end
+
+assert('defined? on constant paths (A::B)') do
+  assert_equal 'constant', defined?(DefinedPathOuter::Inner)
+  assert_nil defined?(DefinedPathOuter::Missing)
+  assert_nil defined?(NoSuchOuter::Inner)      # undefined parent, no raise
+
+  # the ::  lookup follows the ancestor chain of the parent
+  assert_equal 'constant', defined?(DefinedPathChild::Sub)
+
+  # a builtin nested constant
+  assert_equal 'constant', defined?(Float::INFINITY)
 end
 
 # NOTE: `&nil` block-forbidding parameters live in syntax_block_forbid.rb,

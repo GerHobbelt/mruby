@@ -297,10 +297,8 @@ assert("Regexp - patterns that used to hang the compiler now raise (A1)") do
   # Regexp.new is used so the pattern reaches the regexp compiler directly,
   # bypassing the literal validation the parser performs on /.../ literals.
 
-  # (?X) with an unsupported X: inline options (?i)/(?i:...), the absent
-  # operator (?~...), and conditionals (?(...)) are not implemented.
-  assert_raise(RegexpError) { Regexp.new("(?i:a)") }
-  assert_raise(RegexpError) { Regexp.new("(?i)a") }
+  # (?X) with an unsupported X: the absent operator (?~...) and conditionals
+  # (?(...)) are not implemented (inline options (?i)/(?i:...) now are).
   assert_raise(RegexpError) { Regexp.new("(?~foo)") }
   assert_raise(RegexpError) { Regexp.new("(?(<x>)a|b)") }
   assert_raise(RegexpError) { Regexp.new("(?") }
@@ -311,6 +309,31 @@ assert("Regexp - patterns that used to hang the compiler now raise (A1)") do
   assert_raise(RegexpError) { Regexp.new("*") }
   assert_raise(RegexpError) { Regexp.new("+") }
   assert_raise(RegexpError) { Regexp.new("?abc") }
+end
+
+assert("Regexp - inline options (?i) / (?i:...)") do
+  # Toggle form: options apply to the rest of the enclosing group.
+  assert_equal 0, (/(?i)abc/ =~ "ABC")
+  assert_equal 0, (/a(?i)b/ =~ "aB")
+  assert_nil (/a(?i)b/ =~ "Ab")          # the leading `a` stays case-sensitive
+  assert_equal 0, (/(?i)a(?-i)b/ =~ "Ab") # `-i` turns it back off
+  assert_nil (/(?i)a(?-i)b/ =~ "AB")
+
+  # Scoped form: a non-capturing group whose options apply only to its body.
+  assert_equal 0, (/(?i:abc)/ =~ "ABC")
+  assert_nil (/(?i:a)b/ =~ "aB")          # option must not leak past the `)`
+  assert_equal 0, (/(?i:ab)+/ =~ "AbaB")  # scoped group is still quantifiable
+
+  # The toggle inside a group is confined to that group.
+  assert_equal 0, (/(a(?i)b)c/ =~ "aBc")
+  assert_nil (/(a(?i)b)c/ =~ "aBC")       # trailing `c` is case-sensitive again
+
+  # m enables dot-matches-newline for its scope.
+  assert_equal 0, (/(?m:a.b)/ =~ "a\nb")
+  assert_nil (/a.b/ =~ "a\nb")
+
+  # x (extended) cannot be scoped inline with the current architecture.
+  assert_raise(RegexpError) { Regexp.new("(?x)a b") }
 end
 
 assert("MatchData#captures") do
@@ -923,4 +946,32 @@ assert("Regexp - truncated UTF-8 at subject end") do
   # past the end of the string buffer when matched against a class
   assert_nil ("ab\xf0" =~ /[cd]/)
   assert_equal 0, ("ab\xf0" =~ /[^cd]+$/)
+end
+
+assert("Regexp - large non-ASCII character class does not overflow") do
+  # a class listing tens of thousands of non-ASCII codepoints used to
+  # overflow the 16-bit range capacity (32768 * 2 wrapped to 0, feeding a
+  # size-0 realloc and a write through NULL). See issue #6937.
+  # Patterns are always parsed as UTF-8, so build the bytes directly to
+  # exercise this in both MRB_UTF8_STRING and byte-string builds.
+  utf8 = ->(cp) {
+    if cp < 0x800
+      (0xC0 | (cp >> 6)).chr + (0x80 | (cp & 0x3F)).chr
+    else
+      (0xE0 | (cp >> 12)).chr + (0x80 | ((cp >> 6) & 0x3F)).chr + (0x80 | (cp & 0x3F)).chr
+    end
+  }
+  s = "["
+  i = 0x80
+  while i <= 0x8080
+    s += utf8.call(i)
+    i += 1
+  end
+  s += "]"
+  re = Regexp.new(s)
+  assert_kind_of Regexp, re
+  assert_equal 0, (re =~ utf8.call(0x80))
+  assert_equal 0, (re =~ utf8.call(0x8080))
+  assert_nil (re =~ utf8.call(0x8081))
+  assert_nil (re =~ "A")
 end

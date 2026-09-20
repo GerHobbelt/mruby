@@ -1228,6 +1228,23 @@ mrb_vm_cv_get(mrb_state *mrb, mrb_sym sym)
   return mrb_mod_cv_get(mrb, c, sym);
 }
 
+/* Non-raising class-variable lookup for `defined?(@@v)`. Resolves the class
+   from the given lexical scope's proc (the caller's, via ci[-1]), mirroring
+   mrb_vm_cv_get's class selection. */
+mrb_bool
+mrb_vm_cv_defined_p(mrb_state *mrb, const struct RProc *proc, mrb_sym sym)
+{
+  struct RClass *c;
+
+  for (;;) {
+    c = MRB_PROC_TARGET_CLASS(proc);
+    if (c && c->tt != MRB_TT_SCLASS) break;
+    proc = proc->upper;
+    if (!proc) { c = mrb->object_class; break; }
+  }
+  return mrb_mod_cv_defined(mrb, c, sym);
+}
+
 void
 mrb_vm_cv_set(mrb_state *mrb, mrb_sym sym, mrb_value v)
 {
@@ -1365,6 +1382,45 @@ mrb_vm_const_get(mrb_state *mrb, mrb_sym sym)
     if (c2 && (c2->tt == MRB_TT_CLASS || c2->tt == MRB_TT_MODULE)) c = c2;
   }
   return const_get(mrb, c, sym, TRUE);
+}
+
+/* Non-raising lexical constant lookup for `defined?`. Mirrors the search
+   order of mrb_vm_const_get but takes the lexical scope's proc as an argument
+   (the caller's, via ci[-1]) and returns the value or undef, without invoking
+   const_missing or raising. */
+mrb_value
+mrb_vm_const_get_noraise(mrb_state *mrb, const struct RProc *proc, mrb_sym sym)
+{
+  struct RClass *c = MRB_PROC_TARGET_CLASS(proc), *c2;
+  mrb_value v;
+
+  if (!c) c = mrb->object_class;
+  if (iv_get(mrb, class_iv_ptr(c), sym, &v)) return v;
+  for (proc = proc->upper; proc; proc = proc->upper) {
+    c2 = MRB_PROC_TARGET_CLASS(proc);
+    if (!c2) c2 = mrb->object_class;
+    if (iv_get(mrb, class_iv_ptr(c2), sym, &v)) return v;
+  }
+  if (c->tt == MRB_TT_SCLASS) {
+    v = const_get_nohook(mrb, c, sym, TRUE);
+    if (!mrb_undef_p(v)) return v;
+
+    mrb_value klass;
+    for (c2 = c; c2 && c2->tt == MRB_TT_SCLASS; c2 = mrb_class_ptr(klass)) {
+      if (!iv_get(mrb, class_iv_ptr(c2), MRB_SYM(__attached__), &klass)) {
+        c2 = NULL;
+        break;
+      }
+    }
+    if (c2 && (c2->tt == MRB_TT_CLASS || c2->tt == MRB_TT_MODULE)) c = c2;
+  }
+  return const_get_nohook(mrb, c, sym, TRUE);
+}
+
+mrb_bool
+mrb_vm_const_defined_p(mrb_state *mrb, const struct RProc *proc, mrb_sym sym)
+{
+  return !mrb_undef_p(mrb_vm_const_get_noraise(mrb, proc, sym));
 }
 
 /*
@@ -1559,6 +1615,14 @@ mrb_gv_get(mrb_state *mrb, mrb_sym sym)
   if (iv_get(mrb, mrb->globals, sym, &v))
     return v;
   return mrb_nil_value();
+}
+
+/* Whether a global variable has been assigned, for `defined?($g)`. */
+mrb_bool
+mrb_gv_defined(mrb_state *mrb, mrb_sym sym)
+{
+  mrb_value v;
+  return iv_get(mrb, mrb->globals, sym, &v) != 0;
 }
 
 /*

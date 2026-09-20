@@ -167,9 +167,23 @@ class_set_bit(re_charclass *cc, uint8_t ch)
 static void
 class_add_range(re_compiler *c, re_charclass *cc, uint32_t lo, uint32_t hi)
 {
+  /* Merge with the previous range when the new one is contiguous with or
+     overlaps it. Codepoints are appended in scan order, so an ascending run
+     (the common case, e.g. a long [...] enumeration) collapses to a single
+     range instead of one entry per codepoint. */
+  if (cc->num_ranges > 0) {
+    uint32_t *last = &cc->ranges[2 * (cc->num_ranges - 1)];
+    if (lo >= last[0] && lo <= last[1] + 1) {
+      if (hi > last[1]) last[1] = hi;
+      return;
+    }
+  }
   if (cc->num_ranges >= cc->range_capa) {
-    cc->range_capa = cc->range_capa ? cc->range_capa * 2 : 4;
-    cc->ranges = (uint32_t*)mrb_realloc(c->mrb, cc->ranges, sizeof(uint32_t) * 2 * cc->range_capa);
+    /* range_capa/num_ranges are uint32_t: doubling from 32768 no longer
+       wraps to 0 (which fed a size-0 realloc and a write through NULL). */
+    uint32_t new_capa = cc->range_capa ? cc->range_capa * 2 : 4;
+    cc->ranges = (uint32_t*)mrb_realloc(c->mrb, cc->ranges, sizeof(uint32_t) * 2 * new_capa);
+    cc->range_capa = new_capa;
   }
   cc->ranges[2 * cc->num_ranges] = lo;
   cc->ranges[2 * cc->num_ranges + 1] = hi;
@@ -549,6 +563,38 @@ compute_fixed_len(re_compiler *c, uint32_t start, uint32_t end)
   return len;
 }
 
+/* Parse the option letters of an inline (?...) group. The parser is
+   positioned just past the '?'; it reads a run of i/m/x, an optional '-',
+   and a further run of i/m/x to switch off, then stops at the terminator
+   (':' or ')'). `base` is the option set in effect on entry; the resulting
+   set is returned. Ruby's inline letters are i (IGNORECASE), m (DOTALL),
+   x (EXTENDED). Extended mode is applied by a whole-pattern preprocessing
+   pass, so it cannot be scoped inline and is rejected here. */
+static uint32_t
+parse_inline_flags(re_compiler *c, uint32_t base)
+{
+  uint32_t on = 0, off = 0;
+  mrb_bool negate = FALSE, seen = FALSE;
+  for (;;) {
+    int oc = peek(c);
+    uint32_t bit;
+    if (oc == 'i') bit = RE_FLAG_IGNORECASE;
+    else if (oc == 'm') bit = RE_FLAG_DOTALL;
+    else if (oc == 'x') {
+      compile_error(c, "inline extended mode (?x) is not supported");
+      return base;  /* unreached: compile_error longjmps */
+    }
+    else if (oc == '-' && !negate) { negate = TRUE; next_char(c); continue; }
+    else break;
+    if (negate) off |= bit;
+    else on |= bit;
+    seen = TRUE;
+    next_char(c);
+  }
+  if (!seen) compile_error(c, "undefined (?...) sequence");
+  return (base | on) & ~off;
+}
+
 /* Compile a single atom (character, class, group, etc.) */
 static void
 compile_atom(re_compiler *c)
@@ -560,6 +606,11 @@ compile_atom(re_compiler *c)
     {
       next_char(c);
       mrb_bool capturing = TRUE;
+
+      /* Options in effect on entry. A group restores them on exit so an
+         inline toggle like (?i) inside it (which sets c->flags for the rest
+         of the group) does not leak past the closing ')'. */
+      uint32_t saved_flags = c->flags;
 
       const char *cap_name = NULL;
       uint16_t cap_name_len = 0;
@@ -580,6 +631,7 @@ compile_atom(re_compiler *c)
           if (peek(c) != ')') compile_error(c, "unmatched '('");
           next_char(c);
           c->needs_backtrack = TRUE;  /* needs backtracking engine */
+          c->flags = saved_flags;
           break;  /* done with this atom */
         }
         else if (c->p[1] == '<' && c->p + 2 < c->src_end && (c->p[2] == '=' || c->p[2] == '!')) {
@@ -605,6 +657,7 @@ compile_atom(re_compiler *c)
           if (peek(c) != ')') compile_error(c, "unmatched '('");
           next_char(c);
           c->needs_backtrack = TRUE;  /* needs backtracking engine */
+          c->flags = saved_flags;
           break;
         }
         else if (c->p[1] == '<' && c->p + 2 < c->src_end && c->p[2] != '=' && c->p[2] != '!') {
@@ -615,13 +668,37 @@ compile_atom(re_compiler *c)
           cap_name_len = (uint16_t)(c->p - cap_name);
           next_char(c);  /* skip > */
         }
+        else if (c->p[1] == 'i' || c->p[1] == 'm' || c->p[1] == 'x' || c->p[1] == '-') {
+          /* Inline options: the toggle form (?imx) / (?-imx) changes the
+             options for the rest of the enclosing group, and the scoped
+             form (?imx:...) is a non-capturing group whose options apply
+             only to its body. */
+          next_char(c);  /* skip '?' */
+          uint32_t new_flags = parse_inline_flags(c, c->flags);
+          if (peek(c) == ')') {
+            next_char(c);
+            c->flags = new_flags;  /* rest of the group; restored at its ')' */
+            return;                /* consumed the token; no atom emitted */
+          }
+          else if (peek(c) == ':') {
+            next_char(c);
+            c->flags = new_flags;
+            compile_alt(c);
+            c->flags = saved_flags;
+            if (peek(c) != ')') compile_error(c, "unmatched '('");
+            next_char(c);
+            return;
+          }
+          else {
+            compile_error(c, "undefined (?...) sequence");
+          }
+        }
         else {
-          /* (?X) with an unsupported X: none of the recognized (?: (?= (?!
-             (?<= (?<! (?<name> forms. Inline option groups such as (?i) and
-             (?i:...), the absent operator (?~...), and conditionals (?(...))
-             are not implemented. Raise here rather than falling through to
-             the capturing-group path, which would leave the stray `?` for
-             compile_seq to spin on forever (A1). */
+          /* (?X) with an unsupported X: not one of the recognized (?: (?= (?!
+             (?<= (?<! (?<name> (?imx forms. The absent operator (?~...) and
+             conditionals (?(...)) are not implemented. Raise here rather than
+             falling through to the capturing-group path, which would leave
+             the stray `?` for compile_seq to spin on forever (A1). */
           compile_error(c, "undefined (?...) sequence");
         }
       }
@@ -652,6 +729,7 @@ compile_atom(re_compiler *c)
       if (capturing) {
         emit(c, RE_SAVE, 0, group * 2 + 1);
       }
+      c->flags = saved_flags;  /* inline toggles inside the group end here */
     }
     break;
 

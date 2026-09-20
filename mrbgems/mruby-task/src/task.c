@@ -582,6 +582,30 @@ task_run_body(mrb_state *mrb, void *ud)
         /* All tasks are dormant - scheduler done */
         break;
       }
+      /* Task-scheduled GC: every remaining task is waiting for a tick, so this
+         CPU would otherwise idle. Spend it on one unit of GC and loop back to
+         re-check q_ready_ -- if mrb_tick woke a task meanwhile we hand it the
+         CPU immediately, so GC never delays a tick-driven wakeup. Only sleep
+         once there is no GC work left. No-op (returns FALSE) unless
+         GC.scheduler_driven is on. */
+      if (mrb_gc_scheduler_pending(mrb)) {
+        mrb_gc_step(mrb);
+        /* q_ready_ was empty above; if a task is READY now, mrb_tick woke it
+           *during* the step, so the step delayed it. Record the step's wall
+           time as the jitter that task suffered (no-op without MRB_GC_PROFILE).
+           q_ready_ is mutated by the mrb_tick IRQ, so read it under the
+           scheduler-IRQ exclusion to get a defined, non-cached load. */
+        mrb_task_excl_enter(mrb);
+        mrb_bool delayed = (q_ready_ != NULL);
+        mrb_task_excl_exit(mrb);
+        mrb_gc_scheduler_jitter(mrb, delayed);
+        /* This branch loops without reaching idle_cpu or the post-execute
+           hook below, so a long GC drain would otherwise be a third way to
+           starve platform servicing (mrb_task_run_once doesn't need this:
+           it returns to the host after one step). */
+        mrb_hal_task_switch_hook(mrb, MRB_TASK_SWITCH_GC_STEP);
+        continue;
+      }
       /* If there are tasks waiting or suspended, idle */
       mrb_hal_task_idle_cpu(mrb);
       continue;
@@ -594,6 +618,11 @@ task_run_body(mrb_state *mrb, void *ud)
 
     /* Execute task using core logic */
     execute_task(mrb, t);
+
+    /* Platform servicing point — fires on every switch, so a compute-bound
+       task that keeps the ready queue full cannot starve it (idle_cpu only
+       runs when no task is ready). */
+    mrb_hal_task_switch_hook(mrb, MRB_TASK_SWITCH_TASK);
 
     /* Move to end of ready queue if still running (round-robin) */
     if (t->status == MRB_TASK_STATUS_READY) {
@@ -634,6 +663,25 @@ mrb_task_run_once(mrb_state *mrb)
 
   /* No task ready */
   if (!t) {
+    /* Task-scheduled GC, single-step variant. Unlike mrb_task_run we cannot
+       drain GC in a loop here: this call must stay non-blocking so the host
+       event loop keeps spinning, so advance the collector by exactly one unit
+       and return. Returning true (progress made) rather than nil tells a host
+       that branches on the result to pump again promptly; nil is reserved for
+       "truly idle", so GC never stalls because the host backed off to a long
+       sleep. Hosts that ignore the result (e.g. a fixed timer) still advance
+       GC one step per tick. No-op unless GC.scheduler_driven is on. */
+    if (mrb_gc_scheduler_pending(mrb)) {
+      mrb_gc_step(mrb);
+      /* q_ready_ is mutated by the mrb_tick IRQ; read it under the
+         scheduler-IRQ exclusion to get a defined, non-cached load
+         (see the matching comment in task_run_body). */
+      mrb_task_excl_enter(mrb);
+      mrb_bool delayed = (q_ready_ != NULL);
+      mrb_task_excl_exit(mrb);
+      mrb_gc_scheduler_jitter(mrb, delayed);
+      return mrb_true_value();
+    }
     return mrb_nil_value();
   }
 
@@ -644,6 +692,9 @@ mrb_task_run_once(mrb_state *mrb)
 
   /* Execute task using core logic */
   execute_task(mrb, t);
+
+  /* Platform servicing point (see task_run_body) */
+  mrb_hal_task_switch_hook(mrb, MRB_TASK_SWITCH_TASK);
 
   /* Move to end of ready queue if still ready (round-robin) */
   if (t->status == MRB_TASK_STATUS_READY) {
@@ -1230,6 +1281,13 @@ mrb_task_terminate(mrb_state *mrb, mrb_value self)
 }
 
 static mrb_value
+mrb_task_close(mrb_state *mrb, mrb_value self)
+{
+  mrb_close_task(mrb, self);
+  return mrb_nil_value();
+}
+
+static mrb_value
 mrb_task_join(mrb_state *mrb, mrb_value self)
 {
   mrb_task *t, *current;
@@ -1550,6 +1608,28 @@ mrb_terminate_task(mrb_state *mrb, mrb_value task)
   terminate_task_internal(mrb, t);
 }
 
+MRB_API void
+mrb_close_task(mrb_state *mrb, mrb_value task)
+{
+  task_check_scheduler_lock(mrb);
+
+  mrb_task *t = (mrb_task*)mrb_data_check_get_ptr(mrb, task, &mrb_task_type);
+  if (!t) return;
+
+  if (t == mrb->task.main_task ||
+      (mrb->c != mrb->root_c && t == MRB2TASK(mrb))) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "can't close current task");
+  }
+
+  terminate_task_internal(mrb, t);
+  mrb_task_excl_enter(mrb);
+  mrb_task_q_delete(mrb, t);
+  mrb_task_excl_exit(mrb);
+
+  DATA_PTR(task) = NULL;
+  mrb_task_free(mrb, t);
+}
+
 /*
  * Stop a task (mark as stopped but don't move to dormant)
  */
@@ -1678,6 +1758,9 @@ mrb_mruby_task_gem_init(mrb_state *mrb)
   /* Task::Queue */
   mrb_init_task_queue(mrb, task_class);
 
+  /* GC.scheduler_driven family */
+  mrb_init_task_gc(mrb);
+
   /* Class methods */
   mrb_define_class_method_id(mrb, task_class, MRB_SYM(new),     mrb_task_s_new,     MRB_ARGS_KEY(2,0)|MRB_ARGS_BLOCK());
   mrb_define_class_method_id(mrb, task_class, MRB_SYM(current), mrb_task_s_current, MRB_ARGS_NONE());
@@ -1698,6 +1781,7 @@ mrb_mruby_task_gem_init(mrb_state *mrb)
   mrb_define_method_id(mrb, task_class, MRB_SYM(suspend),     mrb_task_suspend,      MRB_ARGS_NONE());
   mrb_define_method_id(mrb, task_class, MRB_SYM(resume),      mrb_task_resume,       MRB_ARGS_NONE());
   mrb_define_method_id(mrb, task_class, MRB_SYM(terminate),   mrb_task_terminate,    MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, task_class, MRB_SYM(close),       mrb_task_close,        MRB_ARGS_NONE());
   mrb_define_method_id(mrb, task_class, MRB_SYM(join),        mrb_task_join,         MRB_ARGS_NONE());
   mrb_define_method_id(mrb, task_class, MRB_SYM(value),       mrb_task_value,        MRB_ARGS_NONE());
 

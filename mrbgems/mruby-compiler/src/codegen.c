@@ -2164,13 +2164,17 @@ gen_assignment(mrc_codegen_scope *s, mrc_node *tree, mrc_node *rhs, int sp, int 
       CAST(index_target);
       codegen(s, cast->receiver, VAL);
       int n = gen_values(s, (mrc_node *)cast->arguments, VAL, 14);
-      genop_2(s, OP_MOVE, cursp(), cursp() - n * 2 + 1);
+      /* the value to assign lives in sp (set by the caller for multiple
+         assignment); cursp()-n*2+1 would point at an index register */
+      genop_2(s, OP_MOVE, cursp(), sp);
+      push();  /* reserve the value register so nregs accounts for it */
       if (n == 1) {
-        pop_n(2);
+        pop_n(3);
         genop_1(s, OP_SETIDX, cursp());
       }
       else {
-        pop_n(n+1);
+        push(); pop();  /* touch block slot so nregs covers the OP_SEND */
+        pop_n(n+2);
         genop_3(s, OP_SEND, cursp(), new_sym(s, MRC_OPSYM_2(aset)), n+1);
       }
       break;
@@ -4284,10 +4288,12 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
   receiver = (mrc_node *)cast->receiver; \
   value = (mrc_node *)cast->value; \
   read_name = cast->read_name; \
-  write_name = cast->write_name;
+  write_name = cast->write_name; \
+  safe = (cast->base.flags & PM_CALL_NODE_FLAGS_SAFE_NAVIGATION) ? 1 : 0;
       mrc_node *receiver = NULL, *value = NULL;
       mrc_sym read_name = -1, write_name = -1, binary_operator = -1, op_jmp = -1;
       uint32_t pos = -1;
+      int safe = 0, skip = 0;
       switch (nt) {
         case PM_CALL_OPERATOR_WRITE_NODE:
           {
@@ -4316,6 +4322,12 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
         push();
       }
       codegen(s, receiver, VAL);
+      if (safe) {
+        /* nil&.x op= v short-circuits to nil without the read/write */
+        int recv = cursp()-1;
+        gen_move(s, cursp(), recv, 1);
+        skip = genjmp2_0(s, OP_JMPNIL, cursp(), val);
+      }
       idx = new_sym(s, read_name);
       base = cursp()-1;
       /* copy receiver and arguments */
@@ -4339,12 +4351,15 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
         pop();
       }
       if (0 <= vsp) {
-        gen_move(s, vsp, cursp(), 0);
+        /* nopeep: a real MOVE, so peephole cannot hoist a loaded RHS out of
+           the argument register (cursp()) that the write SEND reads below */
+        gen_move(s, vsp, cursp(), TRUE);
       }
       pop();
       idx = new_sym(s, write_name);
       genop_3(s, OP_SEND, cursp(), idx, 1);
       if (0 < pos) { dispatch(s, pos); }
+      if (safe) { dispatch(s, skip); }
       break;
     }
     case PM_INDEX_OPERATOR_WRITE_NODE:
@@ -5756,7 +5771,7 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
       CAST(yield);
       mrc_codegen_scope *s2 = s;
       int lv = 0, ainfo = -1;
-      int n = 0, sendv = 0;
+      int n = 0, nk = 0, st = 0;
 
       while (!s2->mscope) {
         lv++;
@@ -5768,23 +5783,33 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
       }
       if (ainfo < 0) codegen_error(s, "invalid yield (SyntaxError)");
       push();
-      if (cast->arguments) {
-        n = gen_values(s, (mrc_node *)cast->arguments, VAL, 14);
+      CAST3(arguments, cast->arguments, arguments);
+      if (arguments) {
+        st = n = gen_values(s, (mrc_node *)cast->arguments, VAL, 14);
         if (n < 0) {
-          n = sendv = 1;
+          st = 1; n = 15;
           push();
+        }
+        /* keyword arguments */
+        for (size_t i = 0; i < arguments->arguments.size; i++) {
+          mrc_node *t = (mrc_node *)arguments->arguments.nodes[i];
+          if (nint(t) == PM_KEYWORD_HASH_NODE) {
+            nk = gen_hash(s, t, VAL, 14);
+            if (nk < 0) {st++; nk = 15;}
+            else st += nk*2;
+            n |= nk<<4;
+          }
         }
       }
       push(); pop(); /* space for a block */
-      pop_n(n+1);
+      pop_n(st+1);
       genop_2S(s, OP_BLKPUSH, cursp(), (ainfo<<4)|(lv & 0xf));
-      if (sendv) n = CALL_MAXARGS;
-      if (n < 15) {
+      if (nk == 0 && n < 15) {
         /* fast path: direct block call without method dispatch */
         genop_2(s, OP_BLKCALL, cursp(), n);
       }
       else {
-        /* fallback: use SEND for splat */
+        /* SEND carries the keyword count / splat array to Proc#call */
         genop_3(s, OP_SEND, cursp(), new_sym(s, MRC_SYM_1(call)), n);
       }
       if (val) push();
@@ -5815,8 +5840,9 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
       }
       else {
         if ((mrc_node *)cast->arguments) {
-          codegen(s, (mrc_node *)cast->arguments, VAL);
-          pop();
+          /* next v returns v itself; gen_retval unwraps a single argument
+             instead of wrapping it in an array (next 1, 2 stays [1, 2]) */
+          gen_retval(s, (mrc_node *)cast->arguments);
         }
         else {
           genop_1(s, OP_LOADNIL, cursp());
@@ -6080,13 +6106,136 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
     }
     case PM_DEFINED_NODE:
     {
-      /* `defined?` is intentionally not implemented (a full implementation is
-         large for little gain). Return nil without evaluating the operand:
-         `defined?` must not evaluate its argument, and the previous stub both
-         evaluated it and called a non-existent `defined?` method. */
+      /* `defined?` must not evaluate its operand. Cases decidable from the
+         operand's node type alone yield a literal string; ivar/const/method/
+         yield existence is resolved at run time by a private helper (the
+         helper reads the caller's frame for const lexical scope and for the
+         block). gvar/cvar and method-with-receiver still fall through to nil. */
+      CAST(defined);
+      const char *type = NULL;
+      int helper = 0;             /* runtime helper symbol, 0 = none */
+      pm_constant_id_t arg = 0;   /* symbol operand for the helper, 0 = none */
+      pm_constant_id_t arg2 = 0;  /* second symbol operand (A::B), 0 = none */
+      switch (nint(cast->value)) {
+      case PM_INTEGER_NODE: case PM_FLOAT_NODE:
+      case PM_RATIONAL_NODE: case PM_IMAGINARY_NODE:
+      case PM_STRING_NODE: case PM_INTERPOLATED_STRING_NODE:
+      case PM_X_STRING_NODE: case PM_INTERPOLATED_X_STRING_NODE:
+      case PM_SYMBOL_NODE: case PM_INTERPOLATED_SYMBOL_NODE:
+      case PM_REGULAR_EXPRESSION_NODE: case PM_INTERPOLATED_REGULAR_EXPRESSION_NODE:
+      case PM_ARRAY_NODE: case PM_HASH_NODE: case PM_KEYWORD_HASH_NODE:
+      case PM_NIL_NODE: case PM_TRUE_NODE: case PM_FALSE_NODE:
+      case PM_RANGE_NODE: case PM_LAMBDA_NODE: case PM_DEFINED_NODE:
+      case PM_SOURCE_FILE_NODE: case PM_SOURCE_LINE_NODE: case PM_SOURCE_ENCODING_NODE:
+        type = "expression";
+        break;
+      case PM_SELF_NODE:
+        type = "self";
+        break;
+      case PM_LOCAL_VARIABLE_READ_NODE:
+        type = "local-variable";
+        break;
+      case PM_LOCAL_VARIABLE_WRITE_NODE: case PM_INSTANCE_VARIABLE_WRITE_NODE:
+      case PM_GLOBAL_VARIABLE_WRITE_NODE: case PM_CLASS_VARIABLE_WRITE_NODE:
+      case PM_CONSTANT_WRITE_NODE: case PM_CONSTANT_PATH_WRITE_NODE:
+      case PM_MULTI_WRITE_NODE:
+      case PM_LOCAL_VARIABLE_OPERATOR_WRITE_NODE:
+      case PM_LOCAL_VARIABLE_OR_WRITE_NODE: case PM_LOCAL_VARIABLE_AND_WRITE_NODE:
+      case PM_INSTANCE_VARIABLE_OPERATOR_WRITE_NODE:
+      case PM_INSTANCE_VARIABLE_OR_WRITE_NODE: case PM_INSTANCE_VARIABLE_AND_WRITE_NODE:
+      case PM_GLOBAL_VARIABLE_OPERATOR_WRITE_NODE:
+      case PM_GLOBAL_VARIABLE_OR_WRITE_NODE: case PM_GLOBAL_VARIABLE_AND_WRITE_NODE:
+      case PM_CLASS_VARIABLE_OPERATOR_WRITE_NODE:
+      case PM_CLASS_VARIABLE_OR_WRITE_NODE: case PM_CLASS_VARIABLE_AND_WRITE_NODE:
+      case PM_CONSTANT_OPERATOR_WRITE_NODE:
+      case PM_CONSTANT_OR_WRITE_NODE: case PM_CONSTANT_AND_WRITE_NODE:
+      case PM_CONSTANT_PATH_OPERATOR_WRITE_NODE:
+      case PM_CONSTANT_PATH_OR_WRITE_NODE: case PM_CONSTANT_PATH_AND_WRITE_NODE:
+      case PM_INDEX_OPERATOR_WRITE_NODE:
+      case PM_INDEX_OR_WRITE_NODE: case PM_INDEX_AND_WRITE_NODE:
+      case PM_CALL_OPERATOR_WRITE_NODE:
+      case PM_CALL_OR_WRITE_NODE: case PM_CALL_AND_WRITE_NODE:
+        type = "assignment";
+        break;
+      case PM_INSTANCE_VARIABLE_READ_NODE:
+        helper = MRC_SYM_2(defined_ivar_q);
+        arg = ((pm_instance_variable_read_node_t *)cast->value)->name;
+        break;
+      case PM_CONSTANT_READ_NODE:
+        helper = MRC_SYM_2(defined_const_q);
+        arg = ((pm_constant_read_node_t *)cast->value)->name;
+        break;
+      case PM_CONSTANT_PATH_NODE:
+        /* only A::B where A is a plain constant; nested/toplevel/expression
+           parents are left to fall through to nil */
+        {
+          pm_constant_path_node_t *cp = (pm_constant_path_node_t *)cast->value;
+          if (cp->parent && nint(cp->parent) == PM_CONSTANT_READ_NODE) {
+            helper = MRC_SYM_2(defined_const_path_q);
+            arg = ((pm_constant_read_node_t *)cp->parent)->name;
+            arg2 = cp->name;
+          }
+        }
+        break;
+      case PM_GLOBAL_VARIABLE_READ_NODE:
+        helper = MRC_SYM_2(defined_gvar_q);
+        arg = ((pm_global_variable_read_node_t *)cast->value)->name;
+        break;
+      case PM_CLASS_VARIABLE_READ_NODE:
+        helper = MRC_SYM_2(defined_cvar_q);
+        arg = ((pm_class_variable_read_node_t *)cast->value)->name;
+        break;
+      case PM_YIELD_NODE:
+        helper = MRC_SYM_2(defined_yield_q);
+        break;
+      case PM_SUPER_NODE: case PM_FORWARDING_SUPER_NODE:
+        helper = MRC_SYM_2(defined_super_q);
+        break;
+      case PM_CALL_NODE:
+        /* a bare method call on self (no explicit receiver, so no operand to
+           evaluate); a call with a receiver would need to evaluate it */
+        if (((pm_call_node_t *)cast->value)->receiver == NULL) {
+          helper = MRC_SYM_2(defined_method_q);
+          arg = ((pm_call_node_t *)cast->value)->name;
+        }
+        break;
+      default:
+        break;
+      }
       if (val) {
-        genop_1(s, OP_LOADNIL, cursp());
-        push();
+        if (type) {
+          genop_2(s, OP_STRING, cursp(), new_lit_cstr(s, type));
+          push();
+        }
+        else if (helper) {
+          genop_1(s, OP_LOADSELF, cursp());   /* receiver slot for the SSEND */
+          if (arg2 != 0) {          /* A::B: two symbol operands */
+            push();
+            genop_2(s, OP_LOADSYM, cursp(), new_sym(s, arg));
+            push();
+            genop_2(s, OP_LOADSYM, cursp(), new_sym(s, arg2));
+            push(); push();         /* reserve args + block slots (nregs) */
+            pop_n(4);
+            genop_3(s, OP_SSEND, cursp(), new_sym(s, helper), 2);
+          }
+          else if (arg == 0) {      /* yield/super: no symbol operand */
+            push(); push();         /* reserve arg + block slots (nregs) */
+            pop_n(2);
+            genop_2(s, OP_SSEND0, cursp(), new_sym(s, helper));
+          }
+          else {
+            push();
+            genop_2(s, OP_LOADSYM, cursp(), new_sym(s, arg));
+            push(); push();         /* reserve value + block slots (nregs) */
+            pop_n(3);
+            genop_3(s, OP_SSEND, cursp(), new_sym(s, helper), 1);
+          }
+          push();
+        }
+        else {
+          genop_1(s, OP_LOADNIL, cursp());
+          push();
+        }
       }
       break;
     }

@@ -33,9 +33,18 @@
 #define MRUBY_H
 
 #ifdef __cplusplus
+/* Guard against redefinition: the C++ ABI build also defines these on the
+   command line (see mruby-compiler/mrbgem.rake), and some toolchains predefine
+   them, so a bare redefine here trips -Wmacro-redefined. */
+#ifndef __STDC_LIMIT_MACROS
 #define __STDC_LIMIT_MACROS
+#endif
+#ifndef __STDC_CONSTANT_MACROS
 #define __STDC_CONSTANT_MACROS
+#endif
+#ifndef __STDC_FORMAT_MACROS
 #define __STDC_FORMAT_MACROS
+#endif
 #endif
 
 #include <stdarg.h>
@@ -166,7 +175,7 @@ typedef struct {
   uint8_t n:4;                  /* (15=*) c=n|nk<<4 */
   uint8_t nk:4;                 /* (15=*) */
   uint8_t cci;                  /* called from C function */
-  uint8_t vis;                  /* 5(ZERO):1(separate module):2(method visibility) */
+  uint8_t vis;                  /* 4(ZERO):1(module_function):1(separate module):2(method visibility) */
                                 /* under 3-bit flags are copied to env, and after that, env takes precedence */
   mrb_sym mid;
   const struct RProc *proc;
@@ -1466,6 +1475,7 @@ MRB_API mrb_bool mrb_recursive_func_p(mrb_state *mrb, mrb_sym mid, mrb_value obj
 
 MRB_API void mrb_garbage_collect(mrb_state*);
 MRB_API void mrb_full_gc(mrb_state*);
+/* no-op while auto_step is disabled (task-scheduled GC); see src/gc.c */
 MRB_API void mrb_incremental_gc(mrb_state*);
 MRB_API void mrb_gc_mark(mrb_state*,struct RBasic*);
 #define mrb_gc_mark_value(mrb,val) do {\
