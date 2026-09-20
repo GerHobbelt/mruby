@@ -133,6 +133,36 @@ assert('Process.kill with a name that is nothing but the prefix') do
   end
 end
 
+assert('Process.kill with a signal of no signal type') do
+  # What cannot be a signal at all is refused by its class, which Ruby
+  # reports as ArgumentError: the call is not converting the argument, it is
+  # naming the kinds it takes.
+  # Under MRB_NO_FLOAT the literal below is Integer 0, which is a signal
+  # number `kill` takes rather than a class it refuses.
+  if Object.const_defined?(:Float)
+    assert_raise_with_message(ArgumentError, "bad signal type Float") do
+      Process.kill(15.0, Process.pid)
+    end
+  end
+  assert_raise_with_message(ArgumentError, "bad signal type NilClass") do
+    Process.kill(nil, Process.pid)
+  end
+  assert_raise_with_message(ArgumentError, "bad signal type Array") do
+    Process.kill([], Process.pid)
+  end
+
+  # A big integer is an Integer, but not the Integer the signal branch reads,
+  # so it is refused the same way, as CRuby refuses it.  Worked out rather
+  # than written down: a literal this wide would drop the whole file from a
+  # build that cannot parse it.
+  huge = ((2**35) * (2**35) rescue nil)
+  if huge
+    assert_raise_with_message(ArgumentError, "bad signal type Integer") do
+      Process.kill(huge, Process.pid)
+    end
+  end
+end
+
 assert('Process.kill with a signal name holding a NUL') do
   # The name reaches the port as a C string, so a NUL in it would name the
   # part before it.  "TERM\0suffix" must not be a way to spell TERM.
@@ -180,8 +210,15 @@ assert('a pid or a signal number too large for the platform') do
   skip "this build cannot name a number wider than a pid" unless big
 
   assert_raise(RangeError) { Process.kill(0, big) }
-  assert_raise(RangeError) { Process.kill(big, Process.pid) }
   assert_raise(RangeError) { Process.waitpid(big) }
+
+  # As a signal, its size is only what is wrong with it where the build's own
+  # Integer carries it: a build that promoted it to a big integer refuses it
+  # as no signal type instead, tested above.  The builds are told apart by
+  # identity, which every Integer has and no big integer object does.
+  if big.equal?(2**31)
+    assert_raise(RangeError) { Process.kill(big, Process.pid) }
+  end
 end
 
 assert('Process::Status.new') do
@@ -245,14 +282,34 @@ assert('Process::Status#to_s, #inspect') do
   assert_equal "#<Process::Status: pid 1234 exit 0>", st.inspect
 end
 
-assert('Process::Status._signame answers with the name Ruby answers with') do
-  # A host that spells one signal two ways gives both names the same number,
-  # and the table is ordered so that the reverse lookup finds the name Ruby
-  # reports: ABRT rather than IOT, CHLD rather than CLD, IO rather than POLL.
-  aliases = %w[IOT CLD POLL]
-  0.upto(64) do |signo|
-    name = Process::Status._signame(signo)
-    assert_not_include aliases, name if name
+assert('Process::Status#to_s spells a signal out') do
+  # The seam with mruby-signal: a status carries a number, and the name it is
+  # written with is the one Signal.signame answers with.  Each raw value is
+  # checked through the decoding predicates first, so a platform that reads
+  # one differently skips rather than fails on an encoding assumed here.
+  kill = Signal.list["KILL"]
+  st = Process::Status.new(1234, kill)
+  skip "a raw status is not a POSIX wait status on this platform" unless st.signaled?
+  assert_equal "pid 1234 SIGKILL (signal #{kill})", st.to_s
+
+  st = Process::Status.new(1234, kill | 0x80)
+  assert_equal "pid 1234 SIGKILL (signal #{kill}) (core dumped)", st.to_s if st.coredump?
+
+  # A raw stopped status can only be spelled where the platform has STOP to
+  # spell it with.  The skip above already keeps every such platform out, but
+  # asking the table rather than leaning on that keeps this case readable on
+  # its own.
+  stop = Signal.list["STOP"]
+  if stop
+    st = Process::Status.new(1234, (stop << 8) | 0x7f)
+    assert_equal "pid 1234 stopped SIGSTOP (signal #{stop})", st.to_s if st.stopped?
+  end
+
+  # A number this platform gives no name is written as the bare number.
+  unnamed = (1..63).find { |signo| Signal.signame(signo).nil? }
+  if unnamed
+    st = Process::Status.new(1234, unnamed)
+    assert_equal "pid 1234 signal #{unnamed}", st.to_s if st.signaled?
   end
 end
 
@@ -292,7 +349,7 @@ assert('Process.waitpid with Process::WNOHANG') do
   assert_false $?.exited?
   assert_nil $?.exitstatus
   assert_nil $?.success?
-  assert_equal "KILL", Process::Status._signame($?.termsig)
+  assert_equal "KILL", Signal.signame($?.termsig)
   io.close
 end
 
@@ -363,7 +420,7 @@ assert('Process.wait2 with Process::WNOHANG') do
   assert_equal io.pid, pid
   assert_true status.signaled?
   assert_nil status.exitstatus
-  assert_equal "KILL", Process::Status._signame(status.termsig)
+  assert_equal "KILL", Signal.signame(status.termsig)
   io.close
 end
 

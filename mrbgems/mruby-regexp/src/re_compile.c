@@ -51,12 +51,14 @@ typedef struct {
   mrb_bool has_backref;
   mrb_bool needs_backtrack;
   mrb_bool dont_capture;    /* pattern declares a named group: plain (...) does not capture */
-  uint16_t max_backref;     /* the largest `\NN` the pattern refers back to,
-                               checked against the group count once the whole
-                               pattern is read: CRuby takes a reference to a
-                               group written later, `\1(a)`, so the count it
-                               compares with is the pattern's, not the one
-                               standing where the reference is */
+  uint16_t max_backref;     /* the largest group number the pattern refers
+                               back to, whichever of `\NN` and `\k<n>` spelled
+                               it, checked against the group count once the
+                               whole pattern is read: CRuby takes a reference
+                               to a group written later, `\1(a)` and
+                               `\k<1>(a)` alike, so the count it compares with
+                               is the pattern's, not the one standing where
+                               the reference is */
   uint16_t num_groups;      /* groups opened so far, counting the plain ones a
                                named pattern demotes: what decides whether
                                `\NN` is a backreference or an octal escape */
@@ -938,7 +940,7 @@ compile_charclass(re_compiler *c)
 
   mrb_bool first = TRUE;
   while (peek(c) != ']' || first) {
-    if (peek(c) < 0) compile_error(c, "unterminated character class");
+    if (peek(c) < 0) compile_error(c, "premature end of char-class");
     first = FALSE;
 
     /* `&&` takes the intersection of what is written either side of it, which
@@ -974,13 +976,12 @@ compile_charclass(re_compiler *c)
       if (peek(c) == '^') { neg = TRUE; next_char(c); }
       const char *name = c->p;
       while (peek(c) >= 0 && peek(c) != ':' && peek(c) != ']') next_char(c);
-      mrb_bool stopped_at_bracket_end = (peek(c) == ']');
       if (peek(c) == ':' && c->p + 1 < c->src_end && c->p[1] == ']') {
         uint8_t bits[16] = {0};
         mrb_bool by_ascii;
         uint16_t ctype;
         if (!posix_class_bits(bits, name, (size_t)(c->p - name), &by_ascii, &ctype)) {
-          compile_error(c, "invalid POSIX bracket class");
+          compile_error(c, "invalid POSIX bracket type");
         }
         next_char(c);  /* ':' */
         next_char(c);  /* ']' */
@@ -1008,15 +1009,11 @@ compile_charclass(re_compiler *c)
       }
       /* The '[' opened a bracket, so a name that does not close is the
          bracket ending early rather than a literal '[', as it is to CRuby.
-         Which of the two things went wrong depends on where the scan
-         stopped: at a ']' the class does close and only the bracket ended
-         early, and anywhere else (a ':' with nothing after it, or the end of
-         the pattern) the class never closes either, which is the older and
-         more particular complaint of the two. */
+         Where the scan stopped makes no difference to what is said: the
+         complaint is the class's own either way, as it is in CRuby, where
+         /[[:al]/ and /[[:al/ raise the one message between them. */
       c->p = save;
-      compile_error(c, stopped_at_bracket_end
-                    ? "premature end of char-class"
-                    : "unterminated character class");
+      compile_error(c, "premature end of char-class");
     }
 
     /* Shorthand classes (\d, \D, \w, \W, \s, \S, \h, \H) are handled
@@ -1558,6 +1555,15 @@ compile_atom(re_compiler *c)
       const char *cap_name = NULL;
       uint32_t cap_name_len = 0;
 
+      /* `(?` and nothing more: the prefix that names which group this is
+         runs off the end of the pattern. It is reported here because what
+         the parser would otherwise be left with is a `?` standing where no
+         atom is, which compile_seq() reads as a quantifier with nothing to
+         repeat. */
+      if (peek(c) == '?' && c->p + 1 >= c->src_end) {
+        compile_error(c, "end pattern in group");
+      }
+
       if (peek(c) == '?' && c->p + 1 < c->src_end) {
         if (c->p[1] == ':') {
           next_char(c); next_char(c);  /* skip ?: */
@@ -1570,7 +1576,7 @@ compile_atom(re_compiler *c)
           uint32_t la_pos = emit(c, negative ? RE_NEG_LOOKAHEAD : RE_LOOKAHEAD, 0, 0);
           compile_look_body(c, negative);
           c->pat->code[la_pos].offset = (uint16_t)c->code_len;  /* patch: skip past sub-pattern */
-          if (peek(c) != ')') compile_error(c, "unmatched '('");
+          if (peek(c) != ')') compile_error(c, "end pattern with unmatched parenthesis");
           next_char(c);
           c->needs_backtrack = TRUE;  /* needs backtracking engine */
           c->flags = saved_flags;
@@ -1599,7 +1605,7 @@ compile_atom(re_compiler *c)
           /* the character count never exceeds the byte count, so it fits */
           c->pat->code[lb_pos + 1].a = (uint8_t)fixed_chars;
 
-          if (peek(c) != ')') compile_error(c, "unmatched '('");
+          if (peek(c) != ')') compile_error(c, "end pattern with unmatched parenthesis");
           next_char(c);
           c->needs_backtrack = TRUE;  /* needs backtracking engine */
           c->flags = saved_flags;
@@ -1623,7 +1629,7 @@ compile_atom(re_compiler *c)
           emit(c, RE_ATOMIC, 0, cut);
           compile_alt(c);
           emit(c, RE_ATOMIC_END, 0, cut);
-          if (peek(c) != ')') compile_error(c, "unmatched '('");
+          if (peek(c) != ')') compile_error(c, "end pattern with unmatched parenthesis");
           next_char(c);
           c->needs_backtrack = TRUE;  /* the Pike VM cannot cut a thread */
           c->flags = saved_flags;
@@ -1703,18 +1709,20 @@ compile_atom(re_compiler *c)
             c->flags = new_flags;
             compile_alt(c);
             c->flags = saved_flags;
-            if (peek(c) != ')') compile_error(c, "unmatched '('");
+            if (peek(c) != ')') compile_error(c, "end pattern with unmatched parenthesis");
             next_char(c);
             return TRUE;
           }
           else {
+            if (peek(c) < 0) compile_error(c, "end pattern in group");
             compile_error(c, "undefined (?...) sequence");
           }
         }
         else if (c->p[1] == '#') {
           /* preprocess_pattern() removes a terminated comment group before
-             the parser runs, so one reaching here was never closed. */
-          compile_error(c, "unterminated comment group");
+             the parser runs, so one reaching here was never closed, which
+             is the pattern ending inside the prefix like any other. */
+          compile_error(c, "end pattern in group");
         }
         else {
           /* (?X) with an unsupported X: not one of the recognized (?: (?= (?!
@@ -1724,6 +1732,14 @@ compile_atom(re_compiler *c)
              conditionals (?(...)) are not implemented. Raise here rather
              than falling through to the capturing-group path, which would
              leave the stray `?` for compile_seq to spin on forever (A1). */
+          if (c->p[1] == '<') {
+            /* `(?<` and nothing more, the only way a '<' reaches here: the
+               pattern ends before the character that tells a lookbehind
+               from a named group. CRuby answers for the group that never
+               closes rather than for the prefix, which either reading
+               leaves open. */
+            compile_error(c, "end pattern with unmatched parenthesis");
+          }
           compile_error(c, "undefined (?...) sequence");
         }
       }
@@ -1758,7 +1774,7 @@ compile_atom(re_compiler *c)
 
       compile_alt(c);
 
-      if (peek(c) != ')') compile_error(c, "unmatched '('");
+      if (peek(c) != ')') compile_error(c, "end pattern with unmatched parenthesis");
       next_char(c);
 
       if (capturing) {
@@ -1884,8 +1900,39 @@ compile_atom(re_compiler *c)
       }
       if (peek(c) != close) compile_error(c, "unterminated backreference name");
       if (c->p == name) compile_error(c, "group name is empty");
-      if (!RE_NAME_LEN_FITS(c->p - name)) compile_error(c, "group name too long");
       uint32_t name_len = (uint32_t)(c->p - name);
+
+      /* A `+` or `-` past the first byte ends a \k name and opens a nest
+         level: `\k<name+n>` reads the group as the enclosing recursion left
+         it n levels up, which is a feature of the subexpression calls this
+         engine refuses (see `\g` below), so the reference is refused with it.
+         The first byte is exempt because that is where the relative form's
+         sign stands: `\k<-1>` is the group one back, and `\k<-1-1>` is that
+         group at a level. Reading the sign as part of the name instead let a
+         reference reach a group CRuby's own numbering puts out of reach, since
+         a definition takes the sign into the name where a reference never
+         does: `(?<a-1>x)\k<a-1>` matched here and is `undefined name <a>`
+         there. Only digits stand behind the sign, so a level CRuby itself
+         refuses is a malformed name here as it is there, `\k<a+>` and
+         `\k<a+1x>` reaching the message the rest of this arm gives one. The
+         name is quoted as it was read; CRuby quotes it to the end of the
+         pattern instead, the way it does for every name its own scan ended.
+         The whole check comes before the length one below because the sign is
+         where the name ends, so a name long enough to fail that one is a
+         level first. */
+      uint32_t sign = 1;
+      while (sign < name_len && name[sign] != '+' && name[sign] != '-') sign++;
+      if (sign < name_len) {
+        mrb_bool numeric = (sign + 1 < name_len);
+        for (uint32_t i = sign + 1; numeric && i < name_len; i++) {
+          if (name[i] < '0' || name[i] > '9') numeric = FALSE;
+        }
+        if (numeric) compile_error(c, "backreference with nest level is not supported");
+        compile_error_str(c, mrb_format(c->mrb, "invalid group name <%l>",
+                                        name, (size_t)name_len));
+      }
+
+      if (!RE_NAME_LEN_FITS(name_len)) compile_error(c, "group name too long");
       next_char(c);  /* skip the closing > or ' */
 
       int group = -1;
@@ -1916,17 +1963,43 @@ compile_atom(re_compiler *c)
                                           name, (size_t)name_len));
         }
 
+        if (relative) {
+          /* `\k<-n>` counts back from where it stands, so the groups it can
+             name are the ones already open; Onigmo resolves it the same way
+             (BACKREF_REL_TO_ABS) and refuses a relative forward reference.
+             The count is `num_groups` rather than `num_captures` because the
+             groups a named pattern demotes still count here, as they do
+             everywhere else the parse numbers a group; where nothing is
+             demoted the two agree, `num_groups` standing one below
+             `num_captures`, which counts group 0. The resolution comes before
+             the refusal below because CRuby reaches that refusal only once
+             the reference has resolved to a group the pattern has:
+             `(?<n>a)\k<-1>` is refused for being numbered, `(?<n>a)\k<-2>`
+             is out of range instead. */
+          group = (int)c->num_groups + 1 - n;
+          if (group < 1) compile_error(c, "invalid backref number/name");
+        }
+
         /* CRuby rejects a numbered backreference in a named pattern whatever
            its spelling, and it has to be rejected here too: once plain groups
-           stop consuming numbers, both the absolute bound and the relative
-           form's `num_captures - n` below would silently resolve to a
-           different group instead of erroring. */
+           stop consuming numbers, the check after the parse, which counts the
+           demoted groups, would silently accept a number naming a group that
+           no longer carries it. */
         if (c->dont_capture) {
           compile_error(c, "numbered backref/call is not allowed. (use name)");
         }
-        group = relative ? (int)c->num_captures - n : n;
-        if (group < 1 || group >= (int)c->num_captures) {
-          compile_error(c, "invalid backref number/name");
+
+        if (!relative) {
+          /* The absolute form may name a group written later, `\k<1>(a)`
+             being as valid in CRuby as `\1(a)` is, so the number is only
+             recorded here and mrb_re_compile() checks it against the
+             pattern's group count once the parse is done. A number above
+             RE_MAX_CAPTURES names no group whatever the pattern goes on to
+             open, and is kept at that bound so the check still refuses it
+             while the number stays one a group field can hold. */
+          if (n > RE_MAX_CAPTURES) n = RE_MAX_CAPTURES;
+          if (n > (int)c->max_backref) c->max_backref = (uint16_t)n;
+          group = n;
         }
       }
       else {
@@ -2905,12 +2978,14 @@ mrb_re_compile(mrb_state *mrb, mrb_regexp_pattern *pat,
   compile_alt(&c);
 
   if (c.p < c.src_end) {
-    compile_error(&c, "unmatched ')'");
+    compile_error(&c, "unmatched close parenthesis");
   }
 
-  /* A `\NN` names a group the pattern does not have. The count is taken here
-     rather than where the reference stands because a reference may be written
-     before the group it names, `\1(a)` being valid in CRuby. */
+  /* A backreference names a group the pattern does not have. The count is
+     taken here rather than where the reference stands because a reference may
+     be written before the group it names, `\1(a)` being valid in CRuby, and
+     it is taken once for both spellings so `\1` and `\k<1>` agree on which
+     references a pattern accepts. */
   if (c.max_backref > c.num_groups) {
     compile_error(&c, "invalid backref number/name");
   }

@@ -16,6 +16,7 @@
 #include <mruby/variable.h>
 #include "process_hal.h"
 #include "process_internal.h"
+#include "signal_hal.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -58,8 +59,8 @@ mrb_process_int_arg(mrb_state *mrb, mrb_int v, const char *what)
  * Read a signal argument into a number.
  *
  * Ruby lets a signal be an Integer, or a name as a String or Symbol, with or
- * without the "SIG" prefix.  Deciding that much is common-layer work; which
- * number a name stands for is the port's.
+ * without the "SIG" prefix.  Deciding that much is this gem's work; which
+ * number a name stands for is mruby-signal's, through the signal HAL.
  */
 static mrb_int
 signal_to_number(mrb_state *mrb, mrb_value sig)
@@ -67,13 +68,6 @@ signal_to_number(mrb_state *mrb, mrb_value sig)
   const char *name;
   mrb_int len, signo;
   char bare[32];
-
-  /* A bigint is an Integer that no signal number can be, and `mrb_integer_p`
-     is false for one, so it has to be turned away before the branches below
-     read it as a name and report it as the wrong type. */
-  if (mrb_bigint_p(sig)) {
-    mrb_raisef(mrb, E_RANGE_ERROR, "signal number out of range: %v", sig);
-  }
 
   if (mrb_integer_p(sig)) {
     signo = mrb_integer(sig);
@@ -86,10 +80,16 @@ signal_to_number(mrb_state *mrb, mrb_value sig)
   if (mrb_symbol_p(sig)) {
     name = mrb_sym_name_len(mrb, mrb_symbol(sig), &len);
   }
-  else {
-    sig = mrb_ensure_string_type(mrb, sig);
+  else if (mrb_string_p(sig)) {
     name = RSTRING_PTR(sig);
     len = RSTRING_LEN(sig);
+  }
+  else {
+    /* Anything else is refused by its class, as Ruby reports it.  A bigint
+       lands here too: it is an Integer that no signal number can be, and
+       `mrb_integer_p` is false for one, which is also how CRuby comes to
+       report a value like 2**70 by class rather than by size. */
+    mrb_raisef(mrb, E_ARGUMENT_ERROR, "bad signal type %C", mrb_obj_class(mrb, sig));
   }
   if (name == NULL) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "bad signal name");
@@ -123,7 +123,7 @@ signal_to_number(mrb_state *mrb, mrb_value sig)
   memcpy(bare, name, (size_t)len);
   bare[len] = '\0';
 
-  if (mrb_hal_process_signal_number(mrb, bare, &signo) != 0) {
+  if (mrb_hal_signal_number(mrb, bare, &signo) != 0) {
     mrb_raisef(mrb, E_ARGUMENT_ERROR, "unsupported signal 'SIG%s'", bare);
   }
   return signo;
@@ -184,8 +184,9 @@ process_ppid(mrb_state *mrb, mrb_value self)
  * Naming a process group through the signal instead, which is a negative
  * signal number or a name written with a leading "-" and asks for the group
  * of each +pid+ given, is not supported yet and raises ArgumentError.  A
- * signal number or a pid too large for the platform to carry raises
- * RangeError.
+ * signal of any other class, a big integer included, raises ArgumentError
+ * naming that class.  A signal number or a pid too large for the platform
+ * to carry raises RangeError.
  */
 static mrb_value
 process_kill(mrb_state *mrb, mrb_value self)

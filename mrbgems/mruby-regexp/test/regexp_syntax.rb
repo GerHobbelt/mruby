@@ -4,6 +4,18 @@ assert("Regexp - character class") do
   assert_equal "abc", md[0]
 end
 
+assert("Regexp - a class the pattern ends inside says which it was") do
+  # A class no ']' closes is `premature end of char-class` in CRuby, whatever
+  # stands unfinished inside it: a member, a range, or a POSIX bracket that
+  # ends early enough to leave the class open as well.
+  ["[", "[a", "[a-", "[^a", "[[:alpha", "[[:alpha:", "[[:alpha:]",
+   "[a[:alpha:]", "[[:word:]x"].each do |src|
+    assert_raise_with_message(RegexpError, "premature end of char-class: /#{src}/", src) do
+      Regexp.new(src)
+    end
+  end
+end
+
 assert("Regexp - reversed character class range") do
   # A range written backwards holds nothing. It used to compile to a class
   # that silently lacked the span, or in the negated form admitted every
@@ -40,8 +52,15 @@ assert("Regexp - POSIX bracket classes") do
   # negated forms
   assert_equal "abc", "abc123".match(/[[:^digit:]]+/)[0]
   assert_equal "x", " x".match(/[^[:space:]]/)[0]
-  # an unknown class name is an error
-  assert_raise(RegexpError) { Regexp.new("[[:bogus:]]") }
+  # an unknown class name is an error, named as CRuby names it
+  assert_raise_with_message(RegexpError,
+                            "invalid POSIX bracket type: /[[:bogus:]]/") do
+    Regexp.new("[[:bogus:]]")
+  end
+  assert_raise_with_message(RegexpError,
+                            "invalid POSIX bracket type: /[[:^bogus:]]/") do
+    Regexp.new("[[:^bogus:]]")
+  end
   # The name length used to be truncated with a (uint16_t) cast, so a name
   # 65536 bytes longer than "alpha" compared equal to "alpha" and compiled
   # as [[:alpha:]] instead of raising.
@@ -930,6 +949,12 @@ assert("Regexp - a backreference names a group the pattern has") do
   assert_raise(RegexpError) { Regexp.new("(a)\\2") }
   assert_raise(RegexpError) { Regexp.new("(a)(b)\\3") }
   assert_raise(RegexpError) { Regexp.new("\\9") }
+  # Both spellings ask the same count, so both refuse the same references.
+  assert_raise(RegexpError) { Regexp.new("\\k<1>") }
+  assert_raise(RegexpError) { Regexp.new("(a)\\k<2>") }
+  assert_raise(RegexpError) { Regexp.new("(a)(b)\\k<3>") }
+  # A number above the capture limit names no group whatever follows it.
+  assert_raise(RegexpError) { Regexp.new("\\k<32>(a)") }
   # A named pattern refuses a numbered reference before it counts.
   assert_raise(RegexpError) { Regexp.new("(?<n>a)\\1") }
   assert_raise(RegexpError) { Regexp.new("(?<n>a)\\2") }
@@ -943,6 +968,25 @@ assert("Regexp - a backreference reaches a group written after it") do
   assert_equal ["aa", "a"], /(a)\1/.match("aa").to_a
   assert_nil(/\1(a)/ =~ "a")
   assert_equal 0, Regexp.new("(a)" * 9 + "\\9") =~ "aaaaaaaaaa"
+
+  # The `\k<n>` spelling of the same reference reaches the same group: it used
+  # to be checked where it stood while `\1` was checked after the parse, so
+  # the two spellings of one forward reference disagreed.
+  assert_nil(Regexp.new("\\k<1>(a)") =~ "a")
+  assert_equal ["aa", "a"], Regexp.new("(a)\\k<1>").match("aa").to_a
+  assert_nil(Regexp.new("\\k<2>(a)(b)") =~ "ab")
+  assert_nil(Regexp.new("(a)\\k<2>(b)") =~ "ab")
+
+  # What the forward reference is for: the group has captured by the second
+  # iteration, so the reference matches there.
+  assert_equal ["aa", "a"], Regexp.new("(?:\\1|(a))+").match("aa").to_a
+  assert_equal ["cc", "c"], Regexp.new("(?:\\k<1>|(c))+").match("cc").to_a
+
+  # The relative form stays as it was: `\k<-n>` counts back from where it
+  # stands, so it names one of the groups already open and never a later one.
+  assert_equal "abba", "abba".match(Regexp.new("(.)(.)\\k<-1>\\k<-2>"))[0]
+  assert_raise(RegexpError) { Regexp.new("\\k<-1>(a)") }
+  assert_raise(RegexpError) { Regexp.new("(?:\\k<-1>|(c))+") }
 end
 
 assert("Regexp - patterns that used to hang the compiler now raise (A1)") do
@@ -1110,7 +1154,7 @@ assert("Regexp - comment groups (?#...)") do
   assert_raise(RegexpError) { Regexp.new("x(?#a(?#b))y") }
 
   # An unterminated group raises rather than swallowing the rest.
-  assert_raise_with_message(RegexpError, "unterminated comment group: /a(?#note/") do
+  assert_raise_with_message(RegexpError, "end pattern in group: /a(?#note/") do
     Regexp.new("a(?#note")
   end
 
@@ -1149,10 +1193,10 @@ assert("Regexp extended mode (x flag)") do
 
   # a bracket the pattern truncates leaves the scan with nothing after the
   # name, and the class is still the parser's error to report
-  assert_raise_with_message(RegexpError, "unterminated character class: /[[:alpha/x") do
+  assert_raise_with_message(RegexpError, "premature end of char-class: /[[:alpha/x") do
     Regexp.new("[[:alpha", Regexp::EXTENDED)
   end
-  assert_raise_with_message(RegexpError, "unterminated character class: /[[:alpha:/x") do
+  assert_raise_with_message(RegexpError, "premature end of char-class: /[[:alpha:/x") do
     Regexp.new("[[:alpha:", Regexp::EXTENDED)
   end
 
@@ -1176,7 +1220,7 @@ assert("Regexp extended mode (x flag)") do
   assert_nil Regexp.new('\x1 2', Regexp::EXTENDED) =~ "\x12"
   assert_equal 0, (Regexp.new('\x1 a', Regexp::EXTENDED) =~ "\x01a")
   assert_equal 0, (Regexp.new('\01 2', Regexp::EXTENDED) =~ "\x012")
-  assert_raise_with_message(RegexpError, "unmatched '(': /\\x1 2(/x") do
+  assert_raise_with_message(RegexpError, "end pattern with unmatched parenthesis: /\\x1 2(/x") do
     Regexp.new('\x1 2(', Regexp::EXTENDED)
   end
 
@@ -1188,7 +1232,7 @@ assert("Regexp extended mode (x flag)") do
   re = Regexp.new("a (?#note) b # tail\nc", Regexp::EXTENDED)
   assert_true re.match?("abc")
 
-  assert_raise_with_message(RegexpError, "unterminated comment group: /a (?#note/x") do
+  assert_raise_with_message(RegexpError, "end pattern in group: /a (?#note/x") do
     Regexp.new("a (?#note", Regexp::EXTENDED)
   end
 
@@ -1199,10 +1243,10 @@ assert("Regexp extended mode (x flag)") do
   assert_equal "(?x-mi:abc)", Regexp.new("abc", Regexp::EXTENDED).to_s
 
   # errors quote the pattern as written, not the text with the comment removed
-  assert_raise_with_message(RegexpError, "unterminated character class: /a # c\n[/x") do
+  assert_raise_with_message(RegexpError, "premature end of char-class: /a # c\n[/x") do
     Regexp.new("a # c\n[", Regexp::EXTENDED)
   end
-  assert_raise_with_message(RegexpError, "unmatched '(': /a b(/x") do
+  assert_raise_with_message(RegexpError, "end pattern with unmatched parenthesis: /a b(/x") do
     Regexp.new("a b(", Regexp::EXTENDED)
   end
 
@@ -1211,15 +1255,15 @@ assert("Regexp extended mode (x flag)") do
   # error is raised: turning /x off inline still reports the entry's /x,
   # and turning it on where entry carried none reports no suffix at all.
   # CRuby matches this on both patterns.
-  assert_raise_with_message(RegexpError, "unterminated character class: /(?-x)a # c[/x") do
+  assert_raise_with_message(RegexpError, "premature end of char-class: /(?-x)a # c[/x") do
     Regexp.new("(?-x)a # c[", Regexp::EXTENDED)
   end
-  assert_raise_with_message(RegexpError, "unterminated character class: /(?x)a # c\n[/") do
+  assert_raise_with_message(RegexpError, "premature end of char-class: /(?x)a # c\n[/") do
     Regexp.new("(?x)a # c\n[")
   end
 
   # Multiple entry flags are named in Regexp#to_s/#inspect's m, i, x order.
-  assert_raise_with_message(RegexpError, "unterminated character class: /[a/ix") do
+  assert_raise_with_message(RegexpError, "premature end of char-class: /[a/ix") do
     Regexp.new("[a", Regexp::EXTENDED | Regexp::IGNORECASE)
   end
 end
@@ -1464,6 +1508,57 @@ assert("Regexp - word boundary") do
   assert_nil /\bcat\b/.match("concatenate")
 end
 
+assert("Regexp - a group the pattern ends inside says which it was") do
+  # A group no ')' closes is `end pattern with unmatched parenthesis` in
+  # CRuby, whichever of the (?...) forms opened it, and the plain one as
+  # well.
+  ["(", "(a", "(?:a", "(?=a", "(?!a", "(?<=a", "(?<!a", "(?>a", "(?i:a",
+   "(?<a>x", "(?'a'x"].each do |src|
+    assert_raise_with_message(RegexpError,
+                              "end pattern with unmatched parenthesis: /#{src}/",
+                              src) do
+      Regexp.new(src)
+    end
+  end
+end
+
+assert("Regexp - a ')' that closes no group says which it was") do
+  # The counterpart of the group that never closes: a ')' with no group
+  # open is `unmatched close parenthesis` in CRuby. A comment group does
+  # not nest, so the second ')' of (?#a(?#b)) is one of these.
+  [")", "a)", "(a))", "(?#a(?#b))"].each do |src|
+    assert_raise_with_message(RegexpError,
+                              "unmatched close parenthesis: /#{src}/", src) do
+      Regexp.new(src)
+    end
+  end
+end
+
+assert("Regexp - a (?...) prefix the pattern ends inside says which it was") do
+  # `(?` opens a group the characters after it name. A pattern that ends
+  # before they do is `end pattern in group` in CRuby, whether what stands
+  # there is nothing at all, an option letter, or a comment group.
+  ["(?", "(?i", "(?im", "(?i-", "(?-", "(?#", "(?#note"].each do |src|
+    assert_raise_with_message(RegexpError, "end pattern in group: /#{src}/", src) do
+      Regexp.new(src)
+    end
+  end
+  # A character that names no group is that failure rather than this one,
+  # whether or not the pattern goes on.
+  ["(?z", "(?z)"].each do |src|
+    assert_raise_with_message(RegexpError, "undefined (?...) sequence: /#{src}/", src) do
+      Regexp.new(src)
+    end
+  end
+  # `(?<` is the prefix CRuby answers for with the group instead: it ends
+  # before the character that tells a lookbehind from a named group, and
+  # both of those are a group that never closes.
+  assert_raise_with_message(RegexpError,
+                            "end pattern with unmatched parenthesis: /(?</") do
+    Regexp.new("(?<")
+  end
+end
+
 assert("Regexp - non-capturing group") do
   md = /(?:a)(b)/.match("ab")
   assert_equal "ab", md[0]
@@ -1627,7 +1722,7 @@ assert("Regexp - a named group makes plain groups non-capturing") do
 
   # the scan runs on every pattern, so a truncated POSIX bracket reaches
   # skip_posix_bracket() without /x too, and is still the parser's error
-  assert_raise_with_message(RegexpError, "unterminated character class: /[[:alpha/") do
+  assert_raise_with_message(RegexpError, "premature end of char-class: /[[:alpha/") do
     Regexp.new("[[:alpha")
   end
 end
@@ -1929,6 +2024,12 @@ assert("Regexp - a \\k reference names a group the pattern has") do
   assert_raise_with_message(RegexpError, "#{msg}: /(a)(?<b>b)\\k<-1>/") do
     Regexp.new("(a)(?<b>b)\\k<-1>")
   end
+  # the relative form resolves against every group the pattern has opened, the
+  # plain ones it demotes included, so this one names group 1 and is refused
+  # for being numbered rather than for naming no group
+  assert_raise_with_message(RegexpError, "#{msg}: /(a)(?<b>b)\\k<-2>/") do
+    Regexp.new("(a)(?<b>b)\\k<-2>")
+  end
   assert_raise(RegexpError) { Regexp.new("(?<b>b)\\k'1'") }
 end
 
@@ -2008,6 +2109,10 @@ assert("Regexp - \\k group reference errors say which failure it was") do
   assert_raise_with_message(RegexpError, "#{msg}: /(a)(b)\\k<-3>/") do
     Regexp.new("(a)(b)\\k<-3>")
   end
+  # a pattern that has opened no group at all
+  assert_raise_with_message(RegexpError, "#{msg}: /\\k<-1>/") do
+    Regexp.new("\\k<-1>")
+  end
 
   # a name no group carries
   assert_raise_with_message(RegexpError,
@@ -2041,6 +2146,16 @@ assert("Regexp - \\k group reference errors say which failure it was") do
                             "numbered backref/call is not allowed. (use name): /(a)(?<b>b)\\k<5>/") do
     Regexp.new("(a)(?<b>b)\\k<5>")
   end
+  # the relative form is resolved before that refusal, so one past the groups
+  # the pattern has is out of range where an absolute one is refused: where an
+  # absolute reference points is only settled once the parse is done, and a
+  # relative one is settled where it stands
+  assert_raise_with_message(RegexpError, "#{msg}: /(?<b>b)\\k<-2>/") do
+    Regexp.new("(?<b>b)\\k<-2>")
+  end
+  assert_raise_with_message(RegexpError, "#{msg}: /(a)(?<b>b)\\k<-3>/") do
+    Regexp.new("(a)(?<b>b)\\k<-3>")
+  end
 
   # The name is a length-counted slice of the pattern, so a name holding a NUL
   # is quoted whole. CRuby builds these messages through a C string and stops
@@ -2062,6 +2177,77 @@ assert("Regexp - a \\k reference reads leading zeros as digits") do
   # what says the name resolved.
   assert_equal "aa", "aa".match(Regexp.new("(a)\\k<01>"))[0]
   assert_equal "aa", "aa".match(Regexp.new("(a)\\k<-01>"))[0]
+end
+
+assert("Regexp - a nest level on a \\k reference is refused") do
+  need_backtracking_stack
+  # `\k<name+n>` reads the group as the enclosing recursion left it n levels
+  # up, which goes with the `\g` subexpression call this engine refuses. Taking
+  # the sign into the name made each a name no group carried, so
+  # /(?<a>c)\k<a+0>/ raised `undefined name <a+0> reference` where CRuby
+  # matched "cc".
+  msg = "backreference with nest level is not supported"
+  assert_raise_with_message(RegexpError, "#{msg}: /(?<a>c)\\k<a+0>/") do
+    Regexp.new("(?<a>c)\\k<a+0>")
+  end
+  ["(?<a>c)\\k<a-1>", "(?<a>c)\\k'a+0'", "(c)\\k<1+0>", "(c)\\k<1-1>",
+   "(?<a>c)\\k<a+007>"].each do |src|
+    assert_raise(RegexpError, src) { Regexp.new(src) }
+  end
+
+  # The first byte is exempt: that is where the relative form's sign stands,
+  # and the level of a relative reference comes after its digits
+  assert_equal "aa", "aa".match(Regexp.new("(a)\\k<-1>"))[0]
+  assert_raise_with_message(RegexpError, "#{msg}: /(a)\\k<-1-1>/") do
+    Regexp.new("(a)\\k<-1-1>")
+  end
+
+  # A definition takes the sign into the name where a reference never does, so
+  # a group whose name holds one is out of every reference's reach, here as in
+  # CRuby. Reading it as a name let /(?<a-1>c)\k<a-1>/ match where CRuby
+  # raised.
+  assert_equal "a-1", Regexp.new("(?<a-1>c)").names[0]
+  assert_raise_with_message(RegexpError, "#{msg}: /(?<a-1>c)\\k<a-1>/") do
+    Regexp.new("(?<a-1>c)\\k<a-1>")
+  end
+
+  # Only digits stand behind the sign, so a level CRuby itself refuses is a
+  # malformed name here as it is there. The name is quoted as it was read,
+  # where CRuby quotes it to the end of the pattern.
+  bad = "invalid group name"
+  assert_raise_with_message(RegexpError,
+                            "#{bad} <a-b>: /(?<a-b>c)\\k<a-b>/") do
+    Regexp.new("(?<a-b>c)\\k<a-b>")
+  end
+  assert_raise_with_message(RegexpError,
+                            "#{bad} <a+>: /(?<a>c)\\k<a+>x/") do
+    Regexp.new("(?<a>c)\\k<a+>x")
+  end
+  assert_raise_with_message(RegexpError,
+                            "#{bad} <a+0+0>: /(?<a>c)\\k<a+0+0>/") do
+    Regexp.new("(?<a>c)\\k<a+0+0>")
+  end
+  # quoted in <> whichever delimiter wrote it, as the rest of this arm is
+  assert_raise_with_message(RegexpError,
+                            "#{bad} <a+>: /(?<a>c)\\k'a+'/") do
+    Regexp.new("(?<a>c)\\k'a+'")
+  end
+
+  # A `)` still ends the name first, whichever side of the sign it falls
+  assert_raise_with_message(RegexpError,
+                            "invalid group name <a)b+0>>: /(?<a>c)\\k<a)b+0>/") do
+    Regexp.new("(?<a>c)\\k<a)b+0>")
+  end
+  assert_raise_with_message(RegexpError,
+                            "invalid group name <a+0)>>: /(?<a>c)\\k<a+0)>/") do
+    Regexp.new("(?<a>c)\\k<a+0)>")
+  end
+
+  # An unterminated name is still that, and not a level with nothing behind it
+  assert_raise_with_message(RegexpError,
+                            "unterminated backreference name: /(?<a>c)\\k<a+/") do
+    Regexp.new("(?<a>c)\\k<a+")
+  end
 end
 
 assert("Regexp - a group name may not be a number") do
