@@ -223,20 +223,37 @@ module Enumerable
   def max(&block)
     flag = true  # 1st element?
     result = nil
-    self.each {|*val|
-      val = val.__svalue
-      if flag
-        # 1st element
-        result = val
-        flag = false
-      else
-        if block
-          result = val if yield(val, result) > 0
+    # The block is asked for out here rather than once an element: what the
+    # loop does with a pair is the same either way, and the test is worth more
+    # outside the loop than the second copy of the body costs.
+    if block
+      self.each {|*val|
+        val = val.__svalue
+        if flag
+          # 1st element
+          result = val
+          flag = false
         else
-          result = val if (val <=> result) > 0
+          cmp = yield(val, result)
+          # A comparison with no answer is not an ordering: without this the
+          # line below would ask nil whether it is positive.
+          raise ArgumentError, "comparison of #{val.class} with #{result.class} failed" if cmp.nil?
+          result = val if cmp > 0
         end
-      end
-    }
+      }
+    else
+      self.each {|*val|
+        val = val.__svalue
+        if flag
+          result = val
+          flag = false
+        else
+          cmp = (val <=> result)
+          raise ArgumentError, "comparison of #{val.class} with #{result.class} failed" if cmp.nil?
+          result = val if cmp > 0
+        end
+      }
+    end
     result
   end
 
@@ -250,20 +267,33 @@ module Enumerable
   def min(&block)
     flag = true  # 1st element?
     result = nil
-    self.each {|*val|
-      val = val.__svalue
-      if flag
-        # 1st element
-        result = val
-        flag = false
-      else
-        if block
-          result = val if yield(val, result) < 0
+    # see `max` above for why the block is asked for out here
+    if block
+      self.each {|*val|
+        val = val.__svalue
+        if flag
+          # 1st element
+          result = val
+          flag = false
         else
-          result = val if (val <=> result) < 0
+          cmp = yield(val, result)
+          raise ArgumentError, "comparison of #{val.class} with #{result.class} failed" if cmp.nil?
+          result = val if cmp < 0
         end
-      end
-    }
+      }
+    else
+      self.each {|*val|
+        val = val.__svalue
+        if flag
+          result = val
+          flag = false
+        else
+          cmp = (val <=> result)
+          raise ArgumentError, "comparison of #{val.class} with #{result.class} failed" if cmp.nil?
+          result = val if cmp < 0
+        end
+      }
+    end
     result
   end
 

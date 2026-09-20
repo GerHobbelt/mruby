@@ -124,6 +124,112 @@ assert('Float#==', '15.2.9.3.7') do
   assert_false 3.1 == 3.2
 end
 
+assert('a NaN is equal to nothing at all, itself included') do
+  # `==` answers by value, and a NaN has no value: it is equal to no Float,
+  # its own operand included.
+  #
+  # `Float#==` said so all along. What answered true was the shortcut before
+  # it, which takes two values that hold the same thing for the same object
+  # and an object for equal to itself. How much of a Float an `mrb_value`
+  # holds is what boxing decides, so the shortcut used to answer this pair in
+  # a boxed build and leave it to `Float#==` under `MRB_NO_BOXING`: the same
+  # expression answered true or false depending on how the build stores a
+  # Float.
+  #
+  # `equal?` is left out below because it is not equality: it is the one
+  # caller of the shortcut that asks for exactly what the shortcut reads.
+  # What it answers is pinned below, in every boxing.
+  nan = Float::NAN
+
+  assert_false(nan == nan)
+  assert_true(nan != nan)
+  assert_false((0.0 / 0.0) == (0.0 / 0.0))
+  assert_false(nan == 0.0 / 0.0)
+  assert_false(nan.__send__(:==, nan))
+  assert_false(nan.eql?(nan))
+  assert_false(nan === nan)                       # case equality is `==` here
+  assert_equal(:miss, case nan when nan then :hit else :miss end)
+
+  # every other pair answers as it did
+  assert_true(1.0 == 1.0)
+  assert_true(1.0 === 1.0)
+  assert_true(0.0 == -0.0)
+  assert_true(Float::INFINITY == Float::INFINITY)
+  assert_equal(:hit, case 1.0 when 1.0 then :hit else :miss end)
+end
+
+assert('a Float is the object that holds what it holds') do
+  # `equal?` asks what a value holds rather than what it is equal to, and what
+  # a Float holds is compared bit for bit. A -0.0 holds what a 0.0 does not, so
+  # the two are two objects; the boxed builds answered that all along, reading
+  # the representation, and `MRB_NO_BOXING` used to read the number instead and
+  # answer the other way. Equal is what they still are.
+  #
+  # The two below are built at run time from a variable so that nothing folds
+  # them into a single literal.
+  z = [0.0][0]
+  pzero = z + 0.0
+  nzero = z * -1.0
+
+  assert_true(pzero.equal?(pzero))
+  assert_false(pzero.equal?(nzero))
+  assert_true(pzero == nzero)
+
+  # A NaN holds what it holds as well, so it is the same object as itself
+  # however far it is passed around, which reading the number could not say:
+  # a NaN is equal to nothing at all, its own operand included.
+  nan = z / z
+  same = nan
+  assert_true(nan.equal?(nan))
+  assert_true(nan.equal?(same))
+  assert_false(nan == nan)
+end
+
+assert('a NaN is the object it is and no other') do
+  # A NaN is equal to no value, its own included, so `==` can never find one.
+  # A container searching for the NaN it holds has nothing but the object to go
+  # by, so every NaN made is one of its own: two NaNs made apart are two
+  # objects, and one copied around stays one.
+  #
+  # The two below are built at run time from a variable so that nothing folds
+  # them into a single literal, and every answer here is the same whichever
+  # boxing the build uses, which is what a NaN having an identity is for.
+  z = [0.0][0]
+  a = z / z
+  b = z / z
+  c = a
+
+  assert_predicate(a, :nan?)
+  assert_predicate(b, :nan?)
+
+  assert_true(a.equal?(a))
+  assert_true(a.equal?(c))          # the same object, passed around
+  assert_false(a.equal?(b))         # two NaNs, made apart
+  assert_false(a.equal?(Float::NAN))
+
+  # `object_id` names what `equal?` compares, so the two answer alike. Where a
+  # NaN is a heap object its id comes off the object, the bits every NaN holds
+  # being the same ones.
+  assert_equal(a.object_id, c.object_id)
+  assert_not_equal(a.object_id, b.object_id)
+
+  # The searches asked here are the ones core answers. `Array#include?` and
+  # `#count` are answered by mruby-array-ext and mruby-enum-ext, and are asked
+  # in the tests those gems carry.
+  assert_equal(0, [a].index(a))
+  assert_nil([a].index(b))
+  assert_true([1.0, a] == [1.0, a])
+  assert_false([1.0, a] == [1.0, b])
+  assert_equal(1, ({a => 1})[a])
+  assert_nil(({a => 1})[b])
+
+  # a Float that is equal to itself is found by what it is equal to
+  x = z + 1.5
+  y = z + 1.5
+  assert_equal(0, [x].index(y))
+  assert_equal(1, ({x => 1})[y])
+end
+
 assert('Float comparison with an Integer it cannot hold') do
   # A Float keeps fewer significant bits than an mrb_int, so an integer past
   # the significand rounds onto a neighbouring Float when the two are compared

@@ -236,17 +236,20 @@ module Enumerable
   # counts the number of elements yielding a true value.
   def count(v=NONE, &block)
     count = 0
-    if block
-      self.each do |*val|
-        count += 1 if block.call(*val)
+    # An argument decides even where a block came with it, as in CRuby and as
+    # in Array#count; the block was tested first here, so the argument was
+    # read only where none came.
+    if NONE.equal?(v)
+      if block
+        self.each do |*val|
+          count += 1 if block.call(*val)
+        end
+      else
+        self.each { count += 1 }
       end
     else
-      if NONE.equal?(v)
-        self.each { count += 1 }
-      else
-        self.each do |*val|
-          count += 1 if val.__svalue == v
-        end
+      self.each do |*val|
+        count += 1 if val.__svalue == v
       end
     end
     count
@@ -369,20 +372,41 @@ module Enumerable
     min = nil
     first = true
 
-    self.each do |*val|
-      if first
+    # The block is asked for out here rather than once an element, as in
+    # `Enumerable#max`; the loop body is the same either way but for what it
+    # compares with.
+    if block
+      self.each do |*val|
         val = val.__svalue
-        max = val
-        min = val
-        first = false
-      else
-        val = val.__svalue
-        if block
-          max = val if block.call(val, max) > 0
-          min = val if block.call(val, min) < 0
+        if first
+          max = val
+          min = val
+          first = false
         else
-          max = val if (val <=> max) > 0
-          min = val if (val <=> min) < 0
+          # A comparison with no answer is not an ordering, the same as in
+          # Enumerable#max and #min.
+          cmp = block.call(val, max)
+          raise ArgumentError, "comparison of #{val.class} with #{max.class} failed" if cmp.nil?
+          max = val if cmp > 0
+          cmp = block.call(val, min)
+          raise ArgumentError, "comparison of #{val.class} with #{min.class} failed" if cmp.nil?
+          min = val if cmp < 0
+        end
+      end
+    else
+      self.each do |*val|
+        val = val.__svalue
+        if first
+          max = val
+          min = val
+          first = false
+        else
+          cmp = (val <=> max)
+          raise ArgumentError, "comparison of #{val.class} with #{max.class} failed" if cmp.nil?
+          max = val if cmp > 0
+          cmp = (val <=> min)
+          raise ArgumentError, "comparison of #{val.class} with #{min.class} failed" if cmp.nil?
+          min = val if cmp < 0
         end
       end
     end

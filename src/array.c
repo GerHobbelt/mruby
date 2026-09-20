@@ -1970,8 +1970,17 @@ mrb_ary_eq(mrb_state *mrb, mrb_value ary1)
 
   int ai = mrb_gc_arena_save(mrb);
   for (mrb_int i=0; i<RARRAY_LEN(ary1); i++) {
-    mrb_value eq = mrb_funcall_argv1(mrb, mrb_ary_entry(ary1, i), MRB_OPSYM(eq), mrb_ary_entry(ary2, i));
-    if (!mrb_test(eq)) return mrb_false_value();
+    /* `OP_EQ` takes two values for equal where they are the same object and
+       dispatches `==` only after, and so does the search `#index` and
+       `#delete` make. The same pair of steps is written out here rather than
+       reached through `mrb_equal()`, whose answer is the same one: the checks
+       it makes between them are all reached again by the dispatch below, and
+       the method lookup it adds is paid at every element. */
+    mrb_value a = mrb_ary_entry(ary1, i), b = mrb_ary_entry(ary2, i);
+    if (!mrb_obj_eq(mrb, a, b)) {
+      mrb_value eq = mrb_funcall_argv1(mrb, a, MRB_OPSYM(eq), b);
+      if (!mrb_test(eq)) return mrb_false_value();
+    }
     mrb_gc_arena_restore(mrb, ai);
   }
   return mrb_true_value();
