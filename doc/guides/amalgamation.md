@@ -121,8 +121,8 @@ MRUBY_CONFIG=build_config/amalgam.rb rake amalgam
 
 Typical sizes depend on included gems:
 
-- `mruby.h`: 200-500 KB
-- `mruby.c`: 2-4 MB
+- `mruby.h`: 270-800 KB
+- `mruby.c`: 1.4-6.9 MB
 
 ## Technical Details
 
@@ -138,6 +138,27 @@ Typical sizes depend on included gems:
 - X-macro headers (like `mruby/ops.h`) are inlined at each use
 - Local includes (`.cstub` files) are automatically inlined
 - Generated files (`mrblib.c`, `gem_init.c`) are included
+
+### The `MRB_AMALGAMATION` Define
+
+The generated `mruby.c` defines `MRB_AMALGAMATION` ahead of everything else.
+It marks a translation unit that holds the whole runtime rather than one
+source file, so that a source asking the compiler for work proportional to
+the translation unit can keep the request scoped the way a per-file build
+scopes it.
+
+The VM uses it for exactly that. `mrb_vm_exec()` carries
+`__attribute__((flatten))`, which inlines every call it makes, recursively,
+as deep as the translation unit allows. A per-file build stops it at the VM's
+own static opcode handlers, which is what the attribute is for. With the whole
+runtime in one translation unit it instead reaches the cycle that allocation,
+collection and exception raising form with each other, and the descent never
+converges. GCC exhausts memory in its inliner before emitting a single
+function, so under GCC the amalgamation drops the attribute and
+`mrb_vm_exec()` is optimized like any other function there.
+
+Clang keeps the descent bounded, compiles the same file in seconds, and runs
+faster with the attribute than without it, so it keeps it.
 
 ### Build Configuration Defines
 

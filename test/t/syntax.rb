@@ -1343,6 +1343,56 @@ assert('pattern matching - hash patterns') do
   end
 end
 
+assert('pattern matching - value patterns as a hash value') do
+  # a value pattern is the receiver of `===`, the hash value its argument
+  case {a: 1}
+  in {a: Integer}
+    assert_true true
+  else
+    flunk "Integer did not match the value 1"
+  end
+
+  case {a: "s"}
+  in {a: Integer}
+    flunk "Integer matched the value \"s\""
+  else
+    assert_true true
+  end
+
+  # a range is asymmetric the same way
+  case {a: 1}
+  in {a: 0..2}
+    assert_true true
+  else
+    flunk "0..2 did not match the value 1"
+  end
+
+  # binding after a class pattern
+  case {a: 1, b: {c: 2}}
+  in {a: Integer => x, b: {c: Integer => y}}
+    assert_equal 1, x
+    assert_equal 2, y
+  else
+    flunk "nested class patterns did not match"
+  end
+
+  # the same pattern nested inside an array pattern
+  case [{a: 1}]
+  in [{a: Integer}]
+    assert_true true
+  else
+    flunk "class pattern in a nested hash did not match"
+  end
+
+  # the value keeps its register for the patterns that follow
+  case {a: 1, b: 2}
+  in {a: Integer, b: Integer => y}
+    assert_equal 2, y
+  else
+    flunk "two class patterns in one hash did not match"
+  end
+end
+
 assert('pattern matching - guard clauses') do
   # if guard
   result = case 10
@@ -1630,6 +1680,134 @@ assert('defined? on constant paths (A::B)') do
 
   # a builtin nested constant
   assert_equal 'constant', defined?(Float::INFINITY) if Object.const_defined?(:Float)
+end
+
+module DefinedDeepOuter
+  module Mid
+    Leaf = 1
+  end
+  NotAModule = 1
+
+  def self.from_lexical_scope;      defined?(Mid::Leaf); end
+  def self.from_lexical_scope_miss; defined?(Mid::Missing); end
+end
+
+class DefinedPathRaises
+  def self.boom; raise 'defined? evaluated a constant path root'; end
+end
+
+assert('defined? on a constant path of any depth') do
+  assert_equal 'constant', defined?(DefinedDeepOuter::Mid)
+  assert_equal 'constant', defined?(DefinedDeepOuter::Mid::Leaf)
+  assert_nil defined?(DefinedDeepOuter::Mid::Missing)
+  assert_nil defined?(DefinedDeepOuter::Missing::Leaf)
+  assert_nil defined?(NoSuchOuterAtAll::Mid::Leaf)
+
+  # the walk stops where a name resolves to something that is not a module
+  assert_nil defined?(DefinedDeepOuter::NotAModule::Leaf)
+  assert_nil defined?(DefinedDeepOuter::Mid::Leaf::Deeper)
+
+  # the first name resolves in the lexical scope of the code asking
+  assert_equal 'constant', DefinedDeepOuter.from_lexical_scope
+  assert_nil DefinedDeepOuter.from_lexical_scope_miss
+end
+
+# a module that holds itself, so a path of any length can be written out and
+# its length is the only thing under test
+module DefinedDeepSelf
+  S = self
+end
+
+assert('defined? on a constant path at the length limit') do
+  # the compiler collects at most DEFINED_PATH_MAX (32) names of one path,
+  # since it holds them on the stack of a recursive codegen; a longer path
+  # is answered nil, where CRuby, which has no such bound, answers "constant"
+  assert_equal 'constant', defined?(DefinedDeepSelf::S::S::S::S::S::S::S::S::
+                                    S::S::S::S::S::S::S::S::S::S::S::S::S::S::
+                                    S::S::S::S::S::S::S::S::S)
+  assert_nil defined?(DefinedDeepSelf::S::S::S::S::S::S::S::S::S::S::S::S::S::
+                      S::S::S::S::S::S::S::S::S::S::S::S::S::S::S::S::S::S::S)
+end
+
+assert('defined? on a constant path rooted at Object') do
+  assert_equal 'constant', defined?(::Object)
+  assert_equal 'constant', defined?(::DefinedDeepOuter)
+  assert_equal 'constant', defined?(::DefinedDeepOuter::Mid::Leaf)
+  assert_nil defined?(::NoSuchOuterAtAll)
+  assert_nil defined?(::DefinedDeepOuter::Missing)
+end
+
+assert('defined? does not evaluate a constant path') do
+  # a root that would have to be evaluated is not a path the compiler names,
+  # and the call it is built from stays unmade
+  assert_nil defined?(DefinedPathRaises.boom::Leaf)
+end
+
+assert('defined? on control flow, jumps and definitions') do
+  lv = 1
+
+  # logical operators
+  assert_equal 'expression', defined?(lv && lv)
+  assert_equal 'expression', defined?(lv || lv)
+  assert_equal 'expression', defined?(lv and lv)
+  assert_equal 'expression', defined?(lv or lv)
+
+  # control flow
+  assert_equal 'expression', defined?(if lv then 1 else 2 end)
+  assert_equal 'expression', defined?(unless lv then 1 end)
+  assert_equal 'expression', defined?(lv ? 1 : 2)
+  assert_equal 'expression', defined?(case lv; when 1 then 2; end)
+  assert_equal 'expression', defined?(case lv; in Integer then 1; end)
+  assert_equal 'expression', defined?(lv in Integer)
+  assert_equal 'expression', defined?(lv => Integer)
+  assert_equal 'expression', defined?(while false do end)
+  assert_equal 'expression', defined?(until true do end)
+  assert_equal 'expression', defined?(for i in [1] do end)
+  assert_equal 'expression', defined?(begin; 1; end)
+  assert_equal 'expression', defined?(if (lv == 1)..(lv == 2) then 1 end)
+
+  # jumps, which `defined?` reports on without needing a place to jump to
+  assert_equal 'expression', defined?(return)
+  assert_equal 'expression', defined?(break)
+  assert_equal 'expression', defined?(next)
+  assert_equal 'expression', defined?(redo)
+  assert_equal 'expression', defined?(retry)
+
+  # definitions, which stay undefined because the operand is not evaluated
+  assert_equal 'expression', defined?(def defined_never_defined; end)
+  assert_false respond_to?(:defined_never_defined, true)
+  assert_equal 'expression', defined?(class DefinedNeverClass; end)
+  assert_equal 'expression', defined?(module DefinedNeverModule; end)
+  assert_false Object.const_defined?(:DefinedNeverClass)
+  assert_false Object.const_defined?(:DefinedNeverModule)
+  assert_equal 'expression', defined?(class << self; end)
+end
+
+assert('defined? sees through parentheses around one expression') do
+  lv = 1
+  @defined_paren_iv = 1
+
+  assert_equal 'local-variable', defined?((lv))
+  assert_equal 'local-variable', defined?(((lv)))
+  assert_equal 'instance-variable', defined?((@defined_paren_iv))
+  assert_equal 'constant', defined?((Object))
+  assert_nil defined?((no_such_method_at_all))
+
+  # parentheses holding several statements are an expression of their own
+  assert_equal 'expression', defined?((1; 2))
+end
+
+assert('defined? on a call carrying a block') do
+  # a literal block makes the whole call an expression, whether or not the
+  # method is there and whatever the call is written on
+  assert_equal 'expression', defined?(loop { break })
+  assert_equal 'expression', defined?(no_such_method_at_all { })
+  assert_equal 'expression', defined?([1, 2].map { |e| e })
+  assert_equal 'expression', defined?(nil&.no_such_method_at_all { })
+
+  # a block passed as `&arg` leaves an ordinary call behind
+  assert_equal 'method', defined?(assert(&:to_s))
+  assert_nil defined?(no_such_method_at_all(&:to_s))
 end
 
 # NOTE: `&nil` block-forbidding parameters live in syntax_block_forbid.rb,

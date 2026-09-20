@@ -320,6 +320,57 @@ assert("Regexp - a pattern nested past the parse depth limit raises") do
   end
 end
 
+assert("Regexp - a pattern whose forks nest deeply matches") do
+  # A step's epsilon closure walks the branches a fork leaves standing, and
+  # what that walk spent on the C stack used to follow how deep the pattern
+  # nests its forks, with nothing above it but MRB_REGEXP_PARSE_DEPTH_LIMIT.
+  # The `?` is what makes every level a fork, the `b` is what makes the
+  # closure cross all of them, and the greedy answer is what says it took the
+  # branch inside as well as the one that skips it.
+  #
+  # Every level here is one the parser holds open at once, the pattern itself
+  # among them, so what the build allows is the ceiling: a build that lowers
+  # the limit is asked a shallower question rather than met with a refusal.
+  nest = Regexp::PARSE_DEPTH_LIMIT - 1
+  nest = 1000 if nest > 1000
+  nest = 0 if nest < 0
+  re = Regexp.new("(?:" * nest + "a" + ")?" * nest + "b")
+  assert_equal "ab", re.match("ab")[0]
+  assert_nil re.match("c")
+  # Where the build left no level at all there is no branch to skip.
+  assert_equal "b", re.match("b")[0] if nest > 0
+end
+
+assert("Regexp - a pattern forking as often as it is long compiles") do
+  # Nothing bounds how often a pattern forks but its length, which `regexp
+  # too large` puts at 65,535 instructions, and the passes that read a
+  # finished program used to spend a C frame per fork they passed: the marks
+  # on the repetitions that can run empty, and the anchor and first-byte
+  # scans. Each keeps its branches on a stack of its own now, so the patterns
+  # below are a question of heap and not of the stack the build runs on.
+  forks = 2000
+  assert_equal 0, (Regexp.new("a*" * forks) =~ "")
+  assert_equal 0, (Regexp.new("a*" * forks) =~ "aaa")
+  assert_equal 0, (Regexp.new("a?" * forks) =~ "")
+
+  # Past 4096 instructions, which is where the anchor and first-byte scans
+  # used to give up for want of room in the frame they marked from.
+  assert_equal 0, (Regexp.new("(?:x?)" * 3000 + "ab") =~ "xxab")
+  assert_equal 2, (Regexp.new("^" + "(?:x?)" * 3000 + "ab") =~ "\n\nab")
+end
+
+assert("Regexp - a lookbehind body forking as often as it is long is measured") do
+  # A lookbehind is measured by a walk of its body, and a fork in it is two
+  # measures that have to agree, which the walk used to take in a C call
+  # apiece. The width stays inside the 255 bytes a rewind carries; what grows
+  # is the number of forks measured. The measure is the compile's, so a
+  # compile is what this asks for: running such a body keeps a choice point
+  # per fork, which is more than a build that sets MRB_REGEXP_STACK_LIMIT low
+  # grants, and what the widths come to is asked of twenty forks further
+  # down, where the guard for that engine stands.
+  assert_kind_of Regexp, Regexp.new("(?<=" + "(?:a|a)" * 200 + ")b")
+end
+
 assert("Regexp - an alternation holds as many branches as the pattern writes") do
   # The branches were once collected in an array of 64 and the 64th refused
   # as `too many alternatives`. They are found in the code they were compiled
@@ -339,10 +390,24 @@ assert("Regexp - an alternation holds as many branches as the pattern writes") d
   assert_equal 100, longest_first.match("a" * 100)[0].size
   assert_equal 1, shortest_first.match("a" * 100)[0].size
 
-  # A lookbehind body of that many branches carries a rewind per branch, as
-  # a body of two does: `3`, `11` and `222` stand among the seventy, one,
-  # two and three characters wide.
+  # A lookbehind body counts its branches the same way, seventy of them
+  # compiling where the array of 64 refused the 64th. Compiling asks for no
+  # backtracking stack, so the count stands here rather than with the match
+  # below, which pays an entry per branch.
   alts = (1..70).map { |i| i.to_s(36) * (i % 3 + 1) }
+  assert_kind_of Regexp, Regexp.new("(?<=#{alts.join('|')})!")
+end
+
+assert("Regexp - a lookbehind rewinds once per branch of its body") do
+  need_backtracking_stack
+  # A lookbehind body of many branches carries a rewind per branch, as a body
+  # of two does: `3`, `11` and `222` stand among the forty, one, two and
+  # three characters wide. The branch a rewind is trying stands on the
+  # backtracking stack while it runs, so a body of N branches asks the build
+  # for N entries and the lookaround's barrier for one more: forty of them
+  # match at a limit of 41 and not at 40, which is why the count is one the
+  # guard's stack covers rather than the seventy compiled above.
+  alts = (1..40).map { |i| i.to_s(36) * (i % 3 + 1) }
   behind = Regexp.new("(?<=#{alts.join('|')})!")
   assert_equal 1, behind =~ "3!"
   assert_equal 2, behind =~ "11!"
@@ -742,12 +807,20 @@ assert("Regexp - /i folds an ASCII letter's class whole") do
   assert_true Regexp.new("s", Regexp::IGNORECASE).match?(long_s)
   assert_false Regexp.new("[^s]", Regexp::IGNORECASE).match?(long_s)
   assert_true Regexp.new(long_s, Regexp::IGNORECASE).match?("S")
-  # A backreference compares the same way, so the capture and the repeat need
-  # not hold the same bytes.
-  assert_equal "k#{kelvin}", "k#{kelvin}".match(Regexp.new("(k)\\1", Regexp::IGNORECASE))[0]
   # Without /i none of it folds.
   assert_false Regexp.new("k").match?(kelvin)
   assert_true Regexp.new("[^k]").match?(kelvin)
+end
+
+assert("Regexp - /i folds an ASCII letter's class for a backreference") do
+  need_backtracking_stack
+  # A backreference compares the same way the class above does, so the capture
+  # and the repeat need not hold the same bytes. It is a backreference that
+  # sends this to the backtracking engine, where the assertions above run on
+  # the Pike VM whatever the build's stack limit is.
+  skip unless __ENCODING__ == "UTF-8"
+  kelvin = "K"
+  assert_equal "k#{kelvin}", "k#{kelvin}".match(Regexp.new("(k)\\1", Regexp::IGNORECASE))[0]
 end
 
 assert("Regexp - /i keeps the word class inside ASCII") do
@@ -2844,6 +2917,7 @@ assert("Regexp - a capture inside a lookaround is undone with the lookaround") d
 end
 
 assert("Regexp - lookbehind over a class that can match a multibyte character") do
+  need_backtracking_stack
   # A class consumes exactly one character whatever its members are, so the
   # rewind steps back that many characters rather than assuming a byte each.
   # A build that reads its strings by byte has one byte per character, so it
@@ -2877,6 +2951,7 @@ assert("Regexp - lookbehind over a class that can match a multibyte character") 
 end
 
 assert("Regexp - lookbehind against a binary subject rewinds by bytes") do
+  need_backtracking_stack
   # A binary subject advances one byte at a time, so the same compiled
   # pattern rewinds by its byte count there: two for the literal Ā, and one
   # for a class, which is handed the raw byte as its codepoint. What this
@@ -3413,6 +3488,57 @@ assert("Regexp - a '-' after a nested class is a member") do
   assert_raise_with_message(RegexpError,
                             "char-class value at end of range: /[a-[b]]/") do
     Regexp.new("[a-[b]]")
+  end
+end
+
+assert("Regexp - what bounds the classes a pattern nests is a table, not a stack") do
+  # A class written inside a class is a level on the parser's own stack, as a
+  # group is, so how deep one may nest is a matter of what the compiler holds
+  # a level in and not of the C stack the build gets. Two things bound it and
+  # the shallower answers: every level open holds an entry in the class table
+  # while it is open, 256 of which there are, and every level but the
+  # outermost counts against MRB_REGEXP_PARSE_DEPTH_LIMIT beside the levels
+  # the pattern itself has open, of which there is one here. So a build at
+  # the default limit nests 256 classes and is told `too many character
+  # classes` at the 257th, and a build that sets the limit at or below that
+  # meets its own limit there instead.
+  deep = 256
+  refusal = "too many character classes"
+  if Regexp::PARSE_DEPTH_LIMIT <= deep
+    deep = Regexp::PARSE_DEPTH_LIMIT
+    refusal = "parse depth limit over"
+  end
+
+  # a union at every level, and the complement of what the innermost holds
+  union = Regexp.new("[" * deep + "a-c" + "]" * deep)
+  assert_equal "b", "xb"[union]
+  assert_nil union =~ "d"
+  neg = Regexp.new("[" * (deep - 1) + "[^a-c]" + "]" * (deep - 1))
+  assert_equal "d", "ad"[neg]
+  assert_nil neg =~ "b"
+
+  # An operand after a `&&` is read beside the class rather than into it, and
+  # the intersection of the two is taken through a third, so a class holding
+  # one takes two entries of the table beyond the levels it has open and
+  # nests two levels fewer.
+  wide = deep < 3 ? 1 : deep - 2
+  isect = Regexp.new("[" * wide + "a-c&&b-d" + "]" * wide)
+  assert_equal "c", "ac"[isect]
+  assert_nil isect =~ "a"
+
+  # The stack is empty again between one class and the next, so a pattern
+  # holding two of them nests in the second as it nested in the first. What a
+  # class leaves behind in the table is the one entry the pattern matches
+  # against; the entries its levels held go back as they close. That entry is
+  # why the pair nests one shy of what a lone class nests.
+  half = deep < 3 ? 1 : deep - 1
+  pair = Regexp.new("[" * half + "a" + "]" * half + "[" * half + "b" + "]" * half)
+  assert_equal "ab", "ab"[pair]
+  assert_nil pair =~ "ba"
+
+  over = "[" * (deep + 1) + "a" + "]" * (deep + 1)
+  assert_raise_with_message(RegexpError, "#{refusal}: /#{over}/") do
+    Regexp.new(over)
   end
 end
 

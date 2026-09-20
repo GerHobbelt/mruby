@@ -37,6 +37,17 @@ void mrb_ci_svar_set(mrb_state *mrb, struct mrb_context *c, mrb_callinfo *ci, st
    recording itself runs inside marking and cannot allocate. */
 void mrb_svars_reserve(mrb_state *mrb, struct mrb_context *c);
 
+#ifdef MRUBY_COMPILE_H
+/* Walk the top-level local variables of a parsed program, which is how
+   `eval` carries the caller's variables into the block it compiles.
+   Written by mruby-compiler and called by mruby-eval, so the typedef its
+   callback is spelled with is declared here rather than in each of them:
+   the amalgamation puts both in one translation unit, where a second copy
+   of a typedef is a redefinition. */
+typedef mrb_bool mrb_parser_foreach_top_variable_func(mrb_state *mrb, mrb_sym sym, void *user);
+void mrb_parser_foreach_top_variable(mrb_state *mrb, struct mrb_parser_state *p, mrb_parser_foreach_top_variable_func *func, void *user);
+#endif
+
 #ifdef MRUBY_CLASS_H
 struct RClass *mrb_vm_define_class(mrb_state*, mrb_value, mrb_value, mrb_sym);
 struct RClass *mrb_vm_define_module(mrb_state*, mrb_value, mrb_sym);
@@ -482,6 +493,7 @@ uint32_t mrb_utf8_decode(const char *p, const char *e, mrb_int *lenp);
 mrb_int mrb_utf8_strlen(const char *str, mrb_int byte_len);
 #endif
 
+#ifdef HAVE_MRUBY_REGEXP_GEM
 /* Whether more than one byte can spell one character in what this build
    reads. The three functions below answer what a given run of bytes spells,
    which is what a reader wants; this is for the few places that have to know
@@ -537,6 +549,8 @@ mrb_enc_decode(const char *p, const char *e, mrb_int *lenp)
   return (uint8_t)*p;
 #endif
 }
+#endif  /* HAVE_MRUBY_REGEXP_GEM */
+
 /* What a case conversion makes of each character. `capitalize` asks two things
    of one string, title case at the front and lower case behind it, and `swap`
    asks per character, so a mode is what a method does rather than one case. */
@@ -804,8 +818,16 @@ void mrb_bint_copy(mrb_state *mrb, mrb_value x, mrb_value y);
 size_t mrb_bint_memsize(mrb_value x);
 mrb_value mrb_bint_hash(mrb_state *mrb, mrb_value x);
 mrb_value mrb_bint_sqrt(mrb_state *mrb, mrb_value x);
-mrb_int mrb_bint_size(mrb_state *mrb, mrb_value bint);
-mrb_value mrb_bint_from_bytes(mrb_state *mrb, const uint8_t *bytes, mrb_int len);
+/* The bytes mrb_bint_new_bytes() takes to build a Bignum the size of this
+   one.  Rounded up to a whole number of limbs, so it is not the length of the
+   value: a Bignum of 9 significant bytes answers 12 where a limb is 4. */
+mrb_int mrb_bint_bytes_size(mrb_state *mrb, mrb_value bint);
+/* Build a Bignum out of `len` bytes taken as they lie, straight into the
+   limbs: which digit a byte lands in follows sizeof(mp_limb) and the host's
+   byte order, and the answer is always positive.  So the bytes are bits to
+   fill a Bignum with, not a number written down; a caller reading a number
+   off a wire wants a spelled byte order and is not served by this. */
+mrb_value mrb_bint_new_bytes(mrb_state *mrb, const uint8_t *bytes, mrb_int len);
 mrb_int mrb_bint_sign(mrb_state *mrb, mrb_value bint);
 mrb_value mrb_bint_gcd(mrb_state *mrb, mrb_value x, mrb_value y);
 mrb_value mrb_bint_lcm(mrb_state *mrb, mrb_value x, mrb_value y);

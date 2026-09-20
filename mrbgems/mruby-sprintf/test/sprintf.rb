@@ -214,3 +214,44 @@ assert('what the string sprintf builds claims') do
   # is the same cell, answered the same way on purpose.
   assert_equal Encoding::BINARY, ("%s".force_encoding(Encoding::BINARY) % ["あ"]).encoding
 end
+
+assert('sprintf - a width near mrb_int is refused, not wrapped') do
+  # CHECK() grows the output buffer, and it used to ask whether blen+(l)
+  # reached bsiz.  That sum is evaluated in mrb_int, so a width near the
+  # maximum wrapped negative, read as below bsiz, and the resize was skipped:
+  # the FILL that followed then wrote about 2GB into a buffer of some 120
+  # bytes (CVE-2018-14337, fixed once in 180f39bf4 and reintroduced by
+  # b58094c88).  A literal ahead of the directive is what makes blen non-zero
+  # and the sum wrap.
+  #
+  # 2147483647 is the width that wrapped.  Where mrb_int is 32-bit it is past
+  # what a String can hold and has to be refused; where mrb_int is wider it is
+  # an ordinary request and the answer is a 2GB string, which is not something
+  # to allocate in a test.  Asking sprintf which build this is would build that
+  # string to find out, so the width is read off an integer instead: 2**31 is
+  # an object of its own where mrb_int stops below it, and where the build has
+  # no wider integer at all it cannot be reached.  Spelling it as a literal
+  # would take the whole file down on the builds this guards, so it is raised.
+  narrow =
+    begin
+      n = 2 ** 31
+      !n.equal?(2 ** 31)
+    rescue RangeError
+      true
+    end
+  skip "mrb_int holds a width of 2147483647" unless narrow
+
+  assert_raise(ArgumentError) { sprintf("ab%2147483647c", 65) }
+  assert_raise(ArgumentError) { sprintf("ab%2147483647d", 0) }
+  assert_raise(ArgumentError) { sprintf("ab%2147483647s", "x") }
+  assert_raise(ArgumentError) { sprintf("ab%.2147483647d", 0) }
+  assert_raise(ArgumentError) { sprintf("ab%2147483626f", 1.0) } if Object.const_defined?(:Float)
+end
+
+assert('sprintf - the widths a buffer can still be asked for keep working') do
+  assert_equal "  42", sprintf("%4d", 42)
+  assert_equal "00042", sprintf("%.*d", 5, 42)
+  assert_equal 1000, sprintf("%1000d", 7).size
+  assert_equal 500, sprintf("%500s", "x").size
+  assert_equal "     1.000000", sprintf("%13f", 1.0) if Object.const_defined?(:Float)
+end
