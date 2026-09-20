@@ -1012,6 +1012,62 @@ regexp_escape(mrb_state *mrb, mrb_value self)
   return re_escape_str(mrb, str);
 }
 
+/*
+ * Regexp.union(*patterns) - a pattern matching any of the arguments
+ *
+ * A single Array argument stands for its elements, and a lone Regexp is
+ * answered as itself rather than recompiled. Everything else combines into
+ * one source the way interpolation would write it: a Regexp contributes its
+ * `to_s` form so its own flags travel inside the group, and a String is
+ * quoted so it stays literal. The answer is always a Regexp, whichever
+ * subclass the arguments or the receiver are, as CRuby answers.
+ *
+ * A Symbol is refused wherever it appears, where CRuby stringifies one in
+ * the single-argument path only: `Regexp.escape` here takes a String and
+ * nothing else, and the arguments a union quotes are read by the same rule
+ * however many there are.
+ */
+static mrb_value
+regexp_union(mrb_state *mrb, mrb_value self)
+{
+  const mrb_value *argv;
+  mrb_int argc;
+  mrb_get_args(mrb, "*", &argv, &argc);
+
+  struct RClass *re_class = mrb_class_get_id(mrb, MRB_SYM(Regexp));
+
+  if (argc == 1 && mrb_array_p(argv[0])) {
+    /* The element pointer stays valid across the allocations below: the
+       array itself is held by the VM stack and is never written to here. */
+    mrb_value ary = argv[0];
+    argv = RARRAY_PTR(ary);
+    argc = RARRAY_LEN(ary);
+  }
+  if (argc == 0) {
+    /* Nothing to match is a pattern that never matches. */
+    mrb_value src = mrb_str_new_lit(mrb, "(?!)");
+    return mrb_obj_new(mrb, re_class, 1, &src);
+  }
+  if (argc == 1 && mrb_obj_is_kind_of(mrb, argv[0], re_class)) {
+    return argv[0];
+  }
+
+  mrb_value src = mrb_str_new(mrb, NULL, 0);
+  int ai = mrb_gc_arena_save(mrb);
+  for (mrb_int i = 0; i < argc; i++) {
+    mrb_value e = argv[i];
+    if (i > 0) mrb_str_cat_lit(mrb, src, "|");
+    if (mrb_obj_is_kind_of(mrb, e, re_class)) {
+      mrb_str_cat_str(mrb, src, regexp_to_s(mrb, e));
+    }
+    else {
+      mrb_str_cat_str(mrb, src, re_escape_str(mrb, mrb_ensure_string_type(mrb, e)));
+    }
+    mrb_gc_arena_restore(mrb, ai);
+  }
+  return mrb_obj_new(mrb, re_class, 1, &src);
+}
+
 /* Answer the group a name refers to in the match the captures stand for, or
    -1 for a name the pattern gives to no group. A pattern may give one name
    to several groups, and CRuby's named accessors then read the last of them
@@ -1073,7 +1129,7 @@ matchdata_name_to_group(mrb_state *mrb, mrb_match_data *md, mrb_value arg)
 }
 
 /*
- * MatchData#[](n)
+ * MatchData#[](n) / #[](name) / #[](start, length) / #[](range)
  */
 
 /* Read the group at the absolute index `idx`, or nil when it names no group
@@ -1116,12 +1172,48 @@ md_aref(mrb_state *mrb, mrb_value self, mrb_value arg)
   return md_nth(mrb, md, idx);
 }
 
+/* The (start, length) and Range forms slice the groups the way Array#[]
+   slices to_a. They are told apart from the group forms the way CRuby's
+   match_aref() tells them apart: a second argument, unless it is nil, forces
+   both arguments through integer conversion, so a name or a Range in the
+   first position raises TypeError there; without one, only a Range slices,
+   and everything that is not a name converts to a single index. */
 static mrb_value
 matchdata_aref(mrb_state *mrb, mrb_value self)
 {
-  mrb_value arg;
-  mrb_get_args(mrb, "o", &arg);
-  return md_aref(mrb, self, arg);
+  mrb_value arg, len_v = mrb_nil_value();
+  mrb_int argc = mrb_get_args(mrb, "o|o", &arg, &len_v);
+
+  if ((argc < 2 || mrb_nil_p(len_v)) && !mrb_range_p(arg)) {
+    return md_aref(mrb, self, arg);
+  }
+
+  mrb_match_data *md = DATA_GET_PTR(mrb, self, &matchdata_type, mrb_match_data);
+  if (!md) return mrb_nil_value();
+
+  mrb_int beg, len;
+  if (argc == 2 && !mrb_nil_p(len_v)) {
+    beg = mrb_as_int(mrb, arg);
+    len = mrb_as_int(mrb, len_v);
+    if (len < 0) return mrb_nil_value();
+    if (beg < 0) {
+      beg += md->num_captures;
+      if (beg < 0) return mrb_nil_value();
+    }
+    else if (beg > md->num_captures) {
+      return mrb_nil_value();
+    }
+    if (len > md->num_captures - beg) len = md->num_captures - beg;
+  }
+  else if (mrb_range_beg_len(mrb, arg, &beg, &len, md->num_captures, TRUE) != MRB_RANGE_OK) {
+    return mrb_nil_value();
+  }
+
+  mrb_value ary = mrb_ary_new_capa(mrb, len);
+  for (mrb_int i = 0; i < len; i++) {
+    mrb_ary_push(mrb, ary, md_nth(mrb, md, beg + i));
+  }
+  return ary;
 }
 
 /* Build array of capture strings from group `from` to num_captures-1 */
@@ -1265,6 +1357,31 @@ matchdata_end(mrb_state *mrb, mrb_value self)
   int pos = md->captures[idx * 2 + 1];
   if (pos < 0) return mrb_nil_value();
   return mrb_int_value(mrb, re_byte_to_char(mrb, md->source, pos));
+}
+
+/*
+ * MatchData#offset(n)
+ */
+
+/* The two offsets `begin` and `end` report, read in one call. CRuby's
+   rb_match_offset() reads the argument the way begin and end read theirs, so
+   a name reaches its group and an argument that reaches none raises. A group
+   that took no part in the match has neither offset, and the pair is
+   [nil, nil] rather than nil: the method always answers an array of two. */
+static mrb_value
+matchdata_offset(mrb_state *mrb, mrb_value self)
+{
+  mrb_value arg;
+  mrb_get_args(mrb, "o", &arg);
+
+  mrb_match_data *md = DATA_GET_PTR(mrb, self, &matchdata_type, mrb_match_data);
+  if (!md) return mrb_nil_value();
+  mrb_int idx = matchdata_group_arg(mrb, md, arg);
+  int beg = md->captures[idx * 2];
+  if (beg < 0) return mrb_assoc_new(mrb, mrb_nil_value(), mrb_nil_value());
+  int end = md->captures[idx * 2 + 1];
+  return mrb_assoc_new(mrb, mrb_int_value(mrb, re_byte_to_char(mrb, md->source, beg)),
+                       mrb_int_value(mrb, re_byte_to_char(mrb, md->source, end)));
 }
 
 /* Whether `str` still reads as the subject `md` was made on. The block loops
@@ -3338,6 +3455,7 @@ mrb_mruby_regexp_gem_init(mrb_state *mrb)
   mrb_define_class_method(mrb, re, "escape", regexp_escape, MRB_ARGS_REQ(1));
   mrb_define_class_method(mrb, re, "quote", regexp_escape, MRB_ARGS_REQ(1));
   mrb_define_class_method(mrb, re, "last_match", regexp_s_last_match, MRB_ARGS_OPT(1));
+  mrb_define_class_method(mrb, re, "union", regexp_union, MRB_ARGS_ANY());
 
   /* Instance methods */
   mrb_define_method(mrb, re, "match", regexp_match, MRB_ARGS_ARG(1, 1)|MRB_ARGS_BLOCK());
@@ -3436,7 +3554,7 @@ mrb_mruby_regexp_gem_init(mrb_state *mrb)
   mrb_undef_class_method(mrb, md, "new");
   mrb_undef_class_method(mrb, md, "allocate");
 
-  mrb_define_method(mrb, md, "[]", matchdata_aref, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, md, "[]", matchdata_aref, MRB_ARGS_ARG(1, 1));
   mrb_define_method(mrb, md, "captures", matchdata_captures, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "to_a", matchdata_to_a, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "values_at", matchdata_values_at, MRB_ARGS_ANY());
@@ -3444,6 +3562,7 @@ mrb_mruby_regexp_gem_init(mrb_state *mrb)
   mrb_define_method(mrb, md, "size", matchdata_length, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "begin", matchdata_begin, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, md, "end", matchdata_end, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, md, "offset", matchdata_offset, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, md, "pre_match", matchdata_pre, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "post_match", matchdata_post, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "__pre_match", matchdata_pre, MRB_ARGS_NONE());

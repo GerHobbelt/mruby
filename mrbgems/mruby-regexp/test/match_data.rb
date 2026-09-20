@@ -154,6 +154,34 @@ assert("MatchData#begin / #end - index out of matches") do
   assert_nil md.end(2)
 end
 
+assert("MatchData#offset") do
+  md = /(a)(b)/.match("ab")
+  assert_equal [0, 2], md.offset(0)
+  assert_equal [0, 1], md.offset(1)
+  assert_equal [1, 2], md.offset(2)
+  # a name reaches its group, as it does in begin and end
+  md = /(?<x>b)(?<y>c)/.match("abcde")
+  assert_equal [1, 2], md.offset(:x)
+  assert_equal [2, 3], md.offset("y")
+end
+
+assert("MatchData#offset - a group that took no part in the match") do
+  # Neither offset exists, and the pair is [nil, nil]: an array of two comes
+  # back whatever the group did, where begin and end each answer nil.
+  assert_equal [nil, nil], /(a)|(b)/.match("a").offset(2)
+  assert_equal [nil, nil], /(?<y>a)(?<y>b)|c/.match("c").offset(:y)
+end
+
+assert("MatchData#offset - an argument that reaches no group") do
+  # The argument is read the way begin and end read theirs, so an index out of
+  # range raises rather than answering [nil, nil].
+  md = /(a)(b)/.match("ab")
+  assert_raise(IndexError) { md.offset(3) }
+  assert_raise(IndexError) { md.offset(-1) }
+  assert_raise(IndexError) { md.offset(:zz) }
+  assert_raise(IndexError) { /(a)/.match("a").offset(:zz) }
+end
+
 assert("$~ global variable") do
   /(\w+)@(\w+)/ =~ "user@host"
   assert_kind_of MatchData, $~
@@ -170,6 +198,17 @@ assert("Regexp.last_match") do
   /(\d+)/ =~ "abc123"
   assert_equal "123", Regexp.last_match(1)
   assert_equal "123", Regexp.last_match(0)
+end
+
+assert("Regexp.last_match reads one group, never a slice") do
+  # the argument goes to the single-index read MatchData#[] keeps behind its
+  # slice forms, so a Range raises TypeError here where $~[0..1] answers an
+  # array, and there is no (start, length) form at all
+  "ab" =~ /(a)(b)/
+  assert_equal ["ab", "a"], $~[0..1]
+  assert_equal ["ab", "a"], $~[0, 2]
+  assert_raise(TypeError) { Regexp.last_match(0..1) }
+  assert_raise(ArgumentError) { Regexp.last_match(0, 2) }
 end
 
 assert("Regexp.last_match - an explicit nil is not an omitted argument") do
@@ -218,6 +257,54 @@ assert("MatchData#[] - group name longer than a uint16 length") do
   md = /(?<abc>x)/.match("x")
   assert_raise(IndexError) { md["abc" + "A" * 65536] }
   assert_equal "x", md[:abc]
+end
+
+assert("MatchData#[] - start and length") do
+  md = /(a)(b)/.match("ab")
+  assert_equal ["ab", "a"], md[0, 2]
+  assert_equal [], md[0, 0]
+  # the slice reads like Array#[] on to_a: truncated at the last group, empty
+  # at the index one past it, nil beyond that or for a negative length
+  assert_equal ["ab", "a", "b"], md[0, 5]
+  assert_equal [], md[3, 1]
+  assert_nil md[4, 1]
+  assert_nil md[0, -1]
+  # a negative start counts back from the last group and, unlike a negative
+  # single index, does reach the whole match
+  assert_equal ["ab", "a"], md[-3, 2]
+  assert_nil md[-4, 2]
+  # a group that did not take part in the match reads nil in place
+  assert_equal ["a", nil, "a"], /(b)?(a)/.match("a")[0, 3]
+  # an explicit nil length selects the single-index form
+  assert_equal "ab", md[0, nil]
+end
+
+assert("MatchData#[] - Range") do
+  md = /(a)(b)/.match("ab")
+  assert_equal ["ab", "a"], md[0..1]
+  assert_equal ["ab", "a"], md[0...2]
+  assert_equal ["ab", "a", "b"], md[0..-1]
+  assert_equal ["a", "b"], md[1..]
+  assert_equal ["ab", "a"], md[..1]
+  assert_equal ["ab", "a", "b"], md[0..10]
+  # bounds read like Array#[]: starting at the index one past the last group
+  # is empty, further out is nil, and so is a start before -num_captures;
+  # a backwards range is empty
+  assert_equal [], md[3..4]
+  assert_nil md[4..5]
+  assert_nil md[-5..-4]
+  assert_equal [], md[2..1]
+  assert_equal ["a", nil, "a"], /(b)?(a)/.match("a")[0..2]
+end
+
+assert("MatchData#[] - a length argument forces integer conversion") do
+  md = /(?<x>a)(b)/.match("ab")
+  # with a length present, the first argument is an index, never a name or a
+  # Range, and the length is an integer, never a name
+  assert_raise(TypeError) { md["x", 2] }
+  assert_raise(TypeError) { md[:x, 2] }
+  assert_raise(TypeError) { md[0..1, 1] }
+  assert_raise(TypeError) { md[0, "2"] }
 end
 
 assert("MatchData#values_at") do

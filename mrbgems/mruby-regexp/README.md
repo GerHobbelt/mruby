@@ -111,6 +111,9 @@ re.eql?(other)                    # => same as ==
 re.hash                           # => source and options hashed together
 Regexp.escape("a.b")              # => "a\\.b"
 Regexp.quote("a.b")               # => same as Regexp.escape
+Regexp.union("a+", /b/i)          # => /a\+|(?i-mx:b)/
+Regexp.union(["a", "b"])          # => /a|b/, one Array stands for its elements
+Regexp.union                      # => /(?!)/, which never matches
 Regexp.last_match(n)              # => nth capture from last match
 
 # MatchData
@@ -119,6 +122,8 @@ md[0]                             # => "user@host" (full match)
 md[1]                             # => "user"
 md[2]                             # => "host"
 md[:name]                         # named capture access
+md[0, 2]                          # => ["user@host", "user"]
+md[0..1]                          # => same as md[0, 2]
 md.captures                       # => ["user", "host"]
 md.values_at(1, 2)                # => ["user", "host"]
 md.to_a                           # => ["user@host", "user", "host"]
@@ -127,6 +132,7 @@ md.size                           # => group count, group 0 included
 md.length                         # => same as size
 md.begin(0)                       # => match start position
 md.end(0)                         # => match end position
+md.offset(0)                      # => [begin, end] of the same group
 md.pre_match                      # => string before match
 md.post_match                     # => string after match
 md.named_captures                 # => {"name" => "value", ...}
