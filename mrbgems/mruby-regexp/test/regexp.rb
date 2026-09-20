@@ -93,6 +93,19 @@ assert("Regexp - \\d \\w \\s") do
   assert_false Regexp.new("\\d+").match?("abc")
 end
 
+assert("Regexp - negated shorthands \\D \\W \\S") do
+  # \D \W \S must be the complement of \d \w \s, not aliases of them.
+  # (A double negation in the compiler made \D match digits, etc.)
+  assert_equal ["a", " ", "b"], "a1 b2".scan(/\D/)
+  assert_equal [" "],           "a1 b2".scan(/\W/)
+  assert_equal ["a", "1", "b", "2"], "a1 b2".scan(/\S/)
+  assert_equal "_9__", "x9 z".gsub(/\D/, "_")
+  # inside [...] the shorthands keep working, including mixed full-range sets
+  assert_equal ["a", " ", "b"], "a5 b".scan(/[\D]/)
+  assert_equal ["a", "5", " ", "b"], "a5 b".scan(/[\s\S]/)
+  assert_equal [" "], "foo BAR".scan(/[\W\d]/)
+end
+
 assert("Regexp - anchors") do
   assert_true Regexp.new("^abc").match?("abc")
   assert_false Regexp.new("^abc").match?("xabc")
@@ -146,6 +159,28 @@ assert("MatchData#begin / #end") do
   md = re.match("abcde")
   assert_equal 1, md.begin(0)
   assert_equal 3, md.end(0)
+end
+
+assert("Regexp - multibyte (UTF-8) match extraction") do
+  # Capture offsets are recorded in bytes; substring extraction must honor
+  # them as byte ranges so multibyte matches are not corrupted.
+  skip unless __ENCODING__ == "UTF-8"
+  assert_equal "あ", "あa".match(/\S/)[0]
+  assert_equal ["あ", "a", "い"], "あ a い".scan(/\S/)
+  assert_equal "本", "日本語".match(/本/)[0]
+  md = "いろは".match(/ろ/)
+  assert_equal "い", md.pre_match
+  assert_equal "は", md.post_match
+  assert_equal ["β", "γ"], "αβγ".match(/(β)(γ)/).captures
+  assert_equal "ああいいうう", "あいう".gsub(/./) { |m| m + m }
+  assert_equal "x-y", "x—y".sub(/—/) { "-" }
+  assert_equal ["1", "2", "3"], "ABCあいう123".scan(/\d/)
+
+  # MatchData#begin/#end report CHARACTER offsets like CRuby, not bytes.
+  m = "αβγ".match(/(β)(γ)/)
+  assert_equal [1, 2], [m.begin(1), m.end(1)]
+  assert_equal [2, 3], [m.begin(2), m.end(2)]
+  assert_equal 2, "あいう".match(/う/).begin(0)
 end
 
 assert("Regexp.escape") do
@@ -265,6 +300,19 @@ assert("String#sub with \\& \\` \\' specials") do
   assert_equal "abbd", "abcd".sub(/(b)c/, '\\1\\1')
 end
 
+assert("String#sub \\' post-match uses byte length, not strlen (issue #6892)") do
+  # An embedded NUL before the match end used to make \' compute its length
+  # with strlen(), underflowing into a wild memcpy and crashing.
+  s = "A\0" + ("B" * 40) + "MATCH"
+  assert_equal 44, s.sub(/MATCH/, "X\\'Y").length
+  assert_equal "A\0" + ("B" * 40) + "XY", s.sub(/MATCH/, "X\\'Y")
+
+  # A shared substring whose logical end is not NUL-terminated must not let
+  # \' copy bytes past the substring into the parent's buffer.
+  parent = ("Q" * 200) + "MATCHzzzzzzzzzzzzzzzz"
+  assert_equal ("Q" * 100) + "[]", parent[100, 105].sub(/MATCH/, "[\\']")
+end
+
 assert("String#gsub with \\& special") do
   assert_equal "[a][b][c]", "abc".gsub(/./, '[\\&]')
 end
@@ -334,6 +382,20 @@ end
 
 assert("String#gsub with block") do
   assert_equal "HELLO WORLD", "hello world".gsub(/\w+/) { |m| m.upcase }
+end
+
+assert("String#gsub with block and zero-width match") do
+  assert_equal "!abc", "abc".gsub(/^/) { "!" }
+  assert_equal "a!bc", "abc".gsub(/(?=b)/) { "!" }
+  assert_equal "!a!b!c!", "abc".gsub(//) { "!" }
+  assert_equal "!\n", "\n".gsub(/^/m) { "!" }
+  assert_equal "!a\n", "a\n".gsub(/^/m) { "!" }
+  assert_equal "!a\n!b", "a\nb".gsub(/^/m) { "!" }
+  if __ENCODING__ == "UTF-8"
+    assert_equal "！いろは", "いろは".gsub(/^/) { "！" }
+    assert_equal "い！ろは", "いろは".gsub(/(?=ろ)/) { "！" }
+    assert_equal "！い！ろ！は！", "いろは".gsub(//) { "！" }
+  end
 end
 
 assert("String#gsub date reformat") do
@@ -494,4 +556,41 @@ assert("Regexp - empty-matchable patterns find earliest match position") do
   md = /a?b?/.match("c")
   assert_equal "", md[0]
   assert_equal 0, md.begin(0)
+end
+
+assert("Regexp - UTF-8 codepoints in character class") do
+  assert_equal 0, ("β" =~ /[α-ω]/)
+  assert_nil ("Z" =~ /[α-ω]/)
+  assert_equal ["₀₁₂"], "a₀₁₂b".scan(/[₀-₉]+/)
+  assert_true "₇₈₉".match?(/[₀₁₂₃₄₅₆₇₈₉]+/)
+  assert_equal 0, ("か" =~ /[あ-ん]/)
+  # negation
+  assert_nil ("β" =~ /[^α-ω]/)
+  assert_equal 0, ("x" =~ /[^α-ω]/)
+  # mixed ASCII / non-ASCII range
+  assert_equal 0, ("m" =~ /[a-z₀-₉]/)
+  assert_equal 0, ("₅" =~ /[a-z₀-₉]/)
+end
+
+assert("Regexp - quantifier over multi-byte char class") do
+  assert_equal "a#b#c", "a₀₁b₂c".gsub(/[₀-₉]+/, "#")
+  assert_equal ["₀₁₂"], "₀₁₂".scan(/[₀-₉]+/)
+end
+
+assert("Regexp - octal and hex escapes") do
+  assert_equal 0, (/\033/ =~ "\e")
+  assert_equal 0, (/\x1b/ =~ "\e")
+  assert_equal 0, (/[\x41]/ =~ "A")
+  assert_equal 0, (/[\101]/ =~ "A")
+  assert_equal 0, (/\x7/ =~ "\a")
+end
+
+assert("Regexp - \\h and \\H hex-digit shorthands") do
+  assert_equal 0, (/\h/ =~ "f")
+  assert_nil (/\h/ =~ "g")
+  assert_equal 0, (/\H/ =~ "g")
+  assert_nil (/\H/ =~ "a")
+  assert_equal ["3f"], "3fX".scan(/[\h]+/)
+  assert_equal ["XY"], "3fXY".scan(/[\H]+/)
+  assert_equal ["deadBEEF"], "deadBEEFzz".scan(/\h+/)
 end

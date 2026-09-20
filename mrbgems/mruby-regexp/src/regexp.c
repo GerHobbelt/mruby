@@ -159,6 +159,39 @@ clear_match_globals(mrb_state *mrb)
   }
 }
 
+/* Byte-based substring extraction. The regexp engine records all capture
+   offsets in bytes, but mrb_str_substr indexes by character under
+   MRB_UTF8_STRING, which corrupts non-empty multibyte matches. Extract by
+   byte range so the byte offsets are honored as-is. Returns nil for an
+   out-of-range request, mirroring mrb_str_substr. */
+static mrb_value
+re_byte_substr(mrb_state *mrb, mrb_value str, mrb_int beg, mrb_int len)
+{
+  if (beg < 0 || len < 0 || beg + len > RSTRING_LEN(str)) return mrb_nil_value();
+  return mrb_str_new(mrb, RSTRING_PTR(str) + beg, len);
+}
+
+/* Convert a byte offset into str to a character offset, so MatchData#begin
+   and #end report character positions like CRuby. Counts UTF-8 lead bytes
+   (every byte that is not a 10xxxxxx continuation) in [0, byte_off). On
+   non-UTF-8 builds a byte is a character, so the offset is returned as-is. */
+static mrb_int
+re_byte_to_char(mrb_state *mrb, mrb_value str, mrb_int byte_off)
+{
+  (void)mrb;
+#ifdef MRB_UTF8_STRING
+  const char *p = RSTRING_PTR(str);
+  mrb_int chars = 0;
+  for (mrb_int i = 0; i < byte_off; i++) {
+    if (((unsigned char)p[i] & 0xC0) != 0x80) chars++;
+  }
+  return chars;
+#else
+  (void)str;
+  return byte_off;
+#endif
+}
+
 /* Create MatchData from captures */
 static mrb_value
 create_matchdata(mrb_state *mrb, mrb_value regexp, mrb_value str, int *captures, int ncap)
@@ -186,7 +219,7 @@ create_matchdata(mrb_state *mrb, mrb_value regexp, mrb_value str, int *captures,
     mrb_value val = mrb_nil_value();
     int g = i + 1;
     if (g < md->num_captures && captures[g*2] >= 0) {
-      val = mrb_str_substr(mrb, str, captures[g*2], captures[g*2+1] - captures[g*2]);
+      val = re_byte_substr(mrb, str, captures[g*2], captures[g*2+1] - captures[g*2]);
     }
     mrb_gv_set(mrb, nth_syms[i], val);
   }
@@ -466,7 +499,7 @@ found:
   int end = md->captures[idx * 2 + 1];
   if (start < 0) return mrb_nil_value();
 
-  return mrb_str_substr(mrb, md->source, start, end - start);
+  return re_byte_substr(mrb, md->source, start, end - start);
 }
 
 /* Build array of capture strings from group `from` to num_captures-1 */
@@ -484,7 +517,7 @@ matchdata_to_ary(mrb_state *mrb, mrb_value self, int from)
       mrb_ary_push(mrb, ary, mrb_nil_value());
     }
     else {
-      mrb_ary_push(mrb, ary, mrb_str_substr(mrb, md->source, s, e - s));
+      mrb_ary_push(mrb, ary, re_byte_substr(mrb, md->source, s, e - s));
     }
   }
   return ary;
@@ -515,11 +548,40 @@ matchdata_begin(mrb_state *mrb, mrb_value self)
   if (!md || idx < 0 || idx >= md->num_captures) return mrb_nil_value();
   int pos = md->captures[idx * 2];
   if (pos < 0) return mrb_nil_value();
-  return mrb_int_value(mrb, pos);
+  return mrb_int_value(mrb, re_byte_to_char(mrb, md->source, pos));
 }
 
 static mrb_value
 matchdata_end(mrb_state *mrb, mrb_value self)
+{
+  mrb_int idx;
+  mrb_get_args(mrb, "i", &idx);
+
+  mrb_match_data *md = DATA_GET_PTR(mrb, self, &matchdata_type, mrb_match_data);
+  if (!md || idx < 0 || idx >= md->num_captures) return mrb_nil_value();
+  int pos = md->captures[idx * 2 + 1];
+  if (pos < 0) return mrb_nil_value();
+  return mrb_int_value(mrb, re_byte_to_char(mrb, md->source, pos));
+}
+
+/* Private byte-offset accessors used by String#gsub, which works in byte
+   space (byteslice). begin/end report character offsets; these report the
+   raw byte offsets the engine recorded. */
+static mrb_value
+matchdata_byte_begin(mrb_state *mrb, mrb_value self)
+{
+  mrb_int idx;
+  mrb_get_args(mrb, "i", &idx);
+
+  mrb_match_data *md = DATA_GET_PTR(mrb, self, &matchdata_type, mrb_match_data);
+  if (!md || idx < 0 || idx >= md->num_captures) return mrb_nil_value();
+  int pos = md->captures[idx * 2];
+  if (pos < 0) return mrb_nil_value();
+  return mrb_int_value(mrb, pos);
+}
+
+static mrb_value
+matchdata_byte_end(mrb_state *mrb, mrb_value self)
 {
   mrb_int idx;
   mrb_get_args(mrb, "i", &idx);
@@ -539,7 +601,7 @@ matchdata_pre(mrb_state *mrb, mrb_value self)
 {
   mrb_match_data *md = DATA_GET_PTR(mrb, self, &matchdata_type, mrb_match_data);
   if (!md || md->captures[0] < 0) return mrb_nil_value();
-  return mrb_str_substr(mrb, md->source, 0, md->captures[0]);
+  return re_byte_substr(mrb, md->source, 0, md->captures[0]);
 }
 
 static mrb_value
@@ -548,7 +610,7 @@ matchdata_post(mrb_state *mrb, mrb_value self)
   mrb_match_data *md = DATA_GET_PTR(mrb, self, &matchdata_type, mrb_match_data);
   if (!md || md->captures[1] < 0) return mrb_nil_value();
   int pos = md->captures[1];
-  return mrb_str_substr(mrb, md->source, pos, RSTRING_LEN(md->source) - pos);
+  return re_byte_substr(mrb, md->source, pos, RSTRING_LEN(md->source) - pos);
 }
 
 /*
@@ -585,7 +647,7 @@ matchdata_named_captures(mrb_state *mrb, mrb_value self)
     if (group >= 0 && group < md->num_captures) {
       int s = md->captures[group * 2];
       int e = md->captures[group * 2 + 1];
-      if (s >= 0) val = mrb_str_substr(mrb, md->source, s, e - s);
+      if (s >= 0) val = re_byte_substr(mrb, md->source, s, e - s);
     }
     mrb_hash_set(mrb, result, name, val);
   }
@@ -624,7 +686,7 @@ matchdata_to_s(mrb_state *mrb, mrb_value self)
   if (!md || md->captures[0] < 0) return mrb_nil_value();
   int s = md->captures[0];
   int e = md->captures[1];
-  return mrb_str_substr(mrb, md->source, s, e - s);
+  return re_byte_substr(mrb, md->source, s, e - s);
 }
 
 /* --- C-level gsub/sub/scan core --- */
@@ -633,7 +695,7 @@ matchdata_to_s(mrb_state *mrb, mrb_value self)
 static void
 apply_replacement(mrb_state *mrb, mrb_value result,
                   const char *rep, mrb_int rep_len,
-                  const char *str, int *captures, int ncap)
+                  const char *str, mrb_int str_len, int *captures, int ncap)
 {
   mrb_int i = 0;
   while (i < rep_len) {
@@ -658,7 +720,11 @@ apply_replacement(mrb_state *mrb, mrb_value result,
       }
       else if (c == '\'') {
         if (captures[1] >= 0) {
-          mrb_str_cat(mrb, result, str + captures[1], strlen(str) - captures[1]);
+          /* post-match: bytes after the match end. Use the subject's real
+             byte length, not strlen(str): the subject may contain embedded
+             NUL bytes or be a non-NUL-terminated shared substring, in which
+             case strlen() underflows the length (issue #6892). */
+          mrb_str_cat(mrb, result, str + captures[1], str_len - captures[1]);
         }
       }
       else if (c == '+') {
@@ -740,7 +806,7 @@ regexp_gsub_str(mrb_state *mrb, mrb_value self)
 
     /* append replacement */
     if (need_expand) {
-      apply_replacement(mrb, result, rep, rep_len, s, captures, ncap);
+      apply_replacement(mrb, result, rep, rep_len, s, slen, captures, ncap);
     }
     else {
       mrb_str_cat(mrb, result, rep, rep_len);
@@ -816,7 +882,7 @@ regexp_sub_str(mrb_state *mrb, mrb_value self)
 
   /* replacement */
   if (has_backslash(rep, rep_len)) {
-    apply_replacement(mrb, result, rep, rep_len, s, captures, pat->num_captures);
+    apply_replacement(mrb, result, rep, rep_len, s, slen, captures, pat->num_captures);
   }
   else {
     mrb_str_cat(mrb, result, rep, rep_len);
@@ -867,13 +933,13 @@ regexp_scan(mrb_state *mrb, mrb_value self)
     if (ncap <= 1) {
       /* no captures or just group 0: push matched string */
       mrb_ary_push(mrb, ary,
-        mrb_str_substr(mrb, str, captures[0], captures[1] - captures[0]));
+        re_byte_substr(mrb, str, captures[0], captures[1] - captures[0]));
     }
     else if (ncap == 2) {
       /* single capture group: push capture string */
       if (captures[2] >= 0) {
         mrb_ary_push(mrb, ary,
-          mrb_str_substr(mrb, str, captures[2], captures[3] - captures[2]));
+          re_byte_substr(mrb, str, captures[2], captures[3] - captures[2]));
       }
       else {
         mrb_ary_push(mrb, ary, mrb_nil_value());
@@ -885,7 +951,7 @@ regexp_scan(mrb_state *mrb, mrb_value self)
       for (int i = 1; i < ncap; i++) {
         if (captures[i * 2] >= 0) {
           mrb_ary_push(mrb, sub,
-            mrb_str_substr(mrb, str, captures[i*2], captures[i*2+1] - captures[i*2]));
+            re_byte_substr(mrb, str, captures[i*2], captures[i*2+1] - captures[i*2]));
         }
         else {
           mrb_ary_push(mrb, sub, mrb_nil_value());
@@ -963,6 +1029,8 @@ mrb_mruby_regexp_gem_init(mrb_state *mrb)
   mrb_define_method(mrb, md, "size", matchdata_length, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "begin", matchdata_begin, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, md, "end", matchdata_end, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, md, "__byte_begin", matchdata_byte_begin, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, md, "__byte_end", matchdata_byte_end, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, md, "pre_match", matchdata_pre, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "post_match", matchdata_post, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "named_captures", matchdata_named_captures, MRB_ARGS_NONE());

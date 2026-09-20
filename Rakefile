@@ -12,6 +12,10 @@ $LOAD_PATH << File.join(MRUBY_ROOT, "lib")
 require "mruby/core_ext"
 require "mruby/build"
 
+if ENV["MRB_COMPILER_PRISM"] == "yes" && ENV["MRUBY_CONFIG"].to_s.empty? && ENV["CONFIG"].to_s.empty?
+  ENV["MRUBY_CONFIG"] = "prism"
+end
+
 # load configuration file
 MRUBY_CONFIG = MRuby::Build.mruby_config_path
 load MRUBY_CONFIG
@@ -56,6 +60,13 @@ task :all => :gensym do
 end
 
 task :build => MRuby.targets.flat_map{|_, build| build.products}
+
+desc "download all gem dependencies without building"
+task :fetch do
+  MRuby.each_target do |build|
+    puts "Dependencies ready for '#{build.name}'"
+  end
+end
 
 desc "clean all built and in-repo installed artifacts"
 task :clean do
