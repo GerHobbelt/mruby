@@ -1,0 +1,16 @@
+MRuby::Gem::Specification.new('mruby-process') do |spec|
+  spec.license = 'MIT'
+  spec.authors = 'mruby developers'
+  spec.summary = 'Process module and Process::Status class'
+
+  # mruby-process needs no I/O of its own.  The tests do: waiting on a child
+  # is only testable with a child, and IO.popen is how one is made.  The
+  # dependency stops at the tests; see README.md.
+  spec.add_test_dependency 'mruby-io', core: 'mruby-io'
+
+  # A gem's tests run in a state holding its dependency closure and nothing
+  # else, so a test that means to name an Errno class has to ask for the gem
+  # that defines them.  Without this the tests still pass, by taking the
+  # branch that settles for any StandardError.
+  spec.add_test_dependency 'mruby-errno', core: 'mruby-errno'
+end

@@ -585,12 +585,50 @@ hex_value(int ch)
   return -1;
 }
 
+static int parse_escape(re_compiler *c);
+
+/* Read the character a control escape names and return the control character
+   it stands for. `\cX` and `\C-X` name the same one, and a `\` in the X
+   position opens an escape of its own, so `\c\n` is a control newline.
+
+   The mask is the one this build's own lexer uses for a string, which is what
+   a regexp literal is read by: /\cA/ reaches the engine as the byte already.
+   Only Regexp.new() with a written-out backslash arrives here, and the two
+   spellings have to name the same character. That settles `\c?`, where CRuby
+   disagrees with itself: its lexer answers DEL and Onig answers 0x1f, so
+   /\c?/ and Regexp.new("\\c?") are two different patterns there. Following
+   the lexer keeps the pair together here. */
+static int
+parse_control_escape(re_compiler *c)
+{
+  int ch = next_char(c);
+
+  if (ch < 0) compile_error(c, "too short control escape");
+  if (ch == '\\') ch = parse_escape(c);
+  if (ch == '?') return 0x7f;
+  return ch & 0x1f;
+}
+
 static int
 parse_escape(re_compiler *c)
 {
   int ch = next_char(c);
   if (ch < 0) compile_error(c, "trailing backslash");
   switch (ch) {
+  case 'c':
+    return parse_control_escape(c);
+  case 'C':
+    /* Only the `\C-X` spelling names a control character; a `\C` with
+       anything else after it is the escape ending early, as it is to CRuby. */
+    if (peek(c) != '-') compile_error(c, "too short control escape");
+    next_char(c);
+    return parse_control_escape(c);
+  case 'M':
+    /* `\M-X` sets the high bit, making a byte that starts no character. This
+       engine has no encoding to read one against (see README.md), and CRuby
+       refuses the escape in a pattern that is not binary, so it is refused
+       rather than answered with a byte nothing matches. */
+    compile_error(c, "meta escape is not supported");
   case 'n': return '\n';
   case 't': return '\t';
   case 'r': return '\r';
@@ -842,6 +880,33 @@ read_class_atom(re_compiler *c, re_charclass *cc, mrb_bool *is_byte, mrb_bool cl
 }
 
 /* Parse [...] character class */
+/* Whether `\X` at `src` is one of the shorthand classes the class parser
+   folds in whole. Each names a set rather than a character. */
+static mrb_bool
+at_shorthand_class(const char *src, const char *end)
+{
+  if (*src != '\\' || src + 1 >= end) return FALSE;
+  switch (src[1]) {
+  case 'd': case 'D': case 'w': case 'W':
+  case 's': case 'S': case 'h': case 'H':
+    return TRUE;
+  default:
+    return FALSE;
+  }
+}
+
+/* A shorthand and a POSIX bracket each name a set, so neither can be an end
+   of a range. Called where one has just been folded in: a '-' after it opens
+   a range this class cannot have, and CRuby reports that '-' rather than
+   reading it as a member. A '-' just before the ']' is a member in both. */
+static void
+reject_set_as_range_start(re_compiler *c)
+{
+  if (peek(c) == '-' && c->p + 1 < c->src_end && c->p[1] != ']') {
+    compile_error(c, "unmatched range specifier in char-class");
+  }
+}
+
 static void
 compile_charclass(re_compiler *c)
 {
@@ -865,6 +930,30 @@ compile_charclass(re_compiler *c)
     if (peek(c) < 0) compile_error(c, "unterminated character class");
     first = FALSE;
 
+    /* `&&` takes the intersection of what is written either side of it, which
+       this engine does not do. Read as members it is the opposite of what was
+       asked: [a&&b] would hold a, & and b where it names nothing at all, so a
+       class written to narrow one would widen it instead. A lone `&` is a
+       member here as it is in CRuby, and an escaped one (`\&&`) is that
+       member followed by whatever comes next. */
+    if (peek(c) == '&' && c->p + 1 < c->src_end && c->p[1] == '&') {
+      compile_error(c, "character class intersection is not supported");
+    }
+
+    /* A '[' inside a class opens something in CRuby rather than standing for
+       itself: a POSIX bracket, a collating element, an equivalence class, or
+       a class nested in this one. Only the bracket is read here and the rest
+       are refused, since taken as members they compile to a different pattern
+       than the one written: [[a][b]] is the union of two classes there and
+       was `[` or `a`, then b, then `]` here. `[\[]` holds the bracket itself,
+       in CRuby as well. A '[' with nothing after it leaves the class
+       unterminated, which the loop reports on its own. */
+    if (peek(c) == '[' && c->p + 1 < c->src_end) {
+      if (c->p[1] == '.') compile_error(c, "POSIX collating element is not supported");
+      if (c->p[1] == '=') compile_error(c, "POSIX equivalence class is not supported");
+      if (c->p[1] != ':') compile_error(c, "nested character class is not supported");
+    }
+
     /* POSIX bracket class: [:name:] or negated [:^name:] inside [...]. */
     if (peek(c) == '[' && c->p + 1 < c->src_end && c->p[1] == ':') {
       const char *save = c->p;
@@ -874,6 +963,7 @@ compile_charclass(re_compiler *c)
       if (peek(c) == '^') { neg = TRUE; next_char(c); }
       const char *name = c->p;
       while (peek(c) >= 0 && peek(c) != ':' && peek(c) != ']') next_char(c);
+      mrb_bool stopped_at_bracket_end = (peek(c) == ']');
       if (peek(c) == ':' && c->p + 1 < c->src_end && c->p[1] == ']') {
         uint8_t bits[16] = {0};
         mrb_bool by_ascii;
@@ -902,9 +992,20 @@ compile_charclass(re_compiler *c)
 #else
         if (neg) dst->utf8_any = TRUE;
 #endif
+        reject_set_as_range_start(c);
         continue;
       }
-      c->p = save;  /* not a POSIX class; treat '[' as a literal below */
+      /* The '[' opened a bracket, so a name that does not close is the
+         bracket ending early rather than a literal '[', as it is to CRuby.
+         Which of the two things went wrong depends on where the scan
+         stopped: at a ']' the class does close and only the bracket ended
+         early, and anywhere else (a ':' with nothing after it, or the end of
+         the pattern) the class never closes either, which is the older and
+         more particular complaint of the two. */
+      c->p = save;
+      compile_error(c, stopped_at_bracket_end
+                    ? "premature end of char-class"
+                    : "unterminated character class");
     }
 
     /* Shorthand classes (\d, \D, \w, \W, \s, \S, \h, \H) are handled
@@ -912,11 +1013,18 @@ compile_charclass(re_compiler *c)
        stay intact. */
     if (peek(c) == '\\') {
       int esc = (c->p + 1 < c->src_end) ? (uint8_t)c->p[1] : -1;
+      /* The engine reads no character property, and the members below would
+         make one of every letter of the name: [\p{Han}] would hold H, a and
+         n. Refused rather than answered with the text of the request. */
+      if ((esc == 'p' || esc == 'P') && c->p + 2 < c->src_end && c->p[2] == '{') {
+        compile_error(c, "character property is not supported");
+      }
       if (esc == 'd' || esc == 'D' || esc == 'w' || esc == 'W' ||
           esc == 's' || esc == 'S' || esc == 'h' || esc == 'H') {
         next_char(c);  /* '\\' */
         next_char(c);  /* spec  */
         class_add_shorthand((esc == 'w' || esc == 'W') ? &ascii_set : cc, esc);
+        reject_set_as_range_start(c);
         continue;
       }
     }
@@ -927,6 +1035,13 @@ compile_charclass(re_compiler *c)
     /* check for range a-z (or U+xxxx-U+yyyy) */
     if (peek(c) == '-' && c->p + 1 < c->src_end && c->p[1] != ']') {
       next_char(c);  /* skip '-' */
+      /* A set cannot close a range either. Read as a character `\d` is the
+         letter, so [a-\d] was [a-d], a class of four letters rather than the
+         error CRuby reports. A POSIX bracket in that place is caught by the
+         backwards-range check below, since its '[' sorts under every letter. */
+      if (at_shorthand_class(c->p, c->src_end)) {
+        compile_error(c, "char-class value at end of range");
+      }
       mrb_bool hi_byte;
       uint32_t hi = read_class_atom(c, cc, &hi_byte, TRUE);
       /* An endpoint at or above 128 is a byte or a character, and a span from
@@ -1218,34 +1333,41 @@ compute_fixed_len(re_compiler *c, uint32_t start, uint32_t end, int *chars_out)
 }
 
 /* Parse the option letters of an inline (?...) group. The parser is
-   positioned just past the '?'; it reads a run of i/m/x, an optional '-',
-   and a further run of i/m/x to switch off, then stops at the terminator
-   (':' or ')'). `base` is the option set in effect on entry; the resulting
-   set is returned. Ruby's inline letters are i (IGNORECASE), m (DOTALL),
+   positioned just past the '?'; it reads i, m, x and '-' in any order until
+   the terminator (':' or ')'), a '-' switching the letters after it off.
+   `base` is the option set in effect on entry; the resulting set is
+   returned. Ruby's inline letters are i (IGNORECASE), m (DOTALL),
    x (EXTENDED). All three are scoped alike by the group they are read in:
    skip_extended_space() reads x from c->flags, which compile_atom() saves
    at every '(' and restores at its ')'. preprocess_pattern() tracks the
    same scopes over the pattern as written for the one thing it still does
-   under /x, removing `#` comments. */
+   under /x, removing `#` comments.
+
+   No letter has to come at all, and a second '-' is read like the first:
+   Onigmo's loop asks only that what it reads is one of these bytes and that
+   what stops it is the terminator, so `(?-)` is a toggle that changes
+   nothing, `(?-:a)` is `(?:a)` and `(?--i)` is `(?-i)`. A generator that
+   writes `(?#{on}-#{off}:...)` reaches the first two with both lists empty.
+   The caller reports what stops the loop when it is neither ':' nor ')',
+   which is where a letter that is not an option is refused, and `(?)` never
+   gets here at all: compile_atom() takes this arm only on i, m, x or '-'. */
 static uint32_t
 parse_inline_flags(re_compiler *c, uint32_t base)
 {
   uint32_t on = 0, off = 0;
-  mrb_bool negate = FALSE, seen = FALSE;
+  mrb_bool negate = FALSE;
   for (;;) {
     int oc = peek(c);
     uint32_t bit;
     if (oc == 'i') bit = RE_FLAG_IGNORECASE;
     else if (oc == 'm') bit = RE_FLAG_DOTALL;
     else if (oc == 'x') bit = RE_FLAG_EXTENDED;
-    else if (oc == '-' && !negate) { negate = TRUE; next_char(c); continue; }
+    else if (oc == '-') { negate = TRUE; next_char(c); continue; }
     else break;
     if (negate) off |= bit;
     else on |= bit;
-    seen = TRUE;
     next_char(c);
   }
-  if (!seen) compile_error(c, "undefined (?...) sequence");
   return (base | on) & ~off;
 }
 
@@ -1795,6 +1917,33 @@ compile_atom(re_compiler *c)
       emit(c, RE_BACKREF, (uint8_t)group, (c->flags & RE_FLAG_IGNORECASE) ? 1 : 0);
       c->has_backref = TRUE;
     }
+    else if (ch == 'g' && c->p + 1 < c->src_end &&
+             (c->p[1] == '<' || c->p[1] == '\'')) {
+      /* `\g<name>` calls a group's sub-pattern again, which this engine does
+         not do. Left to the fall-through it was the letter `g` and the name
+         was literal text, so /(a)\g<1>/ matched "ag<1>" rather than "aa".
+         A bare `\g` is the letter in CRuby too, and stays one. */
+      compile_error(c, "subexpression call is not supported");
+    }
+    else if (ch == 'G' || ch == 'K' || ch == 'R' || ch == 'X') {
+      /* Each of these means something in CRuby that this engine does not do:
+         `\G` anchors at where the search began, `\K` drops what was matched
+         before it, `\R` is any linebreak and `\X` is a whole grapheme
+         cluster. Left to the fall-through each was simply its own letter, so
+         /\R/ matched an R rather than a newline. Inside a character class
+         CRuby reads them as the letter too, which is what the class parser
+         already does, so only the escape outside one is refused here. */
+      compile_error_str(c, mrb_format(c->mrb, "\\\\%c is not supported", (char)ch));
+    }
+    else if ((ch == 'p' || ch == 'P') && c->p + 1 < c->src_end && c->p[1] == '{') {
+      /* The engine reads no character property. Without this the escape is
+         the letter it names and the braces are literal too, so /\p{Alpha}/
+         would answer a pattern that asked for a letter with the text of the
+         request. `[[:alpha:]]` is how to ask for one; see README.md.
+         Only the braced spelling is a property: CRuby reads a bare `\p`, and
+         `\pL` as well, as the letter, and so does the fall-through below. */
+      compile_error(c, "character property is not supported");
+    }
     else if (ch == 'u') {
       next_char(c);  /* skip u */
       mrb_bool more;
@@ -2289,20 +2438,24 @@ skip_uninterpreted(const char *src, const char *end, mrb_bool *in_class, int *pa
    not name x. Returns the terminator's position, or NULL when the bytes
    are not an option group at all, which includes every malformed one: the
    parser reads those bytes too and reports them, and this pass has only to
-   agree with it about the well-formed ones. */
+   agree with it about the well-formed ones.
+
+   The letters are optional here as they are in parse_inline_flags(), so a
+   plain `(?:` is read as a scoped group carrying no options; that is what
+   it is, and the pass does the same with it either way, opening a scope
+   and leaving x as it stands. */
 static const char*
 scan_option_group(const char *src, const char *end, mrb_bool *toggle, mrb_bool *x_on)
 {
   if (end - src < 3 || src[1] != '?') return NULL;
   const char *q = src + 2;
-  mrb_bool negate = FALSE, seen = FALSE;
+  mrb_bool negate = FALSE;
   for (; q < end; q++) {
-    if (*q == 'x') { *x_on = !negate; seen = TRUE; }
-    else if (*q == 'i' || *q == 'm') seen = TRUE;
-    else if (*q == '-' && !negate) negate = TRUE;
-    else break;
+    if (*q == '-') negate = TRUE;
+    else if (*q == 'x') *x_on = !negate;
+    else if (*q != 'i' && *q != 'm') break;
   }
-  if (!seen || q >= end || (*q != ')' && *q != ':')) return NULL;
+  if (q >= end || (*q != ')' && *q != ':')) return NULL;
   *toggle = (*q == ')');
   return q;
 }

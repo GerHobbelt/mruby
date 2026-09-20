@@ -19,3 +19,69 @@ if Object.const_defined?(:TaskTest) && TaskTest.respond_to?(:proc_set_stack)
     assert_true slots >= nregs, "task stack (#{slots}) must cover replacement proc nregs (#{nregs})"
   end
 end
+
+# Regression: an undersized context puts ci->stack past stend, which is the
+# state above before #7279 and the one an embedder reaches by entering the VM
+# the same way. stack_extend_alloc() reads its size floor as the frame's
+# offset from the bottom of the stack; read as the room above the frame the
+# unsigned subtraction wrapped, the growth math asked for a stack no allocator
+# could give, and the extend raised NoMemoryError rather than growing.
+if Object.const_defined?(:TaskTest) && TaskTest.respond_to?(:extend_past_stend)
+  assert('mruby-task: the VM stack grows for a frame that sits past its top') do
+    over = 8
+    size = TaskTest.extend_past_stend(Proc.new { }, over, 4)
+    # `assert_not_nil` records a failure without leaving the block, so the
+    # size is only compared when there is one; otherwise the miss reads as a
+    # NoMethodError on nil rather than as the assertion that failed.
+    assert_not_nil size, "the extend raised instead of growing the stack"
+    if size
+      assert_true size > over,
+                  "new stack (#{size}) must reach the frame at #{over} past the old top"
+    end
+  end
+end
+
+# Deep-frame variant: a task suspended mid-call-chain holds its current frame
+# at an offset from the stack base, and proc_set installs the proc on that
+# frame. Sizing the stack by total capacity misses this case: the proc fits
+# the capacity, the frame offset plus the proc does not, and the resumed task
+# writes past the stack.
+if Object.const_defined?(:TaskTest) && TaskTest.respond_to?(:proc_set_deep)
+  assert('mruby-task: proc_set sizes the stack from the frame of a preempted task') do
+    # Suspend a task at the bottom of a nested call chain.
+    nest = nil
+    nest = lambda do |n|
+      if n > 0
+        nest.call(n - 1)
+      else
+        sleep # suspend this task mid-chain
+      end
+    end
+    deep = Task.new { nest.call(8) }
+    begin
+      50.times do
+        break if deep.status == :SUSPENDED
+        TaskTest.run_once
+      end
+      assert_equal :SUSPENDED, deep.status
+
+      # ~40 locals -> nregs below TASK_STACK_INIT_SIZE (64) on its own, past it
+      # when placed on the suspended task's frame.
+      big = Proc.new {
+        a0=0;a1=0;a2=0;a3=0;a4=0;a5=0;a6=0;a7=0;a8=0;a9=0;a10=0;a11=0;a12=0;a13=0;a14=0;a15=0;a16=0;a17=0;a18=0;a19=0;
+        a20=0;a21=0;a22=0;a23=0;a24=0;a25=0;a26=0;a27=0;a28=0;a29=0;a30=0;a31=0;a32=0;a33=0;a34=0;a35=0;a36=0;a37=0;a38=0;a39=0
+      }
+      off, need, before, after = TaskTest.proc_set_deep(deep, big)
+      # Preconditions that make this the deep-frame case. If the call chain or
+      # the proc drift in size, these fail loudly instead of testing nothing.
+      assert_true off > 0, "suspended task should hold a deep frame (off=#{off})"
+      assert_true need <= before, "proc alone should fit the old capacity (need=#{need}, before=#{before})"
+      assert_true off + need > before, "frame + proc should exceed the old capacity (off=#{off}, need=#{need}, before=#{before})"
+      assert_true after >= off + need, "task stack (#{after}) must cover frame offset (#{off}) + proc nregs (#{need})"
+    ensure
+      # Drop the probe task even when something above raised. A suspended
+      # task left in the queue keeps a later Task.run from terminating.
+      deep.terminate unless deep.status == :DORMANT
+    end
+  end
+end

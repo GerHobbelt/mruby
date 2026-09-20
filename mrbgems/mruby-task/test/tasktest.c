@@ -4,6 +4,7 @@
 #include <mruby/proc.h>
 #include <mruby/data.h>
 #include <mruby/array.h>
+#include <mruby/error.h>
 #include "task.h"
 
 /* Burn CPU until `ms` milliseconds of CPU time have elapsed, then raise.
@@ -157,6 +158,115 @@ tasktest_proc_set_stack(mrb_state *mrb, mrb_value self)
   return mrb_ary_new_from_values(mrb, 2, r);
 }
 
+struct extend_probe {
+  struct mrb_context *c;
+  mrb_int room;
+};
+
+static mrb_value
+extend_probe_body(mrb_state *mrb, void *ud)
+{
+  struct extend_probe *a = (struct extend_probe*)ud;
+  mrb_stack_extend(mrb, a->room);
+  return mrb_fixnum_value((mrb_int)(a->c->stend - a->c->stbase));
+}
+
+/* Regression for the frame-offset floor in stack_extend_alloc(): a context
+   whose ci->stack sits past stend has to grow all the same. That is what an
+   undersized context looks like from inside the VM, and is the state this
+   gem reached before #7279, since cipush places a frame before the stack is
+   extended. Reading the floor as `stend - ci->stack` rather than
+   `ci->stack - stbase` made the unsigned subtraction wrap, and the growth
+   math then asked for a stack no allocator could give: NoMemoryError instead
+   of a bigger one.
+
+   A task's own context is the probe, so the running VM's stack is never the
+   one moved. Returns the stack size after the extend, or nil where it
+   raised. */
+static mrb_value
+tasktest_extend_past_stend(mrb_state *mrb, mrb_value self)
+{
+  mrb_value blk;
+  mrb_int over, room;
+  mrb_get_args(mrb, "oii", &blk, &over, &room);
+
+  mrb_value task = mrb_create_task(mrb, mrb_proc_ptr(blk), mrb_nil_value(),
+                                   mrb_nil_value(), mrb_obj_value(mrb->top_self));
+  mrb_task *t = (mrb_task*)DATA_PTR(task);
+
+  t->c.ci->stack = t->c.stend + over;
+
+  struct extend_probe probe;
+  probe.c = &t->c;
+  probe.room = room;
+
+  struct mrb_context *saved = mrb->c;
+  mrb_bool err = FALSE;
+  mrb->c = &t->c;
+  mrb_value size = mrb_protect_error(mrb, extend_probe_body, &probe, &err);
+  mrb->c = saved;
+
+  /* Never run the probe task; its context was deliberately made incoherent. */
+  mrb_terminate_task(mrb, task);
+  return err ? mrb_nil_value() : size;
+}
+
+/* Deep-frame variant of the proc_set sizing regression: a task suspended
+   mid-call-chain holds its current frame at an offset from the stack base,
+   and proc_set installs the proc on that frame. The stack must be sized
+   from the frame offset, not the total capacity. Returns
+   [frame_off, replacement_nregs, slots_before, slots_after]. */
+struct proc_set_deep_ctx {
+  mrb_value task;
+  struct RProc *proc;
+};
+
+static mrb_value
+proc_set_deep_body(mrb_state *mrb, void *data)
+{
+  struct proc_set_deep_ctx *ctx = (struct proc_set_deep_ctx*)data;
+  mrb_task_proc_set(mrb, ctx->task, ctx->proc);
+  return mrb_nil_value();
+}
+
+static mrb_value
+tasktest_proc_set_deep(mrb_state *mrb, mrb_value self)
+{
+  mrb_value task, big_blk;
+  mrb_get_args(mrb, "oo", &task, &big_blk);
+  if (!mrb_obj_is_kind_of(mrb, task, mrb_class_get(mrb, "Task"))) {
+    mrb_raise(mrb, E_TYPE_ERROR, "Task required");
+  }
+  if (mrb_type(big_blk) != MRB_TT_PROC) {
+    mrb_raise(mrb, E_TYPE_ERROR, "Proc required");
+  }
+  struct RProc *big = mrb_proc_ptr(big_blk);
+  if (MRB_PROC_CFUNC_P(big) || MRB_PROC_ALIAS_P(big) || !big->body.irep) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "irep proc required");
+  }
+
+  mrb_task *t = (mrb_task*)DATA_PTR(task);
+  if (!t || !t->c.stbase || !t->c.ci) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "task has no context");
+  }
+  mrb_value r[4];
+  r[0] = mrb_fixnum_value((mrb_int)(t->c.ci->stack - t->c.stbase));
+  r[1] = mrb_fixnum_value((mrb_int)big->body.irep->nregs);
+  r[2] = mrb_fixnum_value((mrb_int)(t->c.stend - t->c.stbase));
+
+  struct proc_set_deep_ctx ctx = { task, big };
+  mrb_value result;
+  MRB_ENSURE(mrb, result, proc_set_deep_body, &ctx) {
+    r[3] = mrb_fixnum_value((mrb_int)(t->c.stend - t->c.stbase));
+    /* Drop the probe task even when proc_set raises: a sleep-forever task
+       left suspended keeps a later Task.run from terminating. It is never
+       resumed either way, the proc was installed on a deep frame only to
+       measure the sizing. */
+    mrb_terminate_task(mrb, task);
+  }
+  return mrb_ary_new_from_values(mrb, 4, r);
+}
+
 void
 mrb_mruby_task_gem_test(mrb_state* mrb)
 {
@@ -170,4 +280,6 @@ mrb_mruby_task_gem_test(mrb_state* mrb)
   mrb_define_module_function(mrb, tasktest, "reinit_context", tasktest_reinit_context, MRB_ARGS_REQ(1) | MRB_ARGS_BLOCK());
   mrb_define_module_function(mrb, tasktest, "run_sync", tasktest_run_sync, MRB_ARGS_BLOCK());
   mrb_define_module_function(mrb, tasktest, "proc_set_stack", tasktest_proc_set_stack, MRB_ARGS_REQ(2));
+  mrb_define_module_function(mrb, tasktest, "extend_past_stend", tasktest_extend_past_stend, MRB_ARGS_REQ(3));
+  mrb_define_module_function(mrb, tasktest, "proc_set_deep", tasktest_proc_set_deep, MRB_ARGS_REQ(2));
 }
