@@ -174,15 +174,20 @@ clear_match_globals(mrb_state *mrb)
    offsets in bytes, but mrb_str_substr indexes by character under
    MRB_UTF8_STRING, which corrupts non-empty multibyte matches. Extract by
    byte range so the byte offsets are honored as-is. Returns nil for an
-   out-of-range request, mirroring mrb_str_substr. */
+   out-of-range request, mirroring mrb_str_substr.
+
+   mrb_str_byte_subseq() shares the subject's buffer for a piece too long to
+   embed rather than copying its bytes, and carries the byte reading across the
+   way this did. That is what makes a publish cheap: `$\`` and `$'` are the
+   whole of the subject between them, so copying them cost the subject once per
+   match, and every search publishes. A sharer holds the buffer alive, which is
+   the trade: a piece short enough to embed is copied as before, and a long one
+   is a window on bytes `$~` is holding anyway. */
 static mrb_value
 re_byte_substr(mrb_state *mrb, mrb_value str, mrb_int beg, mrb_int len)
 {
   if (beg < 0 || len < 0 || beg + len > RSTRING_LEN(str)) return mrb_nil_value();
-  mrb_value ret = mrb_str_new(mrb, RSTRING_PTR(str) + beg, len);
-  /* a piece of a byte-read subject is bytes of it, read the same way */
-  RSTR_COPY_BINARY_FLAG(mrb_str_ptr(ret), mrb_str_ptr(str));
-  return ret;
+  return mrb_str_byte_subseq(mrb, str, beg, len);
 }
 
 /* Convert a byte offset into str to a character offset, so MatchData#begin
@@ -281,6 +286,32 @@ regexp_check_encoding(mrb_state *mrb, mrb_value self)
   mrb_value str;
   mrb_get_args(mrb, "S", &str);
   re_check_encoding(mrb, str);
+  return mrb_nil_value();
+}
+
+/*
+ * Regexp.__check_byte_pos(str, pos)
+ *
+ * Internal: `mrb_str_check_byte_pos()`, for the byte searches this gem takes
+ * over. `String#byteindex` and `String#byterindex` reach the C methods that
+ * ask this for every argument form but a Regexp, and the answer a search gives
+ * may not turn on which of the two it was reached through.
+ */
+static mrb_value
+regexp_check_byte_pos(mrb_state *mrb, mrb_value self)
+{
+  (void)self;
+  mrb_value str;
+  mrb_int pos;
+  mrb_get_args(mrb, "Si", &str, &pos);
+  /* The mrblib callers read the position against the byte length and answer
+     both ends themselves before asking this, so one outside the subject
+     reaches here only from a direct call. There is no boundary to ask about
+     at a position the subject does not have, and mrb_str_check_byte_pos()
+     would read behind RSTRING_PTR(str) looking for one. A backstop, as
+     check_regexp_arg() below is for a pattern. */
+  if (pos < 0 || pos > RSTRING_LEN(str)) return mrb_nil_value();
+  mrb_str_check_byte_pos(mrb, str, pos);
   return mrb_nil_value();
 }
 
@@ -501,6 +532,17 @@ regexp_s_byte_search(mrb_state *mrb, mrb_value klass)
 
   mrb_get_args(mrb, "oS|ibb", &re, &str, &pos, &checked, &publish);
   check_regexp_arg(mrb, re);
+  /* Every mrblib loop enters at zero or at an offset a match answered with,
+     so a position before the subject reaches here only from a direct call.
+     A backstop, as check_regexp_arg() above is: the answer is the miss a
+     position past the end already gives, rather than the read behind
+     RSTRING_PTR(str) that the engine would make of it. Asked before the
+     encoding is, as `__search` asks a position it cannot place, since a
+     subject the position names nothing in is not read either way. */
+  if (pos < 0) {
+    if (publish) clear_match_globals(mrb);
+    return mrb_nil_value();
+  }
   if (!checked) re_check_encoding(mrb, str);
   return exec_match(mrb, re, str, pos, publish);
 }
@@ -1163,7 +1205,7 @@ re_mark_spliced(mrb_value result, mrb_value subject, mrb_value replacement,
     while (p < e && !(*p & 0x80)) p++;
     if (p == e) return;
   }
-  mrb_str_ptr(result)->flags |= MRB_STR_BINARY;
+  RSTR_ENCODING_SET(mrb_str_ptr(result), MRB_STR_ENCODING_BINARY);
 }
 
 /*
@@ -1449,6 +1491,7 @@ mrb_mruby_regexp_gem_init(mrb_state *mrb)
   mrb_define_class_method(mrb, re, "__binary_string?", regexp_binary_string_p, MRB_ARGS_REQ(1));
   mrb_define_class_method(mrb, re, "__check_encoding", regexp_check_encoding, MRB_ARGS_REQ(1));
   mrb_define_class_method(mrb, re, "__check_pattern", regexp_check_pattern, MRB_ARGS_REQ(1));
+  mrb_define_class_method(mrb, re, "__check_byte_pos", regexp_check_byte_pos, MRB_ARGS_REQ(2));
   mrb_define_class_method(mrb, re, "__search", regexp_s_search, MRB_ARGS_ARG(2, 2));
   mrb_define_class_method(mrb, re, "__byte_search", regexp_s_byte_search, MRB_ARGS_ARG(2, 3));
   mrb_define_class_method(mrb, re, "__search_p", regexp_s_search_p, MRB_ARGS_ARG(2, 1));

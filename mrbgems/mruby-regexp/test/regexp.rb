@@ -151,6 +151,42 @@ assert("Regexp - match operand rejects other types") do
   assert_false(/a/ === nil)
 end
 
+assert("Regexp.__byte_search answers a position before the subject with a miss") do
+  # The mrblib loops enter this at zero or at an offset a match answered with,
+  # so a negative one arrives only from a direct call. Left to the engine it
+  # would read behind the subject; the answer instead is the miss a position
+  # past the end already gives, and it clears the match globals the same way.
+  $~ = /b/.match("abc")
+  assert_nil Regexp.__byte_search(/b/, "abc", -1)
+  assert_nil $~
+
+  $~ = /b/.match("abc")
+  assert_nil Regexp.__byte_search(/b/, "abc", -1000000)
+  assert_nil $~
+
+  $~ = /b/.match("abc")
+  assert_nil Regexp.__byte_search(/b/, "abc", 1000000)
+  assert_nil $~
+
+  # and a search that publishes nothing clears nothing either, at both ends
+  $~ = /b/.match("abc")
+  assert_nil Regexp.__byte_search(/b/, "abc", -1, false, false)
+  assert_equal "b", $~[0]
+  assert_nil Regexp.__byte_search(/b/, "abc", 1000000, false, false)
+  assert_equal "b", $~[0]
+
+  # and it is answered before the subject is read, the way `__search` answers a
+  # position it cannot place: a subject the position names nothing in is not
+  # read either way
+  bad = "\xFF"
+  assert_nil Regexp.__byte_search(/b/, bad, -1)
+  if __ENCODING__ == "UTF-8"
+    assert_raise(ArgumentError) { Regexp.__byte_search(/b/, bad, 0) }
+  else
+    assert_nil Regexp.__byte_search(/b/, bad, 0)
+  end
+end
+
 assert("Regexp.escape") do
   assert_equal "a\\.b\\*c", Regexp.escape("a.b*c")
 
@@ -177,6 +213,28 @@ assert("Regexp.escape") do
   end
   assert_true Regexp.new(Regexp.escape("a b"), Regexp::EXTENDED).match?("a b")
   assert_true Regexp.new(Regexp.escape("a # b"), Regexp::EXTENDED).match?("a # b")
+end
+
+assert("Regexp.__check_byte_pos passes a position the subject does not have") do
+  # `String#byteindex` and `String#byterindex` read the position against the
+  # byte length and answer both ends themselves before asking this, so one
+  # outside the subject arrives only from a direct call. A position the subject
+  # does not have sits on no boundary, and looking for one would read behind
+  # the subject.
+  s = "あいう"
+  assert_nil Regexp.__check_byte_pos(s, -1)
+  assert_nil Regexp.__check_byte_pos(s, -1000000)
+  assert_nil Regexp.__check_byte_pos(s, s.bytesize + 1)
+  assert_nil Regexp.__check_byte_pos(s, 1000000)
+
+  # the ones it does have are still asked
+  assert_nil Regexp.__check_byte_pos(s, 0)
+  assert_nil Regexp.__check_byte_pos(s, s.bytesize)
+  if __ENCODING__ == "UTF-8"
+    assert_raise(IndexError) { Regexp.__check_byte_pos(s, 1) }
+  else
+    assert_nil Regexp.__check_byte_pos(s, 1)
+  end
 end
 
 assert("Regexp#inspect") do

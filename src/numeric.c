@@ -475,7 +475,7 @@ flo_to_s(mrb_state *mrb, mrb_value flt)
     str = mrb_float_to_str(mrb, flt, NULL);
   }
 
-  RSTR_SET_ASCII_FLAG(mrb_str_ptr(str));
+  RSTR_CODERANGE_SET(mrb_str_ptr(str), MRB_STR_CODERANGE_7BIT);
   return str;
 }
 
@@ -638,6 +638,9 @@ num_eql(mrb_state *mrb, mrb_value x)
 
 #ifdef MRB_USE_BIGINT
   if (mrb_bigint_p(x)) {
+    /* `eql?` compares class as well as value, and `mrb_bint_cmp()` compares a
+       Float argument numerically, so reject non-Integer arguments up front. */
+    if (!mrb_bigint_p(y) && !mrb_integer_p(y)) return mrb_false_value();
     return mrb_bool_value(mrb_bint_cmp(mrb, x, y) == 0);
   }
 #endif
@@ -2038,7 +2041,7 @@ mrb_integer_to_str(mrb_state *mrb, mrb_value x, mrb_int base)
   const char *p = mrb_int_to_cstr(buf, sizeof(buf), val, base);
   mrb_assert(p != NULL);
   mrb_value str = mrb_str_new_cstr(mrb, p);
-  RSTR_SET_ASCII_FLAG(mrb_str_ptr(str));
+  RSTR_CODERANGE_SET(mrb_str_ptr(str), MRB_STR_CODERANGE_7BIT);
   return str;
 }
 

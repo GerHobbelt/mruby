@@ -254,13 +254,35 @@ class String
   def scan(pattern)
     pattern = Regexp.__check_pattern(pattern)
     pattern = Regexp.new(Regexp.escape(pattern)) if String === pattern
-    result = Regexp.__scan(pattern, self)
-    if block_given?
-      result.each { |m| yield m }
-      self
-    else
-      result
+    return Regexp.__scan(pattern, self) unless block_given?
+    # A block reads the match globals of the match it was handed, so the block
+    # form has to walk the subject itself and let each search publish as it
+    # goes. `Regexp.__scan` collects every match before anything is yielded,
+    # which leaves only the last one published, so every call of the block saw
+    # the same final `$~`, `` $` ``, `$'` and `$1`.
+    #
+    # Yield what `__scan` collects: the matched string where the pattern has no
+    # group, and an array of the groups where it has any, a single one
+    # included. A zero-width match steps one byte on, which is what stops the
+    # next search reporting the same place; the engine steps over a byte inside
+    # a character on its own.
+    pos = 0
+    len = self.bytesize
+    # The loop ends on a failed search, which clears the globals. CRuby leaves
+    # the last match behind, so keep it and republish it below, the way `gsub`
+    # does. A scan that matched nothing keeps the cleared state.
+    last = nil
+    while pos <= len
+      md = Regexp.__byte_search(pattern, self, pos)
+      break unless md
+      last = md
+      yield(md.size == 1 ? md[0] : md.captures)
+      match_start = md.__byte_begin(0)
+      match_end = md.__byte_end(0)
+      pos = match_start == match_end ? match_end + 1 : match_end
     end
+    last.__set_globals if last
+    self
   end
 
   # Regexp-aware split.  Falls back to the C-defined split (aliased as
@@ -615,11 +637,13 @@ class String
     end
     # `__byte_search` takes the position as given and does not range check
     # it, where `Regexp.__search` answers nil for one outside the subject.
-    # Both ends are a miss here, as they are for `mrb_str_byteindex_m()`.  An
-    # offset that lands inside a character is not an error: the C method does
-    # not check for one either, and on a build without MRB_UTF8_STRING there
-    # is nothing to check.
+    # Both ends are a miss here, as they are for `mrb_str_byteindex_m()`.
     return Regexp.__search(args[0], nil) if pos < 0 || pos > len
+    # An offset that lands inside a character names no position the subject
+    # has, and the C method refuses one.  It is asked after the range test,
+    # where the C method asks it too, so an offset outside the subject stays a
+    # miss rather than becoming an error.
+    Regexp.__check_byte_pos(self, pos)
     md = Regexp.__byte_search(args[0], self, pos)
     md && md.__byte_begin(0)
   end
@@ -642,6 +666,9 @@ class String
         pos = len
       end
     end
+    # As in `byteindex` above, and after the same clamp: a position past the
+    # end of the subject has already been read as its end, which is a boundary.
+    Regexp.__check_byte_pos(self, pos)
     md = __regexp_rsearch(args[0], pos)
     md && md.__byte_begin(0)
   end
