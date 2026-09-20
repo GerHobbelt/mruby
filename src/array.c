@@ -468,6 +468,13 @@ mrb_ary_init(mrb_state *mrb, mrb_value ary)
   mrb_int size = mrb_as_int(mrb, ss);
   struct RArray *a = mrb_ary_ptr(ary);
 
+  /* Rebuilding an array through `initialize` writes over whatever it held,
+     and nothing below this point asks whether that is allowed: a size of
+     zero writes nothing at all, and the loop that fills a larger one writes
+     through no helper that checks. The branch above goes through
+     ary_replace(), which opens with the same check. */
+  ary_modify_check(mrb, a);
+
   if (ARY_CAPA(a) < size) {
     ary_expand_capa(mrb, a, size);
   }
@@ -646,6 +653,12 @@ mrb_ary_replace(mrb_state *mrb, mrb_value self, mrb_value other)
   if (a1 != a2) {
     ary_replace(mrb, a1, a2);
   }
+  else {
+    /* Replacing an array with itself leaves it as it was, so ary_replace()
+       and the frozen check it opens with are skipped. The call still asks to
+       write, and a frozen receiver answers FrozenError for it. */
+    ary_modify_check(mrb, a1);
+  }
 }
 
 /*
@@ -747,6 +760,12 @@ mrb_ary_reverse_bang(mrb_state *mrb, mrb_value self)
       *p1++ = *p2;
       *p2-- = tmp;
     }
+  }
+  else {
+    /* One element or none reverses into itself, so the ary_modify() above,
+       which is where a frozen receiver is turned away, is never reached.
+       The call is destructive at any length, so it is asked here. */
+    ary_modify_check(mrb, a);
   }
   return self;
 }
@@ -978,9 +997,9 @@ mrb_ary_shift_m(mrb_state *mrb, mrb_value self)
   return val;
 }
 
-static mrb_value
-ary_unshift_values(mrb_state *mrb, mrb_value self,
-                   mrb_int argc, const mrb_value argv[])
+MRB_API mrb_value
+mrb_ary_unshift_values(mrb_state *mrb, mrb_value self,
+                       mrb_int argc, const mrb_value argv[])
 {
   struct RArray *a = RARRAY(self);
 
@@ -1041,7 +1060,7 @@ ary_unshift_values(mrb_state *mrb, mrb_value self,
 MRB_API mrb_value
 mrb_ary_unshift(mrb_state *mrb, mrb_value self, mrb_value item)
 {
-  return ary_unshift_values(mrb, self, 1, &item);
+  return mrb_ary_unshift_values(mrb, self, 1, &item);
 }
 
 /*
@@ -1061,7 +1080,7 @@ mrb_ary_unshift(mrb_state *mrb, mrb_value self, mrb_value item)
 static mrb_value
 mrb_ary_unshift_m(mrb_state *mrb, mrb_value self)
 {
-  return ary_unshift_values(mrb, self, mrb_get_argc(mrb), mrb_get_argv(mrb));
+  return mrb_ary_unshift_values(mrb, self, mrb_get_argc(mrb), mrb_get_argv(mrb));
 }
 
 /**
@@ -2268,7 +2287,14 @@ sort_cmp(mrb_state *mrb, mrb_value ary, mrb_value a_val, mrb_value b_val, mrb_va
         break;
 #ifndef MRB_NO_FLOAT
       case MRB_TT_FLOAT:
-        cmp = (mrb_float(a_val) > mrb_float(b_val)) ? 1 : (mrb_float(a_val) < mrb_float(b_val)) ? -1 : 0;
+        {
+          /* A NaN is greater than, less than and equal to nothing at all, so
+             the pair is reported as one that cannot be compared. Falling out
+             of the two tests below would call it a tie and leave the NaN
+             wherever the sort happened to put it. */
+          mrb_float a_flo = mrb_float(a_val), b_flo = mrb_float(b_val);
+          cmp = (a_flo > b_flo) ? 1 : (a_flo < b_flo) ? -1 : (a_flo == b_flo) ? 0 : -2;
+        }
         break;
 #endif
       case MRB_TT_STRING:
@@ -2406,7 +2432,13 @@ mrb_ary_sort_bang(mrb_state *mrb, mrb_value ary)
   mrb_value blk;
 
   mrb_int n = RARRAY_LEN(ary);
-  if (n < 2) return ary;
+  if (n < 2) {
+    /* Already sorted, so this returns without reaching the ary_modify()
+       below, which is where a frozen receiver would have been turned away.
+       The sort is a destructive call at any length, so it is asked here. */
+    ary_modify_check(mrb, mrb_ary_ptr(ary));
+    return ary;
+  }
 
   ary_modify(mrb, mrb_ary_ptr(ary));
   mrb_get_args(mrb, "&", &blk);

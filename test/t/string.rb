@@ -400,6 +400,37 @@ assert('String[]=(UTF-8)') do
   assert_equal "➀➁➂➃➄", m
 end if UTF8STRING
 
+assert('String#[]= on a shared buffer') do
+  # Assigning to the empty range at the end appends, and an append writes
+  # only above what every other sharer of the buffer reads, so it stays in
+  # the buffer instead of taking a copy of it. The sharer must not see the
+  # bytes the string gained. Each string is shortened before it is shared, to
+  # leave spare capacity behind: one that has none cannot be grown in place
+  # anyway, so it would not tell the two behaviours apart.
+  a = "a" * 100 + "z" * 100
+  a[100, 100] = ""
+  a_slice = a[0, 60]
+  a[a.length, 0] = "1234567890"
+  assert_equal "a" * 100 + "1234567890", a
+  assert_equal "a" * 60, a_slice
+
+  # Assigning below the end writes where the sharer reads, so the buffer has
+  # to be taken away from it first.
+  b = "b" * 100 + "y" * 100
+  b[100, 100] = ""
+  b_slice = b[0, 60]
+  b[0, 1] = "1234567890"
+  assert_equal "1234567890" + "b" * 99, b
+  assert_equal "b" * 60, b_slice
+
+  # The loop that made growth at the end quadratic: the slice shares the
+  # buffer again on every turn, and the append past it stays in place.
+  c = ""
+  50.times { c[c.length, 0] = "0123456789012345678901234567890123456789"; c[0, 30] }
+  assert_equal 2000, c.length
+  assert_equal "0123456789012345678901234567890123456789", c[-40, 40]
+end
+
 assert('String#capitalize', '15.2.10.5.7') do
   a = 'abc'
   a.capitalize
@@ -494,6 +525,28 @@ assert('String#upcase - an answer that outgrows an embedded buffer') do
   1.upto(12) do |n|
     assert_equal "Ϊ́" * n, ("ΐ" * n).upcase
   end
+end if UNICODECASE
+
+assert('String#downcase - a receiver above the embedded buffer') do
+  # A receiver too long to live inside its own object holds its bytes in a
+  # heap (or shared) buffer that str_replace() has to release rather than
+  # overwrite, and the coderange the walk sets has to survive the copy that
+  # hands the converted buffer to the receiver.
+  long = "ÄÖÜ" * 20
+  assert_equal 60, long.downcase.length
+  assert_equal "äöü" * 20, long.downcase
+end if UNICODECASE
+
+assert('String case conversion - a frozen receiver') do
+  # Only upcase! reaches str_modify_keep_cr()'s check on its own: the other
+  # three raise from a second modify further in, so they answer FrozenError
+  # whether or not that check is there and pin nothing about it.
+  assert_raise(FrozenError) { 'Ä'.freeze.upcase! }
+  assert_raise(FrozenError) { 'Ä'.freeze.downcase! }
+  assert_raise(FrozenError) { 'Ä'.freeze.capitalize! }
+  # An all-ASCII receiver never enters the walk and is the other half of what
+  # that one check guards.
+  assert_raise(FrozenError) { 'AB'.freeze.downcase! }
 end if UNICODECASE
 
 assert('String case conversion - ASCII only') do
@@ -853,6 +906,28 @@ assert('String#reverse!', '15.2.10.5.30') do
 
   assert_equal 'cba', a
   assert_equal 'cba', 'abc'.reverse!
+end
+
+assert('String#reverse! - a frozen receiver') do
+  # A string of one character or none reverses into itself and returns
+  # without writing, which is where the frozen check used to sit.
+  assert_raise(FrozenError) { ''.freeze.reverse! }
+  assert_raise(FrozenError) { 'a'.freeze.reverse! }
+  assert_raise(FrozenError) { 'ab'.freeze.reverse! }
+end
+
+assert('String#reverse!(UTF-8) - a frozen receiver') do
+  # One character of several bytes is the same early return, reached by the
+  # character count rather than the byte count.
+  assert_raise(FrozenError) { 'あ'.freeze.reverse! }
+end if UTF8STRING
+
+assert('String - a frozen receiver of an empty splice at the end') do
+  # The empty splice at the end is handed to mrb_str_cat() as an append of
+  # no bytes, whose frozen check covers what the callers used to ask.
+  assert_raise(FrozenError) { 'abc'.freeze.bytesplice(3, 0, '') }
+  s = 'abc'.freeze
+  assert_raise(FrozenError) { s[3, 0] = '' }
 end
 
 assert('String#reverse!(UTF-8)', '15.2.10.5.30') do
@@ -1423,4 +1498,20 @@ assert('String#bytesplice on a shared buffer') do
   b_slice.bytesplice(0, 1, "1234567890")
   assert_equal "1234567890" + "b" * 59, b_slice
   assert_equal "b" * 100, b
+
+  # Splicing the empty range at the end appends, and an append writes only
+  # above what the sharer reads, so it stays in the buffer.
+  c = "c" * 100 + "x" * 100
+  c.bytesplice(100, 100, "")
+  c_slice = c[0, 60]
+  c.bytesplice(c.bytesize, 0, "1234567890")
+  assert_equal "c" * 100 + "1234567890", c
+  assert_equal "c" * 60, c_slice
+
+  # The loop that made growth at the end quadratic: the slice shares the
+  # buffer again on every turn, and the append past it stays in place.
+  d = ""
+  50.times { d.bytesplice(d.bytesize, 0, "0123456789012345678901234567890123456789"); d[0, 30] }
+  assert_equal 2000, d.bytesize
+  assert_equal "0123456789012345678901234567890123456789", d.byteslice(-40, 40)
 end

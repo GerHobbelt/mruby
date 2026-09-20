@@ -24,9 +24,9 @@ end
 assert('regression for #1572') do
   script, bin = Tempfile.new('test.rb'), Tempfile.new('test.mrb')
   File.write script.path, 'p "ok"'
-  system "#{cmd('mrbc')} -g -o #{bin.path} #{script.path}"
-  o = `#{cmd(MRUBY_BIN)} #{bin.path}`.strip
-  assert_equal '"ok"', o
+  assert_run('mrbc', '-g', '-o', bin.path, script.path)
+  o, = Open3.capture2(*(cmd_list(MRUBY_BIN) + [bin.path]))
+  assert_equal '"ok"', o.strip
 end
 
 assert '$0 value' do
@@ -35,14 +35,17 @@ assert '$0 value' do
   # .rb script
   script.write "p $0\n"
   script.flush
-  assert_equal "\"#{script.path}\"", `#{cmd(MRUBY_BIN)} "#{script.path}"`.chomp
+  o, = Open3.capture2(*(cmd_list(MRUBY_BIN) + [script.path]))
+  assert_equal "\"#{script.path}\"", o.chomp
 
   # .mrb file
-  `#{cmd('mrbc')} -o "#{bin.path}" "#{script.path}"`
-  assert_equal "\"#{bin.path}\"", `#{cmd(MRUBY_BIN)} "#{bin.path}"`.chomp
+  assert_run('mrbc', '-o', bin.path, script.path)
+  o, = Open3.capture2(*(cmd_list(MRUBY_BIN) + [bin.path]))
+  assert_equal "\"#{bin.path}\"", o.chomp
 
   # one liner
-  assert_equal '"-e"', `#{cmd(MRUBY_BIN)} -e #{shellquote('p $0')}`.chomp
+  o, = Open3.capture2(*(cmd_list(MRUBY_BIN) + ['-e', 'p $0']))
+  assert_equal '"-e"', o.chomp
 end
 
 assert 'ARGV value' do
@@ -61,7 +64,8 @@ __END__
 p 'legend'
 EOS
   script.flush
-  assert_equal "\"test\"\n\"fin\"\n", `#{cmd(MRUBY_BIN)} #{script.path}`
+  o, = Open3.capture2(*(cmd_list(MRUBY_BIN) + [script.path]))
+  assert_equal "\"test\"\n\"fin\"\n", o
 end
 
 assert('garbage collecting built-in classes') do
@@ -74,8 +78,9 @@ Array.dup
 print nil.class.to_s
 RUBY
   script.flush
-  assert_equal "NilClass", `#{cmd(MRUBY_BIN)} #{script.path}`
-  assert_equal 0, $?.exitstatus
+  o, status = Open3.capture2(*(cmd_list(MRUBY_BIN) + [script.path]))
+  assert_equal "NilClass", o
+  assert_equal 0, status.exitstatus
 end
 
 assert('mruby -c option') do
@@ -113,11 +118,14 @@ EOS
 print Hoge.new.hoge
 EOS
   script.flush
-  assert_equal 'hoge', `#{cmd(MRUBY_BIN)} -r #{lib.path} #{script.path}`
-  assert_equal 0, $?.exitstatus
+  o, status = Open3.capture2(*(cmd_list(MRUBY_BIN) + ['-r', lib.path, script.path]))
+  assert_equal 'hoge', o
+  assert_equal 0, status.exitstatus
 
-  assert_equal 'hogeClass', `#{cmd(MRUBY_BIN)} -r #{lib.path} -r #{script.path} -e #{shellquote('print Hoge.class')}`
-  assert_equal 0, $?.exitstatus
+  o, status = Open3.capture2(*(cmd_list(MRUBY_BIN) +
+                               ['-r', lib.path, '-r', script.path, '-e', 'print Hoge.class']))
+  assert_equal 'hogeClass', o
+  assert_equal 0, status.exitstatus
 end
 
 assert('mruby -r option (no library specified)') do
@@ -173,16 +181,16 @@ assert('top level local variables are in file scope') do
   drb, dmrb = Tempfile.new('d.rb'), Tempfile.new('d.mrb')
 
   File.write arb.path, 'a = 1'
-  system "#{cmd('mrbc')} -g -o #{amrb.path} #{arb.path}"
+  assert_run('mrbc', '-g', '-o', amrb.path, arb.path)
   File.write brb.path, 'p a'
-  system "#{cmd('mrbc')} -g -o #{bmrb.path} #{brb.path}"
+  assert_run('mrbc', '-g', '-o', bmrb.path, brb.path)
   assert_mruby("", /:1: undefined method 'a' .*\(NoMethodError\)\n\z/, false, ["-r", arb.path, brb.path])
   assert_mruby("", /:1: undefined method 'a' .*\(NoMethodError\)\n\z/, false, ["-b", "-r", amrb.path, bmrb.path])
 
   File.write crb.path, 'a, b, c = 1, 2, 3; A = -> { b = -2; [a, b, c] }'
-  system "#{cmd('mrbc')} -g -o #{cmrb.path} #{crb.path}"
+  assert_run('mrbc', '-g', '-o', cmrb.path, crb.path)
   File.write drb.path, 'a, b = 5, 6; p A.call; p a, b'
-  system "#{cmd('mrbc')} -g -o #{dmrb.path} #{drb.path}"
+  assert_run('mrbc', '-g', '-o', dmrb.path, drb.path)
   assert_mruby("[1, -2, 3]\n5\n6\n", "", true, ["-r", crb.path, drb.path])
   assert_mruby("[1, -2, 3]\n5\n6\n", "", true, ["-b", "-r", cmrb.path, dmrb.path])
 end
@@ -261,4 +269,31 @@ assert('symbol GC keeps a symbol its bytecode has not loaded yet') do
     [:mruby_symbol_gc_a, :mruby_symbol_gc_b]
     "mruby_symbol_gc_a,mruby_symbol_gc_b"
   EXP
+end
+
+assert('a -r library that does not load is fatal') do
+  # The library's exception was left on the state and nowhere else, and the
+  # program's first successful run overwrote it, so the failure vanished: a
+  # syntax error printed its diagnostic and carried on, a library that raised
+  # said nothing at all, and both exited 0 with the program's output.  `ruby
+  # -r` exits 1 for each of these.
+  lib = Tempfile.new(['lib', '.rb'])
+
+  File.write(lib.path, "def f(\n")
+  assert_mruby("", /syntax error/, false, ["-r", lib.path, "-e", "puts 1"])
+
+  File.write(lib.path, "raise 'lib boom'\n")
+  assert_mruby("", /lib boom/, false, ["-r", lib.path, "-e", "puts 1"])
+
+  # An .mrb library takes the irep loader instead, which has always raised
+  # for this; only the check that reads the exception was missing.
+  bin = Tempfile.new(['lib', '.mrb'])
+  File.write(bin.path, "not an irep\n")
+  assert_mruby("", /irep load error/, false, ["-r", bin.path, "-e", "puts 1"])
+end
+
+assert('a -r library that loads still runs the program') do
+  lib = Tempfile.new(['lib', '.rb'])
+  File.write(lib.path, "def libfn; 42; end\n")
+  assert_mruby("42\n", "", true, ["-r", lib.path, "-e", "puts libfn"])
 end

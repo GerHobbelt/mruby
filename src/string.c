@@ -1440,6 +1440,7 @@ mrb_str_modify(mrb_state *mrb, struct RString *s)
   RSTR_CODERANGE_SET(s, MRB_STR_CODERANGE_UNKNOWN);
 }
 
+#ifdef MRB_UTF8_STRING
 /* mrb_str_modify() for a caller whose write leaves what the bytes read as
    standing: it puts ASCII where ASCII stood, or it cuts where a character
    ends. Such a write cannot turn a sound string unsound, so the answer the
@@ -1453,9 +1454,11 @@ mrb_str_modify(mrb_state *mrb, struct RString *s)
    one, and finding the truth is the walk this is here to skip.
 
    The promise this asks of its caller cannot be checked here, which is why
-   it is not offered outside the library. */
-static void
-str_modify_keep_cr(mrb_state *mrb, struct RString *s)
+   it is declared in mruby/internal.h rather than a public header: it is for
+   a caller inside the library, who can answer for the write, and not for
+   whoever includes mruby/string.h. */
+void
+mrb_str_modify_keep_cr(mrb_state *mrb, struct RString *s)
 {
   mrb_check_frozen(mrb, s);
   str_unshare_buffer(mrb, s);
@@ -1463,6 +1466,7 @@ str_modify_keep_cr(mrb_state *mrb, struct RString *s)
     RSTR_CODERANGE_SET(s, MRB_STR_CODERANGE_UNKNOWN);
   }
 }
+#endif
 
 /*
  * @param mrb The mruby state.
@@ -1978,6 +1982,17 @@ str_out_of_index(mrb_state *mrb, mrb_value index)
   mrb_raisef(mrb, E_INDEX_ERROR, "index %v out of string", index);
 }
 
+/* Bytes spliced in mark the string they land in the way appended ones do:
+   byte-read bytes above ASCII spell no character here and hand their reading
+   over, ASCII bytes move nothing. */
+static void
+str_mark_spliced_binary(struct RString *str, struct RString *rep)
+{
+  if (!RSTR_BINARY_P(str) && RSTR_BINARY_P(rep) && !str_ascii_p(rep)) {
+    RSTR_ENCODING_SET(str, MRB_STR_ENCODING_BINARY);
+  }
+}
+
 static mrb_value
 str_replace_partial(mrb_state *mrb, mrb_value src, mrb_int pos, mrb_int end, mrb_value rep)
 {
@@ -1998,6 +2013,17 @@ str_replace_partial(mrb_state *mrb, mrb_value src, mrb_int pos, mrb_int end, mrb
     mrb_raise(mrb, E_RUNTIME_ERROR, "string size too big");
   }
 
+  /* Replacing the empty range at the end is an append: it writes nothing any
+     sharer of the buffer can see, so mrb_str_cat() may grow the string inside
+     that buffer where mrb_str_modify() below would copy the whole of it first.
+     mrb_str_cat() checks the frozen receiver on every length, so the check
+     mrb_str_modify() would have made is not lost. */
+  if (pos == end && end == len && !mrb_nil_p(rep)) {
+    mrb_str_cat(mrb, src, RSTRING_PTR(rep), (size_t)replen);
+    str_mark_spliced_binary(str, mrb_str_ptr(rep));
+    return src;
+  }
+
   mrb_str_modify(mrb, str);
 
   if (len < newlen) {
@@ -2009,13 +2035,7 @@ str_replace_partial(mrb_state *mrb, mrb_value src, mrb_int pos, mrb_int end, mrb
   memmove(strp + newlen - (len - end), strp + end, len - end);
   if (!mrb_nil_p(rep)) {
     memmove(strp + pos, RSTRING_PTR(rep), replen);
-    /* bytes spliced in mark the string they land in the way appended ones
-       do: byte-read bytes above ASCII spell no character here and hand
-       their reading over, ASCII bytes move nothing */
-    struct RString *repp = mrb_str_ptr(rep);
-    if (!RSTR_BINARY_P(str) && RSTR_BINARY_P(repp) && !str_ascii_p(repp)) {
-      RSTR_ENCODING_SET(str, MRB_STR_ENCODING_BINARY);
-    }
+    str_mark_spliced_binary(str, mrb_str_ptr(rep));
   }
   RSTR_SET_LEN(str, newlen);
   strp[newlen] = '\0';
@@ -2358,7 +2378,7 @@ mrb_str_case_convert_unicode(mrb_state *mrb, mrb_value str, enum mrb_case_mode m
      not be recorded as holding one character per byte. */
   if (RSTR_BINARY_P(s) || str_ascii_p(s)) return -1;
 
-  str_modify_keep_cr(mrb, s);
+  mrb_str_modify_keep_cr(mrb, s);
 
   return str_case_convert_utf8(mrb, str, mode) ? 1 : 0;
 }
@@ -2388,7 +2408,7 @@ mrb_str_capitalize_bang(mrb_state *mrb, mrb_value str)
   struct RString *s = mrb_str_ptr(str);
   mrb_int len = RSTR_LEN(s);
 
-  str_modify_keep_cr(mrb, s);
+  mrb_str_modify_keep_cr(mrb, s);
   char *p = RSTR_PTR(s);
   char *pend = RSTR_PTR(s) + len;
   if (len == 0 || p == NULL) return mrb_nil_value();
@@ -2442,7 +2462,7 @@ mrb_str_chomp_bang(mrb_state *mrb, mrb_value str)
   mrb_int argc = mrb_get_args(mrb, "|S", &rs);
   struct RString *s = mrb_str_ptr(str);
 
-  str_modify_keep_cr(mrb, s);
+  mrb_str_modify_keep_cr(mrb, s);
   mrb_int len = RSTR_LEN(s);
   if (argc == 0) {
     if (len == 0) return mrb_nil_value();
@@ -2501,11 +2521,11 @@ mrb_str_chomp_bang(mrb_state *mrb, mrb_value str)
     if (!RSTR_SINGLE_BYTE_P(s) && mrb_utf8_char_head(p, pp, p + len) != pp) {
       return mrb_nil_value();
     }
-    /* Cutting bytes that are nothing but ASCII leaves what the rest is read as
-       standing, non-ASCII and all, so the coderange str_modify_keep_cr() kept
-       is still the answer. Cutting a non-ASCII byte can have taken the last of
-       them, and a string of nothing but ASCII stands at 7BIT rather than
-       VALID: what it is has to be asked again. */
+    /* Cutting bytes that are nothing but ASCII leaves what the rest is read
+       as standing, non-ASCII and all, so the coderange that
+       mrb_str_modify_keep_cr() kept is still the answer. Cutting a non-ASCII
+       byte can have taken the last of them, and a string of nothing but ASCII
+       stands at 7BIT rather than VALID: what it is has to be asked again. */
     if (search_nonascii(pp, pp + rslen) != pp + rslen) {
       RSTR_CODERANGE_SET(s, MRB_STR_CODERANGE_UNKNOWN);
     }
@@ -2557,7 +2577,7 @@ mrb_str_chop_bang(mrb_state *mrb, mrb_value str)
 {
   struct RString *s = mrb_str_ptr(str);
 
-  str_modify_keep_cr(mrb, s);
+  mrb_str_modify_keep_cr(mrb, s);
   if (RSTR_LEN(s) > 0) {
     /* The last position of a single-byte string is its last byte. */
     mrb_int len = RSTR_LEN(s) - 1;
@@ -2635,7 +2655,7 @@ mrb_str_downcase_bang(mrb_state *mrb, mrb_value str)
   mrb_bool modify = FALSE;
   struct RString *s = mrb_str_ptr(str);
 
-  str_modify_keep_cr(mrb, s);
+  mrb_str_modify_keep_cr(mrb, s);
   p = RSTR_PTR(s);
   pend = RSTR_PTR(s) + RSTR_LEN(s);
   while (p < pend) {
@@ -3070,7 +3090,7 @@ mrb_str_reverse_bang(mrb_state *mrb, mrb_value str)
 
   /* Reversing writes the string's own bytes back in another order, and both
      paths below leave every character whole, so a string that read as UTF-8
-     still does: both write through str_modify_keep_cr(). A string already
+     still does: both write through mrb_str_modify_keep_cr(). A string already
      read as broken is the one this cannot answer for, since bytes that spell
      nothing where they stand can spell a character turned around, and that is
      the string the helper asks again on its own. */
@@ -3084,9 +3104,15 @@ mrb_str_reverse_bang(mrb_state *mrb, mrb_value str)
   mrb_int utf8_len = mrb_str_char_len(mrb, str);
   mrb_int len = RSTR_LEN(s);
 
-  if (utf8_len < 2) return str;
+  if (utf8_len < 2) {
+    /* One character or none reverses into itself and returns here, ahead of
+       the str_modify_keep_cr() below that turns a frozen receiver away. The
+       call is destructive at any length, so it is asked here. */
+    mrb_check_frozen(mrb, s);
+    return str;
+  }
   if (utf8_len < len) {
-    str_modify_keep_cr(mrb, s);
+    mrb_str_modify_keep_cr(mrb, s);
     p = RSTR_PTR(s);
     e = p + RSTR_LEN(s);
     while (p<e) {
@@ -3101,9 +3127,11 @@ mrb_str_reverse_bang(mrb_state *mrb, mrb_value str)
   /* Reached with one character per byte, where the reversal below is a byte
      reversal that cuts no character in two. */
   if (RSTR_LEN(s) > 1) {
-    str_modify_keep_cr(mrb, s);
+    mrb_str_modify_keep_cr(mrb, s);
     goto bytes;
   }
+  /* As above, for a build that reads one character per byte. */
+  mrb_check_frozen(mrb, s);
   return str;
 
  bytes:
@@ -3831,7 +3859,7 @@ mrb_str_upcase_bang(mrb_state *mrb, mrb_value str)
   char *p, *pend;
   mrb_bool modify = FALSE;
 
-  str_modify_keep_cr(mrb, s);
+  mrb_str_modify_keep_cr(mrb, s);
   p = RSTRING_PTR(str);
   pend = RSTRING_END(str);
   while (p < pend) {
@@ -3928,7 +3956,14 @@ mrb_str_cat(mrb_state *mrb, mrb_value str, const char *ptr, size_t len)
   struct RString *s = mrb_str_ptr(str);
   ptrdiff_t off = -1;
 
-  if (len == 0) return str;
+  /* An append of nothing writes nothing, but it is still an append, and the
+     only frozen check on this path is the one the modify below runs. Asking
+     here keeps `str << ""` answering FrozenError like an append that has
+     bytes to add, instead of passing over a frozen receiver in silence. */
+  if (len == 0) {
+    mrb_check_frozen(mrb, s);
+    return str;
+  }
   /* `len` has to be known to fit in an `mrb_int` before it is used as one:
      the conversion is otherwise free to make it negative, and the overflow
      check takes `mrb_int` parameters, so it would not see it. Checking ahead
@@ -4311,6 +4346,15 @@ str_bytesplice(mrb_state *mrb, mrb_value str, mrb_int idx1, mrb_int len1, mrb_va
   if (mrb_int_add_overflow(idx2, len2, &n) || RSTRING_LEN(replace) < n) {
     len2 = RSTRING_LEN(replace) - idx2;
   }
+  /* Splicing the empty range at the end is an append: it writes nothing any
+     sharer of the buffer can see, so mrb_str_cat() may grow the string inside
+     that buffer where mrb_str_modify() below would copy the whole of it first.
+     mrb_str_cat() checks the frozen receiver on every length, so the check
+     mrb_str_modify() would have made is not lost. */
+  if (idx1 == RSTR_LEN(s)) {
+    return mrb_str_cat(mrb, str, RSTRING_PTR(replace) + idx2, (size_t)len2);
+  }
+
   mrb_str_modify(mrb, s);
   if (len1 >= len2) {
     memmove(RSTR_PTR(s)+idx1, RSTRING_PTR(replace)+idx2, len2);

@@ -53,6 +53,13 @@ assert('IO#close', '15.2.20.5.1') do
   assert_nil io.close
 end
 
+assert('IO#close on a closed stream') do
+  io = IO.new(IO.sysopen($mrbtest_io_rfname))
+  io.close
+  assert_nil io.close
+  assert_true io.closed?
+end
+
 assert('IO#closed?', '15.2.20.5.2') do
   io = IO.new(IO.sysopen($mrbtest_io_rfname))
   assert_false io.closed?
@@ -647,11 +654,39 @@ end
 assert('IO#close_write twice') do
   begin
     io = IO.popen($cat, "r+")
+    io.write "mruby-io\n"
     io.close_write
-    # the write end is already gone, and the stream is still read from
-    assert_raise(IOError) { io.close_write }
-    assert_false io.closed?
+    assert_equal "mruby-io\n", io.read
+    # the write end is already gone, and what is left of the stream is the child
+    assert_nil io.close_write
+    assert_true io.closed?
+  rescue NotImplementedError => e
+    skip e.message
+  end
+end
+
+assert('IO#close_write on a stream opened to a child') do
+  begin
+    io = IO.popen("#{$cmd}echo mruby-io", "r")
+    assert_nil io.close_write
+    assert_true io.closed?
+  rescue NotImplementedError => e
+    skip e.message
+  end
+end
+
+assert('IO#close_write on a closed stream') do
+  # The whole stream is gone, so there is no write end left to give up.
+  io = IO.new(IO.sysopen($mrbtest_io_rfname))
+  io.close
+  assert_nil io.close_write
+  assert_true io.closed?
+
+  begin
+    io = IO.popen($cat, "r+")
     io.close
+    assert_nil io.close_write
+    assert_true io.closed?
   rescue NotImplementedError => e
     skip e.message
   end
