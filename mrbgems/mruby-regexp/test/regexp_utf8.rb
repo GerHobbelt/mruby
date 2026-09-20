@@ -430,8 +430,8 @@ assert("Regexp - \\u escapes") do
   assert_equal "abbb", "abbb"[/\u{61 62}+/]
   assert_nil ("b" =~ /\u{61 62}/)
 
-  # /x strips whitespace before the pattern is parsed, but not the spaces
-  # that separate the codepoints of a list
+  # under /x whitespace is skipped between tokens, and a list is one token,
+  # so the spaces that separate its codepoints stay
   assert_equal 0, (Regexp.new("\\u{61 62}", Regexp::EXTENDED) =~ "ab")
 
   # /i folds an ASCII letter reached through `\u`, like a literal one
@@ -829,4 +829,33 @@ assert("Regexp - what sub and gsub build out of a byte-read subject") do
   assert_equal Encoding::UTF_8, "ab".sub(/x/, 171.chr).encoding
   # a byte-read subject is read as bytes whether anything was spliced or not
   assert_equal Encoding::BINARY, subject.gsub(/x/, "-").encoding
+end
+
+assert("Regexp - the match a gsub block leaves behind reads as the receiver does") do
+  # The search that ends the block form of `gsub` runs on the receiver as
+  # the block left it, and it is spared where the receiver still reads as it
+  # did when the last match was made. A block that changed how the receiver
+  # is read without changing a byte has changed what a search reads of it:
+  # `s.replace(s.b)` keeps every byte and makes them byte-read, so the match
+  # left behind counts its offsets in bytes, where the match the loop had
+  # counted characters. Bytes alone would take that receiver for unchanged.
+  skip unless __ENCODING__ == "UTF-8"
+  s = "héllo"
+  s.gsub(/l/) { s.replace(s.b); "L" }
+  assert_equal 4, $~.begin(0)
+  assert_equal 6, $~.string.size
+  s = "héllo"
+  s.gsub(/l/) { "L" }
+  assert_equal 3, $~.begin(0)
+  assert_equal 5, $~.string.size
+
+  # It takes a multibyte character *before* the match for the two readings to
+  # answer differently: with the match at "l" of "héllo" a republish and a
+  # fresh search name the same offset, so that pair cannot tell them apart.
+  # Here the match is at "i" with two three-byte characters in front, so
+  # reading the receiver as bytes moves it from character 1 to byte 3.
+  s = "あiう"
+  s.gsub(/i/) { s.replace(s.b); "X" }
+  assert_equal 3, $~.begin(0)
+  assert_equal 7, $~.string.size
 end

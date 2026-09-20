@@ -10,9 +10,18 @@ simulation) with backtracking fallback.
 - `.` any character (except newline by default)
 - `*`, `+`, `?` greedy quantifiers
 - `*?`, `+?`, `??` non-greedy quantifiers
+- `*+`, `++`, `?+` possessive quantifiers, `a*+` being `(?>a*)`
 - `{n}`, `{n,}`, `{n,m}` repetition counts
+- a quantifier after a quantifier repeats the repeat: `a**` is `(?:a*)*` and
+  `a{2}{3}` is `(?:a{2}){3}`. `{n}` has no non-greedy form, so its `?` is a
+  quantifier too and `a{3}?` matches empty where the lazy `a{3,3}?` does not
 - `[abc]`, `[a-z]`, `[^abc]` character classes
-- `\d`, `\w`, `\s` digit, word, whitespace shortcuts
+- `[[:alpha:]]`, `[[:^alpha:]]` POSIX brackets inside a class: `alpha`,
+  `digit`, `alnum`, `upper`, `lower`, `space`, `blank`, `xdigit`, `word`,
+  `cntrl`, `print`, `graph`, `ascii` and `punct`. Above ASCII each holds
+  what CRuby's does where the build classifies characters by Unicode, and
+  nothing where it does not; see Configuration
+- `\d`, `\w`, `\s` digit, word, whitespace shortcuts, ASCII as in CRuby
 - `\D`, `\W`, `\S` negated shortcuts
 - `(...)` capture group
 - `(?:...)` non-capturing group
@@ -21,7 +30,9 @@ simulation) with backtracking fallback.
 - `|` alternation
 - `\N` backreference: a digit run whose decimal value is at most 9 or at
   most the number of groups opened before it; a run past both is an octal
-  escape (see below)
+  escape (see below). A reference naming a group the pattern does not have
+  raises `RegexpError`, counting the groups of the whole pattern, so `\1(a)`
+  is valid
 - `\k<name>`, `\k'name'` named backreferences
 - `(?=...)` positive lookahead
 - `(?!...)` negative lookahead
@@ -181,7 +192,8 @@ pattern analysis.
   require a fixed-length pattern (no `*`, `+`, `?`, or alternation).
   Maximum 255 bytes.
 - **No Unicode properties**: `\p{Alpha}`, `\p{L}`, etc. are not
-  supported.
+  supported. The POSIX brackets read the same data where the build carries
+  it, so `[[:alpha:]]` is the way to ask for a letter of any script.
 - **No `\x{...}` hex escape**: the hex escape is `\xHH`, so it reaches
   `0xff` at most, and `\x{...}` raises `RegexpError` as CRuby does, since
   the brace is not a hex digit. Write `\u{...}` for a codepoint above that.
@@ -247,7 +259,7 @@ there.
 
 Case folding beyond ASCII is not this gem's to configure. The table is
 core's, carried by any build that defines `MRB_UTF8_STRING` without
-`MRB_USE_ASCII_CASE`, and is what `String#downcase` and the four case methods
+`MRB_USE_ASCII_CTYPE`, and is what `String#downcase` and the four case methods
 beside it read; `/i` reads the two directions it needs over that same table.
 So `/i` folds what the build's own case conversion folds, and a build
 converting case by ASCII has nothing for it to fold beyond ASCII either,
@@ -280,6 +292,21 @@ is ASCII. A class holding the letter only through `\w`, `[:word:]` or
 `[:ascii:]` does not reach them: those are sets ASCII defines, so `[\w]`
 under `/i` stays the ASCII word characters and `[^\w]` accepts `"K"` (U+212A),
 as in CRuby. A letter written out beside the shorthand (`[\ws]`) folds as usual.
+
+What a POSIX bracket holds above ASCII is this gem's table, `re_ctype.h`,
+carried on the same condition as the case table: a build that defines
+`MRB_UTF8_STRING` without `MRB_USE_ASCII_CTYPE`. There the brackets classify
+as CRuby's do, `[[:alpha:]]` holding `"あ"` and `[[:^alpha:]]` rejecting it,
+`[[:upper:]]` under `/i` reaching `"ā"` through `"Ā"`, and `[[:word:]]` every
+Unicode word character where `\w` stays ASCII. The types are the ones the
+Unicode Character Database publishes: `alpha`, `upper` and `lower` are the
+derived properties Alphabetic, Uppercase and Lowercase, `space` is White_Space,
+and the rest are read off the general categories. Without the table a bracket
+holds its ASCII and no character above it, so `[[:alpha:]]` misses `"あ"` and
+`[[:^alpha:]]` takes it, and a build reading its strings by byte answers the
+same, having no character to classify. `[[:xdigit:]]` and `[[:ascii:]]` are
+sets ASCII defines and hold nothing above it on any build. The table is 13.9KB
+of read-only data; `MRB_USE_ASCII_CTYPE` is what leaves it out.
 
 ## License
 

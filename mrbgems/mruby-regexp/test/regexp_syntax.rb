@@ -172,6 +172,12 @@ assert("Regexp - the backtracking engine stops a repetition on an empty iteratio
   assert_equal "aab", /(?:(?:a?)*)*?b/.match("aab")[0]
   assert_equal "", /(?:(?:a?)*?)*b??/.match("aab")[0]
   assert_equal "aab", /(?:(?:a??)+?)+?b/.match("aab")[0]
+  # The fork closing e+? stops there too. It takes what follows the loop able
+  # to match empty as well to tell: where the loop's exit leads straight to a
+  # byte that has to match, the frame that went round again fails anyway.
+  assert_equal "b", /(?:[ab]?)+?b*b/.match("ba")[0]
+  assert_equal "b", /(?:(?:[ab]?)+?b*)b/.match("ba")[0]
+  assert_equal "aa", /(?:(?:a?|a)+?a+){2,}/.match("aa")[0]
   # The empty iteration's capture is kept, as under the linear-time engine.
   md = /(a?)*b??/.match("a")
   assert_equal "", md[1]
@@ -387,9 +393,9 @@ assert("Regexp - /i keeps the word class inside ASCII") do
     # Outside a class the shorthand never folded, and still does not.
     assert_false Regexp.new("\\w", Regexp::IGNORECASE).match?(ch)
     assert_true Regexp.new("\\W", Regexp::IGNORECASE).match?(ch)
-    # /i does not move either in or out of [:word:], whatever the set holds
-    # (this gem's is the ASCII word characters; CRuby's holds every Unicode
-    # word character, these two among them).
+    # /i does not move either in or out of [:word:], whatever the set holds:
+    # the ASCII word characters on a build without the type table, every
+    # Unicode word character on one with it, these two among them.
     assert_equal Regexp.new("[[:word:]]").match?(ch),
                  Regexp.new("[[:word:]]", Regexp::IGNORECASE).match?(ch)
     assert_equal Regexp.new("[^[:word:]]").match?(ch),
@@ -411,7 +417,9 @@ assert("Regexp - /i keeps the word class inside ASCII") do
   assert_true Regexp.new("[\\w#{long_s}]", Regexp::IGNORECASE).match?("S")
   assert_false Regexp.new("[^\\w#{long_s}]", Regexp::IGNORECASE).match?("S")
   # The other POSIX brackets fold like a written range: [:lower:] holds `k`,
-  # so under /i it reaches U+212A, and [^[:alpha:]] rejects U+017F.
+  # so under /i it reaches U+212A, and [^[:alpha:]] rejects U+017F. Where the
+  # build has the type table both hold the letter without /i as well; the
+  # answers below are the same either way.
   assert_true Regexp.new("[[:lower:]]", Regexp::IGNORECASE).match?(kelvin)
   assert_true Regexp.new("[[:alpha:]]", Regexp::IGNORECASE).match?(long_s)
   assert_false Regexp.new("[^[:alpha:]]", Regexp::IGNORECASE).match?(long_s)
@@ -461,6 +469,68 @@ assert("Regexp - a curly brace that is not a quantifier is a literal") do
   assert_raise(RegexpError) { Regexp.new("{2}") }
 end
 
+assert("Regexp - a quantifier after a quantifier repeats the repeat") do
+  # CRuby reads a second quantifier as binding the repeat before it, not the
+  # atom: `a**` is `(?:a*)*`. Two spellings are not that, and are read where
+  # the first quantifier is.
+  assert_equal ["aaa"], /a**/.match("aaa").to_a
+  assert_equal ["aaa"], /a+*/.match("aaa").to_a
+  assert_equal ["aaa"], /a?*/.match("aaa").to_a
+  assert_equal ["aaaaaa"], /a{2}{3}/.match("aaaaaa").to_a
+  assert_equal ["aaaa"], /a{2}+/.match("aaaa").to_a
+  assert_equal ["aaa"], /a{1,2}*/.match("aaa").to_a
+  assert_equal ["aaa"], /a***/.match("aaa").to_a
+  assert_equal ["aa"], /(?:a?){2}/.match("aaa").to_a
+  assert_equal ["aa"], /a?{2}/.match("aaa").to_a
+
+  # `?` right after a greedy `*`, `+`, `?` or a `{n,m}` written with a comma
+  # is the non-greedy marker. `{n}` has no non-greedy form, so its `?` is a
+  # quantifier and `a{3}?` matches empty where the lazy `a{3,3}?` does not.
+  assert_equal [""], /a*?/.match("aaa").to_a
+  assert_equal [""], /a{3}?/.match("").to_a
+  assert_equal [""], /a{3}?/.match("aa").to_a
+  assert_nil /a{3,3}?/.match("aa")
+  assert_equal ["aaa"], /a{3,3}?/.match("aaa").to_a
+  assert_equal [""], /a{0,2}?/.match("aa").to_a
+
+  # `+` right after a greedy `*`, `+` or `?` is possessive, `a*+` being
+  # `(?>a*)`: `a?+` takes one `a` out of "aa" where `(?:a?)+` takes two. After
+  # a lazy repeat, a possessive one or a `{...}` it is a quantifier again.
+  assert_equal ["a"], /a?+/.match("aa").to_a
+  assert_nil /a?+a/.match("a")
+  assert_equal ["aa"], /a?+a/.match("aa").to_a
+  assert_equal ["aa"], /(?:a?)+/.match("aa").to_a
+  assert_equal ["aaa"], /a*+/.match("aaa").to_a
+  assert_equal ["aa"], /a+?+/.match("aa").to_a
+  assert_equal ["a"], /a+?+?/.match("aa").to_a
+  assert_equal ["aa"], /a?++/.match("aa").to_a
+
+  # A body that matches no times matches empty however it is repeated.
+  assert_equal [""], /a{0}*/.match("").to_a
+  assert_equal [""], /a{0}{2}?/.match("aa").to_a
+
+  # A repeat of a repeat is an empty-matching loop by construction; the null
+  # check of both engines stops it rather than the recursion limit.
+  assert_equal ["aaa"], /(?:a?)**/.match("aaa").to_a
+  assert_equal ["aaa"], /(?:a*)*+/.match("aaa").to_a
+  assert_equal ["b"], /(?:a?)**b/.match("b").to_a
+end
+
+assert("Regexp - a backreference names a group the pattern has") do
+  # The count is the pattern's, not the one standing where the reference is,
+  # so a reference to a group written later is valid.
+  assert_equal ["aa", "a"], /(a)\1/.match("aa").to_a
+  assert_nil(/\1(a)/ =~ "a")
+  assert_raise(RegexpError) { Regexp.new("\\1") }
+  assert_raise(RegexpError) { Regexp.new("(a)\\2") }
+  assert_raise(RegexpError) { Regexp.new("(a)(b)\\3") }
+  assert_raise(RegexpError) { Regexp.new("\\9") }
+  assert_equal 0, Regexp.new("(a)" * 9 + "\\9") =~ "aaaaaaaaaa"
+  # A named pattern refuses a numbered reference before it counts.
+  assert_raise(RegexpError) { Regexp.new("(?<n>a)\\1") }
+  assert_raise(RegexpError) { Regexp.new("(?<n>a)\\2") }
+end
+
 assert("Regexp - patterns that used to hang the compiler now raise (A1)") do
   # These once looped forever in the compiler at 100% CPU instead of raising.
   # Regexp.new is used so the pattern reaches the regexp compiler directly,
@@ -473,8 +543,9 @@ assert("Regexp - patterns that used to hang the compiler now raise (A1)") do
   assert_raise(RegexpError) { Regexp.new("(?") }
   assert_raise(RegexpError) { Regexp.new("(?<") }
 
-  # A quantifier metacharacter with no atom to repeat.
-  assert_raise(RegexpError) { Regexp.new("a***") }
+  # A quantifier metacharacter with no atom to repeat. `a***` has one, the
+  # repeat before it: it is `(?:(?:a*)*)*`.
+  assert_equal ["aaa"], Regexp.new("a***").match("aaa").to_a
   assert_raise(RegexpError) { Regexp.new("*") }
   assert_raise(RegexpError) { Regexp.new("+") }
   assert_raise(RegexpError) { Regexp.new("?abc") }
@@ -667,13 +738,186 @@ assert("Regexp extended mode (x flag)") do
   # to_s shows x flag
   assert_equal "(?x-mi:abc)", Regexp.new("abc", Regexp::EXTENDED).to_s
 
-  # errors quote the pattern as written, not the stripped text
+  # errors quote the pattern as written, not the text with the comment removed
   assert_raise_with_message(RegexpError, "unterminated character class: /a # c\n[/") do
     Regexp.new("a # c\n[", Regexp::EXTENDED)
   end
   assert_raise_with_message(RegexpError, "unmatched '(': /a b(/") do
     Regexp.new("a b(", Regexp::EXTENDED)
   end
+end
+
+assert("Regexp - free-spacing whitespace stands between tokens only") do
+  # Under /x the parser skips whitespace where one token ends and the next
+  # begins, as CRuby's tokenizer does, and reads every token with the
+  # whitespace inside it in place. So a space cannot split a token that
+  # is not one, and taking a space out cannot join two into one.
+  x = Regexp::EXTENDED
+
+  # between tokens: literals, groups, alternatives, anchors, quantifiers
+  assert_equal ["ab"], Regexp.new("a b", x).match("ab").to_a
+  assert_equal ["a", "a"], Regexp.new("( a )", x).match("a").to_a
+  assert_equal ["b"], Regexp.new("(?: a | b )", x).match("b").to_a
+  assert_equal ["b"], Regexp.new("a | b", x).match("b").to_a
+  assert_equal ["a"], Regexp.new("^ a $", x).match("a").to_a
+  assert_equal ["axb"], Regexp.new("a . b", x).match("axb").to_a
+  assert_equal ["aaa"], Regexp.new("a +", x).match("aaa").to_a
+  assert_equal ["aa"], Regexp.new("a {2}", x).match("aa").to_a
+  assert_equal ["aa", "a"], Regexp.new("(a) {2}", x).match("aa").to_a
+  assert_equal ["b"], Regexp.new("a ?b", x).match("b").to_a
+  assert_equal ["a"], Regexp.new("(?= a)a", x).match("a").to_a
+  assert_equal ["b"], Regexp.new("(?<= a)b", x).match("ab").to_a
+  assert_equal ["b"], Regexp.new("(?! a)b", x).match("b").to_a
+  assert_equal ["a"], Regexp.new("(?> a )", x).match("a").to_a
+  assert_equal ["A"], Regexp.new("(?i: a )", x).match("A").to_a
+  assert_equal ["aa", "a"], Regexp.new("(?<n> a)\\k<n>", x).match("aa").to_a
+  assert_equal ["aa", "a"], Regexp.new("(a) \\1", x).match("aa").to_a
+
+  # the five bytes CRuby skips; a vertical tab is a literal
+  assert_equal ["ab"], Regexp.new("a \t\n\r\fb", x).match("ab").to_a
+  assert_nil Regexp.new("a\vb", x).match("ab")
+  assert_equal ["a\vb"], Regexp.new("a\vb", x).match("a\vb").to_a
+
+  # an escaped blank is the blank
+  assert_equal ["a b"], Regexp.new("a\\ b", x).match("a b").to_a
+  assert_equal ["a\nb"], Regexp.new("a\\\nb", x).match("a\nb").to_a
+  assert_equal ["#"], Regexp.new("\\#", x).match("#").to_a
+
+  # inside a token the whitespace is the token's own: `(?` and `{n,m}` are
+  # read whole, so a space breaks them rather than being removed from them
+  assert_raise_with_message(RegexpError,
+                            "target of repeat operator is not specified: /( ?i)A/") do
+    Regexp.new("( ?i)A", x)
+  end
+  assert_raise(RegexpError) { Regexp.new("(?i )a", x) }
+  assert_nil Regexp.new("a{1, 2}", x).match("aa")
+  assert_equal ["a{1,2}"], Regexp.new("a{1, 2}", x).match("a{1,2}").to_a
+  assert_equal ["a{2}"], Regexp.new("a{ 2}", x).match("a{2}").to_a
+  assert_equal ["a{2}"], Regexp.new("a{2 }", x).match("a{2}").to_a
+  # the `?` that makes a quantifier non-greedy is read right after it, so a
+  # `?` a space away is a repeat of the repeat, which this engine refuses
+  # as it refuses `a**`
+  assert_equal [""], Regexp.new("a*?", x).match("aaa").to_a
+  # A `?` a blank away from the quantifier repeats the repeat, `(?:a*)?`, and
+  # is not the non-greedy marker, which is read where the quantifier is.
+  assert_equal ["aaa"], Regexp.new("a* ?", x).match("aaa").to_a
+  assert_equal ["aa"], Regexp.new("a{2} ?", x).match("aaa").to_a
+
+  # a numeric escape is read whole too: the whitespace that CRuby rejects
+  # inside one is rejected here, and the whitespace that ends one short of
+  # its full width ends it, so `\x6 1` is `\x06` and `1`
+  ["\\u {61 62}", "\\u1 234", "\\u12 34", "\\u00 61", "\\u\t{61 62}",
+   "\\u 0061", "[\\u12 34]"].each do |pat|
+    assert_raise_with_message(RegexpError, "invalid Unicode escape: /#{pat}/") do
+      Regexp.new(pat, x)
+    end
+  end
+  # nothing after \u is "too short", a wrong byte after it "invalid"; the
+  # blank is a byte the parser sees, and reports
+  assert_raise_with_message(RegexpError, "invalid Unicode escape: /\\u /") do
+    Regexp.new("\\u ", x)
+  end
+  assert_raise_with_message(RegexpError, "too short escape sequence: /\\u/") do
+    Regexp.new("\\u", x)
+  end
+  assert_equal ["ab"], Regexp.new("\\u0061 \\u0062", x).match("ab").to_a
+  assert_equal ["ab"], Regexp.new("\\u{ 61  62 }", x).match("ab").to_a
+  assert_raise_with_message(RegexpError, "invalid hex escape: /\\x 61/") do
+    Regexp.new("\\x 61", x)
+  end
+  assert_equal ["\x061"], Regexp.new("\\x6 1", x).match("\x061").to_a
+  assert_nil Regexp.new("\\x6 1", x).match("a")
+  assert_equal ["\x0061"], Regexp.new("\\0 61", x).match("\x0061").to_a
+  assert_equal ["\x061"], Regexp.new("\\06 1", x).match("\x061").to_a
+  assert_nil Regexp.new("\\0 61", x).match("1")
+
+  # a group name is the raw bytes up to its terminator, whitespace included,
+  # whether it is declared or referenced: the name is "a b"
+  assert_equal ["a b"], Regexp.new("(?<a b>x)", x).names
+  assert_equal ["a b"], Regexp.new("(?'a b'x)", x).names
+  assert_equal "xx", Regexp.new("(?<a b>x)\\k<a b>", x).match("xx")[0]
+  assert_equal "xx", Regexp.new("(?'a b'x)\\k'a b'", x).match("xx")[0]
+  assert_raise_with_message(RegexpError,
+                            "undefined name <a b> reference: /(?<ab>x)\\k<a b>/") do
+    Regexp.new("(?<ab>x)\\k<a b>", x)
+  end
+  assert_raise_with_message(RegexpError,
+                            "undefined name <ab> reference: /(?<a b>x)\\k<ab>/") do
+    Regexp.new("(?<a b>x)\\k<ab>", x)
+  end
+  # a `\k` that whitespace follows is the letter k, with the `<ab>` after
+  # the whitespace a literal of its own; a comment between the two is gone
+  # before the parser reads either, as in CRuby, so that `\k` is a reference
+  assert_equal "xk<ab>", Regexp.new("(?<ab>x)\\k <ab>", x).match("xk<ab>")[0]
+  assert_equal "xk<ab>", Regexp.new("(?<ab>x)\\k\n<ab>", x).match("xk<ab>")[0]
+  assert_equal "xx", Regexp.new("(?<ab>x)\\k#c\n<ab>", x).match("xx")[0]
+  assert_equal "xx", Regexp.new("(?<ab>x)\\k(?#c)<ab>").match("xx")[0]
+  # a comment inside a name is removed the same way, and takes its newline
+  assert_equal ["ab"], Regexp.new("(?<ab#c\n>x)\\k<ab#c\n>", x).names
+  assert_equal "xx", Regexp.new("(?<ab#c\n>x)\\k<ab#c\n>", x).match("xx")[0]
+  # inside a class the escape is the letter and the space is a member
+  assert_equal [" "], Regexp.new("[\\k<a b>]", x).match(" ").to_a
+end
+
+assert("Regexp - a removed comment does not reach into an escape") do
+  # The pass that removes (?#...) groups and, under /x, `#` comments runs
+  # before the parser, so bytes it removes from inside an escape would leave
+  # the parser a different escape. CRuby's own pre-pass reads each escape
+  # whole before it reaches the comment, and so does this one: `\u12(?#c)34`
+  # is rejected as `\u12(?` rather than read as `\u1234`.
+  x = Regexp::EXTENDED
+
+  # \uXXXX is exactly four bytes after the u, whatever they are
+  ["\\u12(?#c)34", "\\u(?#c){61}", "\\u006(?#c)1"].each do |pat|
+    assert_raise_with_message(RegexpError, "invalid Unicode escape: /#{pat}/") do
+      Regexp.new(pat)
+    end
+  end
+  ["\\u12#c\n34", "\\u#c\n{61}"].each do |pat|
+    assert_raise_with_message(RegexpError, "invalid Unicode escape: /#{pat}/") do
+      Regexp.new(pat, x)
+    end
+  end
+  assert_equal ["ab"], Regexp.new("\\u0061(?#c)\\u0062").match("ab").to_a
+  assert_equal ["ab"], Regexp.new("\\u{61}(?#c)\\u{62}").match("ab").to_a
+  # a `\u{...}` list is one escape through its brace, and holds no comment
+  assert_raise_with_message(RegexpError, "invalid Unicode list: /\\u{61(?#c)62}/") do
+    Regexp.new("\\u{61(?#c)62}")
+  end
+  assert_raise_with_message(RegexpError, "invalid Unicode list: /\\u{61 #c\n62}/") do
+    Regexp.new("\\u{61 #c\n62}", x)
+  end
+
+  # \x is one or two hex digits and needs the one; a one-digit escape is
+  # written at full width so that a digit the comment kept apart cannot
+  # join it: `\x6(?#c)1` is `\x06` and `1`
+  assert_raise_with_message(RegexpError, "invalid hex escape: /\\x(?#c)61/") do
+    Regexp.new("\\x(?#c)61")
+  end
+  assert_raise_with_message(RegexpError, "invalid hex escape: /\\x#c\n61/") do
+    Regexp.new("\\x#c\n61", x)
+  end
+  assert_equal ["\x061"], Regexp.new("\\x6(?#c)1").match("\x061").to_a
+  assert_nil Regexp.new("\\x6(?#c)1").match("a")
+  assert_equal ["\x061"], Regexp.new("\\x6#c\n1", x).match("\x061").to_a
+  assert_nil Regexp.new("\\x6#c\n1", x).match("a")
+  assert_equal ["\x06"], Regexp.new("\\x6(?#c)").match("\x06").to_a
+  assert_equal ["a1"], Regexp.new("\\x61(?#c)1").match("a1").to_a
+
+  # \0 is up to two more octal digits, written at full width the same way
+  assert_equal ["\x0061"], Regexp.new("\\0(?#c)61").match("\x0061").to_a
+  assert_nil Regexp.new("\\0(?#c)61").match("1")
+  assert_equal ["\x0061"], Regexp.new("\\0#c\n61", x).match("\x0061").to_a
+  assert_equal ["\x061"], Regexp.new("\\06(?#c)1").match("\x061").to_a
+  assert_equal ["\x061"], Regexp.new("\\06#c\n1", x).match("\x061").to_a
+  assert_equal ["\x00"], Regexp.new("\\0(?#c)").match("\x00").to_a
+  assert_equal ["\x001"], Regexp.new("\\000(?#c)1").match("\x001").to_a
+
+  # inside a class the pass removes nothing, so `(?#c)` is five members and
+  # `#c` two, and the escape is read as written
+  assert_equal ["\x06"], Regexp.new("[\\x6(?#c)1]").match("\x06").to_a
+  assert_equal ["("], Regexp.new("[\\x6(?#c)1]").match("(").to_a
+  assert_equal ["#"], Regexp.new("[\\x6#c\n1]", x).match("#").to_a
 end
 
 assert("Regexp - empty pattern") do
@@ -707,6 +951,34 @@ assert("Regexp - non-capturing group") do
   assert_nil md[2]
 end
 
+assert("Regexp - an empty group takes a quantifier") do
+  # `(?:)` emits no code, but it is an atom, and a repeat of what matches
+  # empty matches empty, as CRuby compiles it. The scoped-option and demoted
+  # plain spellings of an empty group are the same atom.
+  assert_equal [""], /(?:)*/.match("").to_a
+  assert_equal [""], /(?:)+/.match("").to_a
+  assert_equal [""], /(?:){2}/.match("").to_a
+  assert_equal [""], /(?:){0}/.match("").to_a
+  assert_equal [""], /(?:)*?/.match("").to_a
+  assert_equal [""], /(?:)*+/.match("").to_a
+  assert_equal [""], /(?:)**/.match("").to_a
+  assert_equal [""], /(?:(?:))*/.match("").to_a
+  assert_equal [""], /(?:a{0})*/.match("aa").to_a
+  assert_equal ["ab"], /a(?:)*b/.match("ab").to_a
+  assert_equal ["b", ""], /((?:)*)b/.match("b").to_a
+  assert_equal [""], /(?i:)*/.match("").to_a
+  assert_equal ["a", "a"], /(?<n>a)()*/.match("a").to_a
+  assert_equal [""], /(?:) * /x.match("").to_a
+  # A `{` after it that spells no quantifier is a literal, as after any atom.
+  assert_equal ["{a}"], /(?:){a}/.match("{a}").to_a
+  # An option toggle is not an atom: the quantifier after `(?i)` has no target.
+  assert_raise_with_message(RegexpError,
+                            "target of repeat operator is not specified: /(?i)*/") do
+    Regexp.new("(?i)*")
+  end
+  assert_raise(RegexpError) { Regexp.new("(?:(?i))*(?i)+") }
+end
+
 assert("Regexp - atomic group (?>...)") do
   # The body's first match is its only one: what follows cannot make it
   # give text back or take another branch, where a plain group can.
@@ -736,6 +1008,19 @@ assert("Regexp - atomic group (?>...)") do
   # Sequential atomic groups at the same depth cut independently.
   assert_nil /(?>x(?>a)(?>b)y)/.match("xabz")
   assert_equal 0, /(?>x(?>a)(?>b)y)/ =~ "xaby"
+
+  # A possessive repeat is an atomic group wrapped around what it repeats,
+  # and it cuts as a group of its own: a failure after it does not open the
+  # repeat to being skipped, whatever groups the repeated code holds.
+  assert_nil /(?>a)?+a/.match("a")
+  assert_nil /(?>a)*+a/.match("aa")
+  assert_nil /(?:(?>a)b?)?+a/.match("a")
+  assert_nil /(?:(?>a)?+)?+a/.match("a")
+  assert_equal 0, /(?>a)?+b/ =~ "ab"
+  assert_equal 0, /(?:(?>a)b?)?+c/ =~ "abc"
+  # A failure inside the repeat, before its end, still fails only the inner
+  # group, and the repeat is skipped as its `?` allows.
+  assert_equal 1, /(?:(?>a)b)?+c/ =~ "ac"
 
   # A repetition whose body can match empty stops on its empty iteration
   # inside the group as anywhere else, and takes the group's exit; a
@@ -824,33 +1109,40 @@ assert("Regexp - a named group makes plain groups non-capturing") do
   end
 end
 
-assert("Regexp - the /x pass and the named-group scan skip the same constructs") do
-  # Two walks read the pattern before the parser does: the /x free-spacing
-  # pass and the named-group pre-scan. Both have to step over the same
-  # escapes, character classes and POSIX brackets, so each row below is read
-  # by both at once. A rule lost from the free-spacing pass strips a space it
-  # should have kept; the same rule lost from the pre-scan turns a bracketed
-  # "(?<" into a phantom named group, which demotes the plain (b) that
-  # follows and shortens the match. Either way the row fails.
+assert("Regexp - the comment pass, the named-group scan and the parser skip the same constructs") do
+  # Three readers step over the pattern's escapes, character classes and
+  # POSIX brackets: the comment pass, which runs when the pattern holds a
+  # `#`; the named-group pre-scan; and the parser, which under /x skips
+  # whitespace between tokens and none inside those constructs. Every row
+  # below is read by the pre-scan and the parser, and the rows with a `#`
+  # by the pass as well. A rule lost from the pass takes a `#` inside a
+  # class for a comment and eats the rest of the pattern; the same rule
+  # lost from the pre-scan turns a bracketed "(?<" into a phantom named
+  # group, which demotes the plain (b) that follows and shortens the match;
+  # lost from the parser it strips a space that is a member. Either way the
+  # row fails.
   x = Regexp::EXTENDED
 
-  # an escape pair hides the '(' from both
+  # an escape pair hides the '(' from the pre-scan and the parser
   assert_equal ["(<a>b", "b"],
                Regexp.new('\(?<a> (b)', x).match("(<a>b").to_a
 
-  # a character class hides "(?<" and keeps its own spaces
-  assert_equal ["(?< b", "b"],
-               Regexp.new('[(?< a>]+ (b)', x).match("(?< b").to_a
+  # a character class hides "(?<" and keeps its own spaces and its `#`
+  assert_equal ["(?< #b", "b"],
+               Regexp.new('[(?< a>#]+ (b)', x).match("(?< #b").to_a
 
-  # a ']' written first is a member, so the class runs past it
+  # a ']' written first is a member, so the class runs past it; no `#` in
+  # these two, since CRuby's own pre-pass does not know this rule and takes
+  # a `#` after `[]` for a comment, so it cannot settle what the pass makes
+  # of one
   assert_equal ["] (?<b", "b"],
                Regexp.new('[] (?<a>]+(b)', x).match("] (?<b").to_a
   assert_equal ["zzb", "b"],
                Regexp.new('[^] (?<a>]+(b)', x).match("zzb").to_a
 
   # a POSIX bracket's ']' does not close the class either
-  assert_equal ["a (?<b", "b"],
-               Regexp.new('[[:alpha:] (?<a>]+(b)', x).match("a (?<b").to_a
+  assert_equal ["a #(?<b", "b"],
+               Regexp.new('[[:alpha:] #(?<a>]+(b)', x).match("a #(?<b").to_a
 
   # a `\u{...}` list is one escape, so its separating space survives /x and
   # its bytes are not read as pattern syntax
@@ -862,11 +1154,10 @@ assert("Regexp - the /x pass and the named-group scan skip the same constructs")
   assert_equal ["abcd", "c", "d"],
                Regexp.new('[\u{61 62}]+(c)(d)', x).match("abcd").to_a
 
-  # With no whitespace, no #comment and no (?#...) to remove, /x rewrites
-  # nothing, so both compiles must agree; they do not take the same road,
-  # though: without /x the pre-scan reads the pattern as written, while with
-  # /x it reads what the free-spacing pass emitted. The two walks disagreeing
-  # about where a class or an escape ends is exactly what shows up here.
+  # With no `#` the pass does not run, and with no whitespace /x gives the
+  # parser nothing to skip, so both compiles read the same bytes and must
+  # agree: /x by itself changes nothing about where a class or an escape
+  # ends.
   [
     ['\(?<a>(b)',            "(<a>b"],
     ['[(?<a>]+(b)',          "(?<b"],
@@ -1218,7 +1509,7 @@ assert("Regexp - \\k group reference errors say which failure it was") do
 end
 
 assert("Regexp - named captures survive /x preprocessing") do
-  # Regression: with /x, mrb_re_compile freed the stripped buffer that
+  # Regression: with /x, mrb_re_compile freed the rewritten buffer that
   # named_captures[i].name pointed into.
   re = /(?<n>\d+) # comment
        \s* (?<u>\w+) /x
@@ -1285,6 +1576,63 @@ assert("Regexp - negative lookbehind at string start") do
   # negative lookbehind succeeds when not enough text before
   md = Regexp.new("(?<!x)a").match("a")
   assert_equal "a", md[0]
+end
+
+assert("Regexp - a capture inside a lookaround is undone with the lookaround") do
+  # A lookaround's sub-pattern used to run in a call of its own, so once it
+  # had matched, the frames that could undo what it captured were gone, and
+  # backtracking past the lookaround left the capture written. A plain
+  # group's frames stay while the text after it runs, and undo.
+  assert_nil /(?:(a)b|)/.match("a")[1]
+  assert_nil /(?:(?=(a))b|)/.match("a")[1]
+  assert_nil /(?=(a))b|/.match("a")[1]
+  assert_nil /(?:(?=(a))b)?/.match("a")[1]
+  assert_nil /(?:(?=(a))b)*/.match("a")[1]
+  assert_nil /(?:(?<=(a))b|)c/.match("ac")[1]
+  # A negative lookaround's sub-pattern matching is the assertion failing,
+  # and what it captured on the way is undone with it.
+  assert_nil /(?!(a))|/.match("a")[1]
+  assert_nil /(?!(a))*/.match("a")[1]
+  assert_nil /(?!(a))?/.match("a")[1]
+  assert_equal ["a", nil], /(?!(a)b)a\1?/.match("ac").to_a
+  # A backreference to the leaked group consumed text, and the match itself
+  # changed.
+  assert_nil /(?:(?=(a))b|)\1/ =~ "aa"
+  assert_nil /(?:(?!(a))|a)\1/ =~ "aa"
+  assert_equal "ab", /(?:(?!(a))|a)\1?b/.match("aab")[0]
+  assert_nil /(?:(?=(a))a|b)\1/ =~ "ba"
+  # What a lookaround that holds captured stays, as before.
+  assert_equal "a", /(?=(a))a/.match("a")[1]
+  assert_equal ["b", "a"], /(?<=(a))b/.match("ab").to_a
+  assert_equal ["ab", "a"], /(?=(a|ab))\1b/.match("abb").to_a
+  # A positive lookaround's sub-pattern matches once: the text after it
+  # failing does not send it back for another branch, as in Onigmo.
+  assert_nil /(?=(a|ab))\1c/ =~ "abc"
+  assert_equal ["abc", nil], /(?:(?=(a|ab))\1c|abc)/.match("abc").to_a
+  # The text after a lookaround runs inside its sub-pattern's frames, so
+  # an atomic group's cut from that text passes through the lookaround on
+  # its way to the group, and the lookaround does not absorb it as its own.
+  assert_nil /(?>(?=a)ab|a)b/ =~ "ab"
+  assert_nil /(?>(?!x)ab|a)b/ =~ "ab"
+  assert_equal 0, /(?>(?=a)ab|a)c/ =~ "abc"
+  # A possessive repeat wrapped around a lookaround is numbered apart from
+  # it, as from an atomic group, so its cut is not read as the lookaround's.
+  assert_nil /(?:(?=a)a)?+a/.match("a")
+  assert_nil /(?:(?=a)a)*+a/.match("aa")
+  assert_nil /(?:a(?<=a))?+a/.match("a")
+  assert_nil /(?:(?!b)a)?+a/.match("a")
+  assert_equal 0, /(?:(?=a)a)?+b/ =~ "ab"
+  # A repeat around a positive lookaround re-enters its sub-pattern while
+  # the frames of the run before are still up, so a loop inside it starts
+  # over with the record of where the run before left off still live; the
+  # first iteration of an e+ reads that record without having written it,
+  # and must not take it for its own: `(b|)+` on "b" goes round twice, and
+  # the empty second time is what it leaves in the group.
+  assert_equal ["", ""], /(?=(b|)+)+/.match("b").to_a
+  assert_equal ["", ""], /(?=(b|)+a)+/.match("ba").to_a
+  assert_equal ["", ""], /(?=(b|)+)+\1/.match("b").to_a
+  assert_equal ["", "", ""], /(?=(b|)+(?=(a|)+))+/.match("ba").to_a
+  assert_equal ["", ""], /(?=(a|)+)++/.match("abab").to_a
 end
 
 assert("Regexp - lookbehind over a class that can match a multibyte character") do

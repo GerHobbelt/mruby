@@ -48,10 +48,19 @@ typedef struct {
   mrb_bool has_backref;
   mrb_bool needs_backtrack;
   mrb_bool dont_capture;    /* pattern declares a named group: plain (...) does not capture */
+  uint16_t max_backref;     /* the largest `\NN` the pattern refers back to,
+                               checked against the group count once the whole
+                               pattern is read: CRuby takes a reference to a
+                               group written later, `\1(a)`, so the count it
+                               compares with is the pattern's, not the one
+                               standing where the reference is */
   uint16_t num_groups;      /* groups opened so far, counting the plain ones a
                                named pattern demotes: what decides whether
                                `\NN` is a backreference or an octal escape */
-  uint32_t atomic_depth;    /* how many (?>...) groups enclose the parse point */
+  uint32_t num_cuts;        /* atomic groups and lookarounds numbered so far,
+                               the possessive repeats among them: each takes
+                               the next number, so no two that nest share one;
+                               see RE_ATOMIC and RE_LOOK_END */
   uint32_t atom_start;      /* where the atom a quantifier binds to begins;
                                compile_quantified sets it to the position
                                before the atom, and a `\u{...}` list moves it
@@ -73,10 +82,9 @@ compile_error_str(re_compiler *c, mrb_value msg)
 {
   /* Quote c->orig, the pattern as written: when the pattern is preprocessed
      c->src points at the buffer preprocess_pattern() returned, so quoting it
-     would drop the free-spacing, the comments and the (?#...) groups from the
-     message. c->orig is the caller's buffer, which outlives the compile. It
-     is not NUL-terminated, so use %l with the explicit length from
-     c->orig_end. */
+     would drop the comments and the (?#...) groups from the message. c->orig
+     is the caller's buffer, which outlives the compile. It is not
+     NUL-terminated, so use %l with the explicit length from c->orig_end. */
   mrb_value emsg = mrb_format(c->mrb, "%v: /%l/",
                               msg, c->orig, (size_t)(c->orig_end - c->orig));
 
@@ -189,6 +197,30 @@ next_char(re_compiler *c)
 {
   if (c->p >= c->src_end) return -1;
   return (uint8_t)*c->p++;
+}
+
+/* Under /x, step over the whitespace between two tokens. Called where one
+   token ends and the next may begin, in compile_seq() and before the
+   quantifier in compile_quantified(), and nowhere else: whitespace inside a
+   token is the token's own, so `a{1, 2}` is not an interval and `(?<a b>x)`
+   names the group "a b", as in CRuby, whose tokenizer skips whitespace only
+   where it fetches a token. The bytes are the five Onigmo skips; a vertical
+   tab is a literal under /x there, and here.
+
+   `#` comments are not skipped here: preprocess_pattern() removes them, as
+   CRuby's own pre-pass does before it tokenizes, which is what lets a removed
+   comment join `\1` to the `0` after it. */
+static mrb_bool
+extended_space(int ch)
+{
+  return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f';
+}
+
+static void
+skip_extended_space(re_compiler *c)
+{
+  if (!(c->flags & RE_FLAG_EXTENDED)) return;
+  while (extended_space(peek(c))) next_char(c);
 }
 
 static uint16_t
@@ -475,41 +507,56 @@ class_add_shorthand(re_charclass *cc, int ch)
 }
 
 /* TRUE when every character the class can match is ASCII, so it always
-   consumes exactly one byte. Non-ASCII codepoint ranges and the utf8_any
-   catch-all (set by \D, \W, \S, \H and [[:^alpha:]]) both admit multibyte
-   characters, whose width is not known until match time. */
+   consumes exactly one byte. Non-ASCII codepoint ranges, a type read off the
+   table and the utf8_any catch-all (set by \D, \W, \S, \H and [[:^ascii:]])
+   all admit multibyte characters, whose width is not known until match
+   time. */
 static mrb_bool
 class_is_ascii_only(const re_charclass *cc)
 {
+#ifdef RE_UNICODE_CTYPE
+  if (cc->ctype_yes || cc->ctype_no) return FALSE;
+#endif
   return cc->num_ranges == 0 && !cc->utf8_any;
 }
 
 /* Set ASCII bits for a POSIX class name (e.g. "alpha") into a 128-bit map.
-   Returns FALSE for an unknown name. Semantics are ASCII, like this gem's
-   \w/\d shorthands; non-ASCII codepoints are not classified.
+   Returns FALSE for an unknown name. What the name holds above ASCII is
+   answered separately, by the re_ctype bit written to *ctype: a build with
+   the table reads the rest of the type off it, and one without has ASCII and
+   nothing more, like this gem's \w/\d shorthands, so it writes nothing there
+   and the caller does not read. [:xdigit:] and [:ascii:] are sets ASCII
+   defines, so they hold nothing above it on any build and have no bit.
 
-   *ascii_set is TRUE for a name whose set ASCII defines, [:word:] and
-   [:ascii:], as opposed to one ASCII merely bounds here; the distinction is
-   what compile_charclass() folds by. */
+   *ascii_set is TRUE for a name whose ASCII set is one ASCII defines, [:word:]
+   and [:ascii:], as opposed to one ASCII merely bounds here; the distinction
+   is what compile_charclass() folds by. */
 static mrb_bool
-posix_class_bits(uint8_t *bits, const char *name, size_t len, mrb_bool *ascii_set)
+posix_class_bits(uint8_t *bits, const char *name, size_t len, mrb_bool *ascii_set,
+                 uint16_t *ctype)
 {
 #define NAME_IS(s) (len == sizeof(s) - 1 && memcmp(name, s, len) == 0)
 #define BSET(ch)   (bits[(ch) >> 3] |= (uint8_t)(1u << ((ch) & 7)))
 #define BRANGE(lo, hi) do { for (int i = (lo); i <= (hi); i++) BSET(i); } while (0)
+#ifdef RE_UNICODE_CTYPE
+#define TYPE(t)    (*ctype = (t))
+#else
+#define TYPE(t)    ((void)0)
+#endif
   *ascii_set = NAME_IS("word") || NAME_IS("ascii");
-  if (NAME_IS("alpha")) { BRANGE('a','z'); BRANGE('A','Z'); }
-  else if (NAME_IS("digit")) { BRANGE('0','9'); }
-  else if (NAME_IS("alnum")) { BRANGE('a','z'); BRANGE('A','Z'); BRANGE('0','9'); }
-  else if (NAME_IS("upper")) { BRANGE('A','Z'); }
-  else if (NAME_IS("lower")) { BRANGE('a','z'); }
-  else if (NAME_IS("space")) { BSET(' '); BRANGE('\t','\r'); }
-  else if (NAME_IS("blank")) { BSET(' '); BSET('\t'); }
+  TYPE(0);
+  if (NAME_IS("alpha")) { BRANGE('a','z'); BRANGE('A','Z'); TYPE(RE_CTYPE_ALPHA); }
+  else if (NAME_IS("digit")) { BRANGE('0','9'); TYPE(RE_CTYPE_DIGIT); }
+  else if (NAME_IS("alnum")) { BRANGE('a','z'); BRANGE('A','Z'); BRANGE('0','9'); TYPE(RE_CTYPE_ALNUM); }
+  else if (NAME_IS("upper")) { BRANGE('A','Z'); TYPE(RE_CTYPE_UPPER); }
+  else if (NAME_IS("lower")) { BRANGE('a','z'); TYPE(RE_CTYPE_LOWER); }
+  else if (NAME_IS("space")) { BSET(' '); BRANGE('\t','\r'); TYPE(RE_CTYPE_SPACE); }
+  else if (NAME_IS("blank")) { BSET(' '); BSET('\t'); TYPE(RE_CTYPE_BLANK); }
   else if (NAME_IS("xdigit")) { BRANGE('0','9'); BRANGE('a','f'); BRANGE('A','F'); }
-  else if (NAME_IS("word")) { BRANGE('a','z'); BRANGE('A','Z'); BRANGE('0','9'); BSET('_'); }
-  else if (NAME_IS("cntrl")) { BRANGE(0, 0x1f); BSET(0x7f); }
-  else if (NAME_IS("print")) { BRANGE(0x20, 0x7e); }
-  else if (NAME_IS("graph")) { BRANGE(0x21, 0x7e); }
+  else if (NAME_IS("word")) { BRANGE('a','z'); BRANGE('A','Z'); BRANGE('0','9'); BSET('_'); TYPE(RE_CTYPE_WORD); }
+  else if (NAME_IS("cntrl")) { BRANGE(0, 0x1f); BSET(0x7f); TYPE(RE_CTYPE_CNTRL); }
+  else if (NAME_IS("print")) { BRANGE(0x20, 0x7e); TYPE(RE_CTYPE_PRINT); }
+  else if (NAME_IS("graph")) { BRANGE(0x21, 0x7e); TYPE(RE_CTYPE_GRAPH); }
   else if (NAME_IS("ascii")) { BRANGE(0, 0x7f); }
   else if (NAME_IS("punct")) {
     for (int i = 0x21; i <= 0x7e; i++) {
@@ -517,12 +564,14 @@ posix_class_bits(uint8_t *bits, const char *name, size_t len, mrb_bool *ascii_se
                        (i >= '0' && i <= '9');
       if (!alnum) BSET(i);
     }
+    TYPE(RE_CTYPE_PUNCT);
   }
   else return FALSE;
   return TRUE;
 #undef NAME_IS
 #undef BSET
 #undef BRANGE
+#undef TYPE
 }
 
 /* Value of one hex digit, or -1 for anything else (including the -1 that
@@ -828,7 +877,8 @@ compile_charclass(re_compiler *c)
       if (peek(c) == ':' && c->p + 1 < c->src_end && c->p[1] == ']') {
         uint8_t bits[16] = {0};
         mrb_bool by_ascii;
-        if (!posix_class_bits(bits, name, (size_t)(c->p - name), &by_ascii)) {
+        uint16_t ctype;
+        if (!posix_class_bits(bits, name, (size_t)(c->p - name), &by_ascii, &ctype)) {
           compile_error(c, "invalid POSIX bracket class");
         }
         next_char(c);  /* ':' */
@@ -838,7 +888,20 @@ compile_charclass(re_compiler *c)
           mrb_bool in = (bits[i >> 3] >> (i & 7)) & 1;
           if (in != neg) class_set_bit(dst, (uint8_t)i);
         }
-        if (neg) dst->utf8_any = TRUE;  /* [:^...:] matches non-ASCII too */
+        /* Above ASCII a type is read off the table at match time, in either
+           polarity. A set ASCII defines holds nothing there, so its negation
+           holds everything there: [:^ascii:] is every character above ASCII
+           and every byte that is no character. Without the table, every
+           bracket is such a set. */
+#ifdef RE_UNICODE_CTYPE
+        if (ctype) {
+          if (neg) cc->ctype_no |= ctype;
+          else cc->ctype_yes |= ctype;
+        }
+        else if (neg) dst->utf8_any = TRUE;
+#else
+        if (neg) dst->utf8_any = TRUE;
+#endif
         continue;
       }
       c->p = save;  /* not a POSIX class; treat '[' as a literal below */
@@ -1008,6 +1071,16 @@ compile_charclass(re_compiler *c)
   for (int i = 0; i < RE_CLASS_BITMAP_SIZE; i++) cc->bitmap[i] |= ascii_set.bitmap[i];
   if (ascii_set.utf8_any) cc->utf8_any = TRUE;
 
+#ifdef RE_UNICODE_CTYPE
+  /* A type is not spelled out as members, so the closure above never saw it;
+     it is closed at match time instead, by reading the type of every
+     character sharing the folding of the one in hand. The bitmap holds the
+     ASCII of every bracket, and the closure has already reached across the
+     boundary from there: U+017F is in the class once 's' is, so a type
+     found only through an ASCII counterpart is found through the ranges. */
+  cc->ctype_fold = (c->flags & RE_FLAG_IGNORECASE) && (cc->ctype_yes || cc->ctype_no);
+#endif
+
   cc->negated = negated;
   emit(c, negated ? RE_NCLASS : RE_CLASS, (uint8_t)id, 0);
 }
@@ -1019,11 +1092,13 @@ compile_charclass(re_compiler *c)
 
 /* Parse {n}, {n,}, {n,m} quantifier. Returns min,max via pointers. */
 static mrb_bool
-parse_quantifier(re_compiler *c, int *min_out, int *max_out)
+parse_quantifier(re_compiler *c, int *min_out, int *max_out, mrb_bool *ranged)
 {
   const char *save = c->p;
   int min = 0, max = -1;
   mrb_bool has_digit = FALSE;
+
+  *ranged = FALSE;
 
   while (peek(c) >= '0' && peek(c) <= '9') {
     min = min * 10 + (next_char(c) - '0');
@@ -1032,6 +1107,7 @@ parse_quantifier(re_compiler *c, int *min_out, int *max_out)
   }
   if (peek(c) == ',') {
     next_char(c);
+    *ranged = TRUE;
     if (peek(c) >= '0' && peek(c) <= '9') {
       max = 0;
       while (peek(c) >= '0' && peek(c) <= '9') {
@@ -1120,7 +1196,7 @@ compute_fixed_len(re_compiler *c, uint32_t start, uint32_t end, int *chars_out)
       /* For simplicity, reject alternation in lookbehind */
       return -1;
     }
-    case RE_MATCH:
+    case RE_LOOK_END:
       *chars_out = chars;
       return len;
     default:
@@ -1136,11 +1212,11 @@ compute_fixed_len(re_compiler *c, uint32_t start, uint32_t end, int *chars_out)
    and a further run of i/m/x to switch off, then stops at the terminator
    (':' or ')'). `base` is the option set in effect on entry; the resulting
    set is returned. Ruby's inline letters are i (IGNORECASE), m (DOTALL),
-   x (EXTENDED). The x bit is carried like the other two but nothing in the
-   parser reads it: free-spacing is applied by preprocess_pattern() before
-   the parser runs, and that pass tracks the same (?x) and (?-x) scopes over
-   the pattern as written, so by the time the letter is read here the
-   whitespace it governed is already gone or already kept. */
+   x (EXTENDED). All three are scoped alike by the group they are read in:
+   skip_extended_space() reads x from c->flags, which compile_atom() saves
+   at every '(' and restores at its ')'. preprocess_pattern() tracks the
+   same scopes over the pattern as written for the one thing it still does
+   under /x, removing `#` comments. */
 static uint32_t
 parse_inline_flags(re_compiler *c, uint32_t base)
 {
@@ -1301,8 +1377,25 @@ emit_codepoint(re_compiler *c, uint32_t cp)
    number/name` for one within it that names no group. */
 #define RE_MAX_BACKREF_NUM 2147483647
 
-/* Compile a single atom (character, class, group, etc.) */
+/* Compile the sub-pattern of a lookaround, whose opener has just been
+   emitted, up to and including the RE_LOOK_END that closes it. The end
+   carries the lookaround's number, from the count the atomic groups use, so
+   that a cut aimed at this lookaround is told from one aimed at a group
+   around or inside it; see bt_match(). */
 static void
+compile_look_body(re_compiler *c, mrb_bool negative)
+{
+  uint16_t cut = (uint16_t)++c->num_cuts;
+  compile_alt(c);
+  emit(c, RE_LOOK_END, negative, cut);
+}
+
+/* Compile a single atom (character, class, group, etc.). Returns whether one
+   was read: FALSE when what stands at the parse point is not an atom, either a
+   quantifier metacharacter or the end of the sequence, neither of them
+   consumed, or an option toggle `(?i)`, consumed but nothing a quantifier can
+   repeat. An empty group `(?:)` emits nothing and is still an atom. */
+static mrb_bool
 compile_atom(re_compiler *c)
 {
   int ch = peek(c);
@@ -1331,8 +1424,7 @@ compile_atom(re_compiler *c)
           mrb_bool negative = (c->p[1] == '!');
           next_char(c); next_char(c);  /* skip ?= or ?! */
           uint32_t la_pos = emit(c, negative ? RE_NEG_LOOKAHEAD : RE_LOOKAHEAD, 0, 0);
-          compile_alt(c);
-          emit(c, RE_MATCH, 0, 0);  /* end of lookahead sub-pattern */
+          compile_look_body(c, negative);
           c->pat->code[la_pos].offset = (uint16_t)c->code_len;  /* patch: skip past sub-pattern */
           if (peek(c) != ')') compile_error(c, "unmatched '('");
           next_char(c);
@@ -1347,8 +1439,7 @@ compile_atom(re_compiler *c)
           uint32_t lb_pos = emit(c, negative ? RE_NEG_LOOKBEHIND : RE_LOOKBEHIND, 0, 0);
           emit(c, RE_LB_WIDTH, 0, 0);
           uint32_t sub_start = c->code_len;
-          compile_alt(c);
-          emit(c, RE_MATCH, 0, 0);
+          compile_look_body(c, negative);
           c->pat->code[lb_pos].offset = (uint16_t)c->code_len;
 
           /* measure the sub-pattern for both rewind units */
@@ -1373,16 +1464,21 @@ compile_atom(re_compiler *c)
         else if (c->p[1] == '>') {
           /* atomic group (?>...): the body is a non-capturing group whose
              first match is its only one. The two instructions bracketing it
-             carry the group's nesting depth, which is how the executor pairs
-             the end of a body with the group it closes when a failure after
-             the body has to fail the group; see bt_match(). The depth counts
-             instructions the pattern holds, so it fits the field. */
+             carry a number of the group's own, which is how the executor
+             pairs the end of a body with the group it closes when a failure
+             after the body has to fail the group; see bt_match(). The number
+             is the count of groups numbered before it rather than the
+             nesting depth: a possessive repeat wraps a group around code
+             already emitted, and with depths that wrapper and a group inside
+             it, compiled with the same groups open around them, shared a
+             depth, so a cut of the wrapper was read as the inner group's.
+             Every numbered group emits two instructions, so the number fits
+             the field. */
           next_char(c); next_char(c);  /* skip ?> */
-          c->atomic_depth++;
-          emit(c, RE_ATOMIC, 0, (uint16_t)c->atomic_depth);
+          uint16_t cut = (uint16_t)++c->num_cuts;
+          emit(c, RE_ATOMIC, 0, cut);
           compile_alt(c);
-          emit(c, RE_ATOMIC_END, 0, (uint16_t)c->atomic_depth);
-          c->atomic_depth--;
+          emit(c, RE_ATOMIC_END, 0, cut);
           if (peek(c) != ')') compile_error(c, "unmatched '('");
           next_char(c);
           c->needs_backtrack = TRUE;  /* the Pike VM cannot cut a thread */
@@ -1417,7 +1513,7 @@ compile_atom(re_compiler *c)
           if (peek(c) == ')') {
             next_char(c);
             c->flags = new_flags;  /* rest of the group; restored at its ')' */
-            return;                /* consumed the token; no atom emitted */
+            return FALSE;          /* consumed the token; no atom emitted */
           }
           else if (peek(c) == ':') {
             next_char(c);
@@ -1426,7 +1522,7 @@ compile_atom(re_compiler *c)
             c->flags = saved_flags;
             if (peek(c) != ')') compile_error(c, "unmatched '('");
             next_char(c);
-            return;
+            return TRUE;
           }
           else {
             compile_error(c, "undefined (?...) sequence");
@@ -1537,6 +1633,7 @@ compile_atom(re_compiler *c)
         c->p = q;
         emit(c, RE_BACKREF, (uint8_t)num, (c->flags & RE_FLAG_IGNORECASE) ? 1 : 0);
         c->has_backref = TRUE;
+        if (num > c->max_backref) c->max_backref = (uint16_t)num;
       }
       else {
         /* parse_escape() reads `\1`-`\7` as octal and `\8`, `\9` as the
@@ -1698,7 +1795,8 @@ compile_atom(re_compiler *c)
          sequence loop spun forever (issue #6914). */
       next_char(c);  /* consume `{` for the trial parse */
       int qmin, qmax;
-      if (parse_quantifier(c, &qmin, &qmax)) {
+      mrb_bool qranged;
+      if (parse_quantifier(c, &qmin, &qmax, &qranged)) {
         compile_error(c, "target of repeat operator is not specified");
       }
       emit(c, RE_CHAR, '{', 0);
@@ -1707,7 +1805,7 @@ compile_atom(re_compiler *c)
 
   default:
     if (ch < 0 || ch == ')' || ch == '|' || ch == '*' || ch == '+' || ch == '?') {
-      return;  /* not an atom */
+      return FALSE;  /* not an atom */
     }
     next_char(c);
     if (ch >= 128) {
@@ -1717,6 +1815,7 @@ compile_atom(re_compiler *c)
     emit_char(c, (uint8_t)ch);
     break;
   }
+  return TRUE;
 }
 
 /* Append a copy of the atom bytecode in [start, start+size) at the current
@@ -1742,6 +1841,34 @@ emit_atom_copy(re_compiler *c, uint32_t start, uint32_t size)
   }
 }
 
+/* Read the quantifiers that follow a body which matches empty and emit
+   nothing for them: `a{0}` and `(?:)` leave no code, and repeating what
+   matches empty any number of times still matches empty, so `a{0}*`,
+   `a{0}{2}?` and `(?:)+` are the empty match CRuby gives. */
+static void
+skip_quantifiers(re_compiler *c)
+{
+  for (;;) {
+    skip_extended_space(c);
+    int ch = peek(c);
+    if (ch == '*' || ch == '+' || ch == '?') {
+      next_char(c);
+      if (peek(c) == '?') next_char(c);
+      continue;
+    }
+    if (ch == '{') {
+      const char *save = c->p;
+      int min, max;
+      mrb_bool ranged;
+      next_char(c);
+      if (!parse_quantifier(c, &min, &max, &ranged)) { c->p = save; return; }
+      if (peek(c) == '?') next_char(c);
+      continue;
+    }
+    return;
+  }
+}
+
 /* Compile atom with quantifiers (*, +, ?, {n,m}) */
 static void
 compile_quantified(re_compiler *c)
@@ -1753,49 +1880,104 @@ compile_quantified(re_compiler *c)
      leaving its own atom behind for this one. */
   uint32_t saved_atom_start = c->atom_start;
   c->atom_start = begin;
-  compile_atom(c);
+  mrb_bool atom = compile_atom(c);
   uint32_t start = c->atom_start;
   c->atom_start = saved_atom_start;
-  if (c->code_len == begin) return;  /* no atom emitted */
-
-  int ch = peek(c);
-  if (ch == '*' || ch == '+' || ch == '?') {
-    next_char(c);
-    mrb_bool nongreedy = (peek(c) == '?');
-    if (nongreedy) {
-      next_char(c);
-      c->needs_backtrack = TRUE;
-    }
-
-
-    if (ch == '*') {
-      /* e* → L: SPLIT(body, end); body; JMP L; end:
-         SPLIT offset = end (after JMP), patched after JMP is emitted */
-      insert_inst(c, start, nongreedy ? RE_SPLITNG : RE_SPLIT, 0, 0);
-      emit(c, RE_JMP, 0, start);
-      c->pat->code[start].offset = (uint16_t)c->code_len;  /* patch: skip to end */
-    }
-    else if (ch == '+') {
-      /* e+ → body; SPLIT/SPLITNG(start)
-         SPLIT: first=pc+1(end), second=offset(start) → non-greedy
-         SPLITNG: first=offset(start), second=pc+1(end) → greedy */
-      emit(c, nongreedy ? RE_SPLIT : RE_SPLITNG, 0, start);
-    }
-    else { /* ? */
-      /* e? → SPLIT(body, end); body; end: */
-      insert_inst(c, start, nongreedy ? RE_SPLITNG : RE_SPLIT, 0, 0);
-      c->pat->code[start].offset = (uint16_t)c->code_len;  /* patch: skip to end */
-    }
+  if (c->code_len == begin) {
+    /* Nothing emitted. An empty group `(?:)` is an atom all the same, and
+       one that matches empty matches empty however it is repeated, so its
+       quantifiers are read and emit nothing, as those of `a{0}` are; CRuby
+       compiles `(?:)*` the same way. What is not an atom, an option toggle
+       `(?i)` or a stray metacharacter, leaves a quantifier after it for
+       compile_seq() to refuse, as CRuby refuses `(?i)*`. */
+    if (atom) skip_quantifiers(c);
+    return;
   }
-  else if (ch == '{') {
+
+  /* Under /x the quantifier may stand apart from its atom, `a +` being `a+`.
+     A `?` making it non-greedy is read right after it, though, as CRuby
+     reads it.
+
+     A quantifier that follows a quantifier binds everything emitted so far
+     rather than the atom alone, so the loop below comes round with `start`
+     back at `begin`: `a**` is `(?:a*)*` and `a{2}{3}` is `(?:a{2}){3}`. Two
+     spellings are read before it comes round, as CRuby reads them:
+
+     - `?` right after `*`, `+`, `?` or a `{n,m}` written with a comma is the
+       non-greedy marker. `{n}` has no non-greedy form, so its `?` is a
+       quantifier of its own: `a{3}?` is `(?:a{3})?` and matches empty, where
+       the lazy `a{3,3}?` does not.
+     - `+` right after `*`, `+` or `?` is possessive, `a*+` being `(?>a*)`.
+       That is why `a?+` takes one `a` out of "aa" where `(?:a?)+` takes two.
+       After a `{...}` it is a quantifier again, `a{2}+` matching "aaaa".
+
+     `greedy_rep` says the last thing read was a greedy `*`, `+` or `?`, which
+     is the only place a `+` is possessive: the `+` of `a+` follows the atom,
+     the one of `a+?+` follows a lazy repeat, and the one of `a?++` follows a
+     possessive, and CRuby reads all three of those as quantifiers. */
+  mrb_bool greedy_rep = FALSE;
+
+  for (;;) {
+    skip_extended_space(c);
+    int ch = peek(c);
+
+    if (greedy_rep && ch == '+') {
+      /* Possessive: what stands emitted becomes an atomic group of its own,
+         numbered after every group inside it, since those are emitted. */
+      next_char(c);
+      uint16_t cut = (uint16_t)++c->num_cuts;
+      insert_inst(c, begin, RE_ATOMIC, 0, cut);
+      emit(c, RE_ATOMIC_END, 0, cut);
+      c->needs_backtrack = TRUE;  /* the Pike VM cannot cut a thread */
+      greedy_rep = FALSE;
+      start = begin;
+      continue;
+    }
+
+    if (ch == '*' || ch == '+' || ch == '?') {
+      next_char(c);
+      mrb_bool nongreedy = (peek(c) == '?');
+      if (nongreedy) {
+        next_char(c);
+        c->needs_backtrack = TRUE;
+      }
+
+      if (ch == '*') {
+        /* e* -> L: SPLIT(body, end); body; JMP L; end:
+           SPLIT offset = end (after JMP), patched after JMP is emitted */
+        insert_inst(c, start, nongreedy ? RE_SPLITNG : RE_SPLIT, 0, 0);
+        emit(c, RE_JMP, 0, start);
+        c->pat->code[start].offset = (uint16_t)c->code_len;  /* patch: skip to end */
+      }
+      else if (ch == '+') {
+        /* e+ -> body; SPLIT/SPLITNG(start)
+           SPLIT: first=pc+1(end), second=offset(start) -> non-greedy
+           SPLITNG: first=offset(start), second=pc+1(end) -> greedy */
+        emit(c, nongreedy ? RE_SPLIT : RE_SPLITNG, 0, start);
+      }
+      else { /* ? */
+        /* e? -> SPLIT(body, end); body; end: */
+        insert_inst(c, start, nongreedy ? RE_SPLITNG : RE_SPLIT, 0, 0);
+        c->pat->code[start].offset = (uint16_t)c->code_len;  /* patch: skip to end */
+      }
+      greedy_rep = !nongreedy;
+      start = begin;
+      continue;
+    }
+
+    if (ch != '{') return;
+
     const char *save = c->p;
     next_char(c);
     int min, max;
-    if (!parse_quantifier(c, &min, &max)) {
+    mrb_bool ranged;
+    if (!parse_quantifier(c, &min, &max, &ranged)) {
       c->p = save;
       return;  /* not a quantifier */
     }
-    mrb_bool nongreedy = (peek(c) == '?');
+    /* `{n}` has no non-greedy form, so a `?` after it is a quantifier and the
+       loop takes it; `{n,m}` takes it as the marker. */
+    mrb_bool nongreedy = (ranged && peek(c) == '?');
     if (nongreedy) {
       next_char(c);
       c->needs_backtrack = TRUE;
@@ -1842,6 +2024,14 @@ compile_quantified(re_compiler *c)
         c->pat->code[start].offset = (uint16_t)c->code_len;
       }
     }
+    greedy_rep = FALSE;
+    start = begin;
+    /* `{0}` left nothing to repeat, and a quantifier over a body that matches
+       empty matches empty, so what follows is read and emits nothing. */
+    if (c->code_len == begin) {
+      skip_quantifiers(c);
+      return;
+    }
   }
 }
 
@@ -1849,14 +2039,20 @@ compile_quantified(re_compiler *c)
 static void
 compile_seq(re_compiler *c)
 {
-  while (peek(c) >= 0 && peek(c) != ')' && peek(c) != '|') {
+  for (;;) {
+    /* One token ends here and the next may begin, so under /x this is where
+       the whitespace between them goes: `a b` is `ab`, and the blanks before
+       a '|' or a ')' are gone by the time compile_alt() looks for one. */
+    skip_extended_space(c);
+    int ch = peek(c);
+    if (ch < 0 || ch == ')' || ch == '|') return;
     uint32_t code_before = c->code_len;
     const char *p_before = c->p;
     compile_quantified(c);
     if (c->code_len == code_before && c->p == p_before) {
       /* compile_quantified neither consumed input nor emitted code: the
          current character is a quantifier metacharacter with no atom to
-         repeat (a leading `*`, `+`, `?`, or the trailing `*`s in `a***`).
+         repeat (a leading `*`, `+`, `?`, or one after the toggle `(?i)`).
          CRuby raises RegexpError here; without this guard peek() never
          advances and the loop spins forever (A1). */
       compile_error(c, "target of repeat operator is not specified");
@@ -1929,31 +2125,6 @@ compile_alt(re_compiler *c)
   }
 }
 
-/*
- * Does the pattern hold a group preprocess_pattern() rewrites: a (?#
- * comment group, or an inline option group that turns x on, as in (?x),
- * (?x:...) or (?ix-m:...)? Cheap pre-check so an ordinary pattern without
- * one skips the pass and its malloc. An escaped or bracketed "(?" is a
- * false positive here, which costs the pass and nothing else: the pass
- * itself steps over escapes and classes.
- */
-static mrb_bool
-has_rewritten_group(const char *src, mrb_int len)
-{
-  const char *p = src, *end = src + len;
-  while (p < end && (p = (const char*)memchr(p, '(', (size_t)(end - p))) != NULL) {
-    if (end - p >= 3 && p[1] == '?') {
-      if (p[2] == '#') return TRUE;
-      /* The letters before a '-' are the ones switched on. */
-      for (const char *q = p + 2; q < end && (*q == 'i' || *q == 'm' || *q == 'x'); q++) {
-        if (*q == 'x') return TRUE;
-      }
-    }
-    p++;
-  }
-  return FALSE;
-}
-
 /* Inside a character class, is `src` the start of a POSIX bracket [:name:]?
    Returns the position just past its closing "]", or NULL if it is not one.
    compile_charclass() consumes such a bracket as a unit, so its ']' does not
@@ -1981,6 +2152,33 @@ skip_posix_bracket(const char *src, const char *end)
  * A class spans several calls, with *in_class carrying the state between
  * them, so the caller keeps one flag and starts it FALSE.
  *
+ * An escape is stepped over at the width CRuby's pre-pass (re.c) reads it,
+ * because preprocess_pattern() copies what is stepped over and removes
+ * comments from what is not, and a comment removed from inside an escape
+ * leaves the parser a different escape: `\u12(?#c)34` would reach it as the
+ * valid `\u1234`, where CRuby has read `\u12(?` and rejected it before the
+ * comment is removed. So the escapes spelled with digits take their digits
+ * here:
+ *
+ * - `\u{...}` runs through its '}' (an unterminated list to the end): a `#`
+ *   inside it is a malformed list for the parser to reject, not a comment
+ *   for the pass to remove, and a "(?<" inside it declares nothing.
+ * - `\uXXXX` takes the next four bytes whatever they are, so that a byte
+ *   that is not a hex digit reaches the parser and is rejected there rather
+ *   than replaced by whatever a removed comment brings next.
+ * - `\x` takes up to two hex digits, and with none of them the one byte
+ *   after, which the parser rejects. `\0` takes up to two more octal digits.
+ *   Both stop short of their full width at the first byte that is not a
+ *   digit, and a digit a removed comment brings next would lengthen them:
+ *   `\x6(?#c)1` is `\x06` and `1` in CRuby, whose pre-pass has read `\x6`
+ *   whole and written it at full width before it reaches the comment. *pad
+ *   says how many '0' bytes bring the escape to full width, for the pass to
+ *   write after the letter; a full-width or non-numeric escape sets it to 0.
+ *
+ * `\1`-`\9` are the backslash and the digit, and the digits after them are
+ * plain bytes, as they are to CRuby's pre-pass: a removed comment does join
+ * them, and `\1(?#c)0` is `\10` there and here.
+ *
  * preprocess_pattern() and has_named_group() both walk the pattern hunting
  * for a "(?" opener, and both have to agree with the parser on when a '(' is
  * an opener rather than an escaped or bracketed byte. The rules for that live
@@ -1988,21 +2186,34 @@ skip_posix_bracket(const char *src, const char *end)
  * in the other.
  */
 static const char*
-skip_uninterpreted(const char *src, const char *end, mrb_bool *in_class)
+skip_uninterpreted(const char *src, const char *end, mrb_bool *in_class, int *pad)
 {
   char ch = *src;
 
+  *pad = 0;
   if (ch == '\\' && src + 1 < end) {
-    mrb_bool unicode = (src[1] == 'u');
+    char kind = src[1];
     src += 2;
-    /* A `\u{...}` list is a single escape rather than `\u` followed by a
-       brace group: it separates its codepoints with spaces, which the
-       free-spacing pass would otherwise remove, joining `\u{61 62}` into the
-       one codepoint `\u{6162}`. An unterminated list runs to the end. */
-    if (unicode && src < end && *src == '{') {
-      while (src < end) {
-        if (*src++ == '}') break;
+    if (kind == 'u') {
+      if (src < end && *src == '{') {
+        while (src < end) {
+          if (*src++ == '}') break;
+        }
       }
+      else {
+        src += (end - src < 4) ? end - src : 4;
+      }
+    }
+    else if (kind == 'x') {
+      int n = 0;
+      while (n < 2 && src < end && hex_value(*src) >= 0) { src++; n++; }
+      if (n == 0) { if (src < end) src++; }
+      else *pad = 2 - n;
+    }
+    else if (kind == '0') {
+      int n = 0;
+      while (n < 2 && src < end && *src >= '0' && *src <= '7') { src++; n++; }
+      *pad = 2 - n;
     }
     return src;
   }
@@ -2030,7 +2241,7 @@ skip_uninterpreted(const char *src, const char *end, mrb_bool *in_class)
 }
 
 /* Read the letters of an inline option group whose "(?" starts at `src`,
-   as far as the free-spacing pass needs them: whether the group is one,
+   as far as the comment pass needs them: whether the group is one,
    whether it is the toggle form (?imx) rather than the scoped (?imx:...),
    and what it makes of x. `*x_on` is left as it was when the letters do
    not name x. Returns the terminator's position, or NULL when the bytes
@@ -2054,8 +2265,8 @@ scan_option_group(const char *src, const char *end, mrb_bool *toggle, mrb_bool *
   return q;
 }
 
-/* The free-spacing pass's scope stack: one bit per open group, holding
-   what extended mode was outside it. */
+/* The comment pass's scope stack: one bit per open group, holding what
+   extended mode was outside it. */
 static void
 scope_set(uint8_t *scope, mrb_int depth, mrb_bool extended)
 {
@@ -2071,37 +2282,39 @@ scope_get(const uint8_t *scope, mrb_int depth)
 }
 
 /*
- * Rewrite the pattern before the parser sees it.
- * Removes (?#...) comment groups always, and wherever extended mode is in
- * effect also whitespace and #comments. Extended mode is in effect from the
- * start when the Regexp carries /x, and it is switched inside the pattern
- * by the inline option groups: (?x) and (?-x) for the rest of the enclosing
- * group, (?x:...) and (?-x:...) for their own body. So this pass keeps a
- * stack of one bit per open group, pushed at every '(' it interprets and
- * popped at every ')', which is what lets a toggle end where its group does.
- * That is the same scoping the parser gives i and m; x has to be resolved
- * here because the bytes it governs are gone before the parser reads them.
- * Whitespace inside [...] character classes is preserved, and so is a (?#
- * written there, which is a literal member rather than a comment group.
- * Escaped characters (\ followed by anything) are preserved.
- * skip_uninterpreted() decides which bytes those are.
+ * Rewrite the pattern before the parser sees it: remove the (?#...) comment
+ * groups, under any flags, and wherever extended mode is in effect the `#`
+ * comments too. That is what CRuby's own pre-pass (re.c) removes before its
+ * tokenizer reads the pattern, and it is why the removal is done here rather
+ * than by the parser: taking a comment out of the source joins the bytes on
+ * either side of it, and CRuby has `\1(?#c)0` and `\1#c`, a newline and `0`
+ * both as `\10`. The whitespace of free-spacing mode is another matter. It
+ * separates tokens and never joins anything, so the parser skips it between
+ * tokens (skip_extended_space()) and reads every token, escapes and group
+ * names included, with the whitespace still in place.
  *
- * Removing whitespace must not join what it kept apart. An escape spelled
- * with digits (`\1`, `\01`, `\x1`) takes the digits that follow it, so
- * `\x1 2` copied as `\x12` would be one byte where CRuby, whose tokenizer
- * stops at the space, reads two. So when whitespace went out between such
- * an escape and a hex digit, an empty group `(?:)` goes in: it emits no
- * instruction and keeps the digit an atom of its own. A removed comment,
- * `#...` to the end of its line or `(?#...)`, does join the two: CRuby
- * strips those before it tokenizes, and `\1(?#c)0` is `\10` there.
+ * Extended mode is in effect from the start when the Regexp carries /x, and
+ * it is switched inside the pattern by the inline option groups: (?x) and
+ * (?-x) for the rest of the enclosing group, (?x:...) and (?-x:...) for
+ * their own body. So this pass keeps a stack of one bit per open group,
+ * pushed at every '(' it interprets and popped at every ')', which is what
+ * lets a toggle end where its group does. That is the same scoping the
+ * parser gives x for the whitespace; the `#` comments have to be resolved
+ * here because the bytes they cover are gone before the parser reads them.
+ * A `#` inside [...] is a member of the class, and so is a (?# written
+ * there. Escaped characters (\ followed by anything) are preserved.
+ * skip_uninterpreted() decides which bytes those are, and it also says when
+ * a numeric escape is to be written at full width, `\x6` as `\x06`, so that
+ * a digit a removed comment brings next cannot lengthen it.
  *
  * The buffer comes from the GC arena, which holds it until the caller's frame
  * is gone: the parser reads it from beginning to end, and every raise in
  * between leaves this function nothing to be reached through. The scope
  * stack lives behind the rewritten pattern in the same allocation: a group
  * opener is one byte of source, so len bits is room for every group. The
- * pattern part is twice the source: each separator adds four bytes and
- * takes an escape, a blank and a digit, at least four bytes, to occur.
+ * pattern part is twice the source: writing an escape at full width
+ * lengthens it by two bytes at most, `\0` to `\000`, and nothing else the
+ * pass writes is longer than what it read.
  */
 static char*
 preprocess_pattern(mrb_state *mrb, const char *src, mrb_int len,
@@ -2111,29 +2324,23 @@ preprocess_pattern(mrb_state *mrb, const char *src, mrb_int len,
   uint8_t *scope = (uint8_t*)buf + len * 2;
   mrb_int depth = 0;
   mrb_int o = 0;
-  mrb_int esc_end = -1;         /* where the last digit escape ended in buf */
-  mrb_bool blank_out = FALSE;   /* whitespace was removed since */
   mrb_bool in_class = FALSE;
   const char *end = src + len;
 
   while (src < end) {
     char ch = *src;
     /* An escape or a character class is copied through untouched: neither
-       holds a comment group, and inside a class the free-spacing rules do
-       not apply. */
-    const char *skip = skip_uninterpreted(src, end, &in_class);
+       holds a comment. A numeric escape short of its full width is padded
+       with zeros after its letter, `\x6` to `\x06`. */
+    int pad;
+    const char *skip = skip_uninterpreted(src, end, &in_class, &pad);
     if (skip) {
-      /* An escape spelled with digits: `\N`, `\x`, or `\u` outside the
-         `\u{...}` list form, whose brace closes it. What is copied here is
-         the backslash and the byte after it; the digits beyond are literals
-         to this pass, and the loop below keeps track of them. */
-      mrb_bool digits = (ch == '\\' && skip - src == 2 &&
-                         (ISDIGIT(src[1]) || src[1] == 'x' || src[1] == 'u'));
-      while (src < skip) buf[o++] = *src++;
-      if (digits) {
-        esc_end = o;
-        blank_out = FALSE;
+      if (pad) {
+        buf[o++] = *src++;
+        buf[o++] = *src++;
+        while (pad-- > 0) buf[o++] = '0';
       }
+      while (src < skip) buf[o++] = *src++;
       continue;
     }
     if (ch == ')') {
@@ -2171,7 +2378,8 @@ preprocess_pattern(mrb_state *mrb, const char *src, mrb_int len,
       if (term && toggle) {
         /* (?imx) changes the rest of the enclosing group and opens none of
            its own, so the stack is left alone. The group is copied through
-           for the parser, which applies i and m from the same letters. */
+           for the parser, which applies all three letters from the same
+           bytes. */
         while (src <= term) buf[o++] = *src++;
         extended = x_on;
         continue;
@@ -2188,28 +2396,13 @@ preprocess_pattern(mrb_state *mrb, const char *src, mrb_int len,
       buf[o++] = *src++;
       continue;
     }
-    if (extended) {
-      if (ch == '#') {
-        /* Skip to the end of the line, newline included: the comment is
-           one removed span, not a comment and then a blank. */
-        while (src < end && *src != '\n') src++;
-        if (src < end) src++;
-        continue;
-      }
-      if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v') {
-        src++;
-        blank_out = TRUE;
-        continue;
-      }
-    }
-    if (o == esc_end && hex_value((unsigned char)ch) >= 0) {
-      if (blank_out) {
-        memcpy(buf + o, "(?:)", 4);  /* the digit is an atom of its own */
-        o += 4;
-      }
-      else {
-        esc_end = o + 1;  /* the digit extends the escape */
-      }
+    if (extended && ch == '#') {
+      /* Skip to the end of the line, newline included: the comment is one
+         removed span, and the newline is not left for the parser to read
+         as whitespace where the comment stood inside a token. */
+      while (src < end && *src != '\n') src++;
+      if (src < end) src++;
+      continue;
     }
     buf[o++] = *src++;
   }
@@ -2239,7 +2432,8 @@ has_named_group(const char *src, mrb_int len)
 
   while (src < end) {
     char ch = *src;
-    const char *skip = skip_uninterpreted(src, end, &in_class);
+    int pad;
+    const char *skip = skip_uninterpreted(src, end, &in_class, &pad);
     if (skip) {
       src = skip;
       continue;
@@ -2442,7 +2636,11 @@ mrb_re_compile(mrb_state *mrb, mrb_regexp_pattern *pat,
   c.orig = pattern;
   c.orig_end = pattern + len;
 
-  if ((flags & RE_FLAG_EXTENDED) || has_rewritten_group(pattern, len)) {
+  /* Both things the pre-pass removes, a (?#...) group and a `#` comment,
+     are spelled with a '#', so a pattern without one is parsed as written.
+     A '#' that is escaped or a class member is a false positive here, which
+     costs the pass and nothing else: the pass steps over both. */
+  if (memchr(pattern, '#', (size_t)len)) {
     mrb_int slen;
     pattern = preprocess_pattern(mrb, pattern, len,
                                  (flags & RE_FLAG_EXTENDED) != 0, &slen);
@@ -2454,8 +2652,7 @@ mrb_re_compile(mrb_state *mrb, mrb_regexp_pattern *pat,
   c.flags = flags;
   c.num_captures = 1;  /* group 0 = whole match */
   /* Scan the same bytes the parser is about to read: preprocess_pattern() has
-     already taken out the /x free-spacing, the #comments and the (?#...)
-     groups. */
+     already taken out the #comments and the (?#...) groups. */
   c.dont_capture = has_named_group(pattern, len);
 
   pat->flags = flags;
@@ -2467,6 +2664,13 @@ mrb_re_compile(mrb_state *mrb, mrb_regexp_pattern *pat,
 
   if (c.p < c.src_end) {
     compile_error(&c, "unmatched ')'");
+  }
+
+  /* A `\NN` names a group the pattern does not have. The count is taken here
+     rather than where the reference stands because a reference may be written
+     before the group it names, `\1(a)` being valid in CRuby. */
+  if (c.max_backref > c.num_groups) {
+    compile_error(&c, "invalid backref number/name");
   }
 
   /* group 0 end */

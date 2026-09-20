@@ -45,6 +45,59 @@ assert("String#scan of a multibyte subject reports byte-correct globals") do
   assert_equal [[1, "あ", "いXう"], [3, "あXい", "う"]], seen
 end
 
+assert("String#scan with a block that changes the receiver") do
+  # `rb_str_scan` searches for the next match in the receiver as the block
+  # left it, and the match it leaves behind is a search once more from the
+  # offset the last match was found from, so a block that writes the match
+  # away leaves nil where the loop used to republish the match it had.
+  s = "hello"
+  seen = []
+  s.scan(/l/) { |m| seen << m; s.upcase! }
+  assert_equal ["l"], seen
+  assert_equal "HELLO", s
+  assert_nil $~
+  s = "hello"
+  n = 0
+  seen = []
+  s.scan(/l/) { |m| seen << m; n += 1; s.upcase! if n == 2 }
+  assert_equal ["l", "l"], seen
+  assert_nil $~
+  # a change that leaves the match where it was leaves it behind, on the
+  # changed string
+  s = "hello"
+  s.scan(/(l)/) { s.tr!("h", "H") }
+  assert_equal "l", $&
+  assert_equal "l", $1
+  assert_equal "Hel", $`
+  assert_equal "o", $'
+  assert_equal "Hello", $~.string
+  # a match the block writes in after the current one is found
+  s = "abcd"
+  seen = []
+  s.scan(/b/) { |m| seen << m; s[3] = "b" }
+  assert_equal ["b", "b"], seen
+  assert_equal "abc", $`
+  s = "abc"
+  seen = []
+  s.scan(//) { |m| seen << m; s.upcase! }
+  assert_equal ["", "", "", ""], seen
+  assert_equal "ABC", $`
+  # a quoted String pattern goes the same way
+  s = "hello"
+  seen = []
+  s.scan("l") { |m| seen << m; s.upcase! }
+  assert_equal ["l"], seen
+  assert_nil $~
+  # a block that changes the length is refused, as in `gsub`
+  s = "hello"
+  assert_raise_with_message(RuntimeError, "string modified") { s.scan(/l/) { s << "z" } }
+  assert_equal "helloz", s
+  s = "hello"
+  assert_raise_with_message(RuntimeError, "string modified") { s.scan("l") { s << "z" } }
+  s = "ab"
+  assert_raise_with_message(RuntimeError, "string modified") { s.scan(/x*/) { s.clear } }
+end
+
 assert("String#gsub - regexp search position is byte-based internally") do
   skip unless __ENCODING__ == "UTF-8"
   assert_equal "あ-い-う", "あ,い,う".gsub(/,/, "-")
@@ -588,6 +641,90 @@ assert("String#gsub with \\& special") do
   assert_equal "[a][b][c]", "abc".gsub(/./, '[\\&]')
 end
 
+assert("String#sub / #gsub expand \\k<name> in the replacement") do
+  assert_equal "ab!", "ab".sub(/(?<x>b)/, '\k<x>!')
+  assert_equal "acb", "abc".sub(/(?<x>b)(?<y>c)/, '\k<y>\k<x>')
+  assert_equal "abb", "ab".sub(/(?<x>b)/, '\k<x>\k<x>')
+  assert_equal "a<b>a<b>", "abab".gsub(/(?<x>b)/, '<\k<x>>')
+  assert_equal "aBb", "ab".dup.sub!(/(?<x>b)/, 'B\k<x>')
+  # A group that took no part in the match stands for nothing, the way a
+  # numbered reference to one does.
+  assert_equal "a[]", "ab".sub(/(?<x>c)?b/, '[\k<x>]')
+  # The name is the bytes between the angles, so a multibyte one reaches its
+  # group without the replacement being read as characters.
+  assert_equal "ab!", "ab".sub(/(?<あ>b)/, '\k<あ>!')
+  # Only `\k<` opens a reference: every other spelling is the literal it was,
+  # `\k'name'` among them, which the pattern side does accept as a backref.
+  assert_equal "a\\kx", "ab".sub(/(?<x>b)/, '\kx')
+  assert_equal "az\\k", "ab".sub(/(?<x>b)/, 'z\k')
+  assert_equal "a\\k'x'", "ab".sub(/(?<x>b)/, "\\k'x'")
+  assert_equal "a\\k<x>", "ab".sub(/(?<x>b)/, '\\\\k<x>')
+end
+
+assert("String#sub / #gsub raise for a replacement that names no group") do
+  msg = "undefined group name reference: y"
+  assert_raise_with_message(IndexError, msg) { "ab".sub(/(?<x>b)/, '\k<y>') }
+  assert_raise_with_message(IndexError, msg) { "abab".gsub(/(?<x>b)/, '\k<y>') }
+  assert_raise_with_message(IndexError, msg) { "ab".dup.sub!(/(?<x>b)/, '\k<y>') }
+  # A pattern that names no group at all, and a literal String pattern, which
+  # has no groups to name.
+  assert_raise_with_message(IndexError, msg) { "ab".sub(/b/, '\k<y>') }
+  assert_raise_with_message(IndexError, msg) { "ab".sub("b", '\k<y>') }
+  assert_raise_with_message(IndexError, msg) { "abab".gsub("b", '\k<y>') }
+  # Group 0 is a number, and no name at all is no name.
+  assert_raise_with_message(IndexError, "undefined group name reference: 0") do
+    "ab".sub(/(?<x>b)/, '\k<0>')
+  end
+  assert_raise_with_message(IndexError, "undefined group name reference: ") do
+    "ab".sub(/(?<x>b)/, '\k<>')
+  end
+  # Nothing matched, so nothing expanded the replacement and nothing asked
+  # the pattern for the name.
+  assert_equal "zz", "zz".sub(/(?<x>b)/, '\k<y>')
+  assert_equal "zz", "zz".gsub("b", '\k<y>')
+end
+
+assert("String#sub / #gsub raise for a replacement whose \\k< is unclosed") do
+  msg = "invalid group name reference format"
+  assert_raise_with_message(RuntimeError, msg) { "ab".sub(/(?<x>b)/, '\k<x') }
+  assert_raise_with_message(RuntimeError, msg) { "ab".sub(/(?<x>b)/, '\k<') }
+  assert_raise_with_message(RuntimeError, msg) { "abab".gsub(/(?<x>b)/, '\k<x') }
+  assert_raise_with_message(RuntimeError, msg) { "ab".sub("b", '\k<x') }
+  assert_equal "zz", "zz".sub(/(?<x>b)/, '\k<x')
+end
+
+assert("String#sub / #gsub turn \\1-\\9 off where the pattern names a group") do
+  # Naming a group is what stops a plain `(...)` from taking a number, and it
+  # stops a replacement from spending one too: the escape stands for nothing,
+  # not for the named group that carries that number.
+  assert_equal "a[]", "ab".sub(/(?<x>b)/, '[\1]')
+  assert_equal "a[]a[]", "abab".gsub(/(?<x>b)/, '[\1]')
+  assert_equal "[]", "ab".sub(/(?<a>a)(?<b>b)/, '[\1\2]')
+  assert_equal "a[]", "ab".dup.sub!(/(?<x>b)/, '[\1]')
+  # The number is still the group's own, so `md[1]` and `\k<x>` reach what
+  # `\1` no longer does.
+  assert_equal "b", /(?<x>b)/.match("ab")[1]
+  assert_equal "a[b]", "ab".sub(/(?<x>b)/, '[\k<x>]')
+  # A plain group beside a named one has no number left to reach either, and
+  # the named one's number reaches nothing.
+  assert_equal "[]", "ab".sub(/(?<a>a)(b)/, '[\2]')
+  assert_equal "[]", "ab".sub(/(?<a>a)(b)/, '[\1]')
+  # The escapes that name no group are untouched: `\0` and `\&` are the whole
+  # match, `\+` the last group that took part, and `` \` `` and `\'` the text
+  # around the match.
+  assert_equal "a[b]", "ab".sub(/(?<x>b)/, '[\0]')
+  assert_equal "a[b]", "ab".sub(/(?<x>b)/, '[\&]')
+  assert_equal "a[b]", "ab".sub(/(?<x>b)/, '[\+]')
+  assert_equal "a[a]", "ab".sub(/(?<x>b)/, '[\`]')
+  assert_equal "a[]", "ab".sub(/(?<x>b)/, "[\\']")
+  # A pattern that names nothing keeps every number it hands out.
+  assert_equal "a[b]", "ab".sub(/(b)/, '[\1]')
+  assert_equal "a[b]a[b]", "abab".gsub(/(b)/, '[\1]')
+  # A literal String pattern has no group for a number to reach, named or not.
+  assert_equal "a[]", "ab".sub("b", '[\1]')
+  assert_equal "a[]a[]", "abab".gsub("b", '[\1]')
+end
+
 assert("String#scan") do
   assert_equal ["1", "2", "3"], "a1b2c3".scan(Regexp.new("\\d"))
 end
@@ -815,4 +952,265 @@ assert("String#gsub with block leaves the last match behind") do
   assert_nil $'
   assert_nil $1
   assert_nil $+
+end
+
+assert("String#sub / #gsub search a String pattern without compiling one") do
+  # A String pattern is a literal, and the search for it walks the subject's
+  # bytes rather than a pattern compiled to walk them: `.` matches only `.`.
+  assert_equal "aXc.e", "a.c.e".sub(".", "X")
+  assert_equal "aXcXe", "a.c.e".gsub(".", "X")
+  assert_equal "a.c.e", "a.c.e".gsub("z", "X")
+  assert_equal "abcabc", "abcabc".gsub("abcabcabc", "X")
+  assert_equal "X", "abc".gsub("abc", "X")
+  assert_equal "--", "aaaa".gsub("aa", "-")
+
+  # What a compiled pattern is still asked for is the Regexp the match names,
+  # which is the quoted literal as CRuby's is.
+  "a.c".gsub(".", "X")
+  assert_equal "\\.", $~.regexp.source
+  assert_equal ".", $~[0]
+  assert_equal 1, $~.begin(0)
+  assert_equal "a", $`
+  assert_equal "c", $'
+  assert_equal ".", $&
+
+  # The last match, not the first, as everywhere else.
+  "a.c.e".gsub(".", "X")
+  assert_equal 3, $~.begin(0)
+
+  # Matching nothing clears, as it does everywhere else.
+  /b(c)/ =~ "abcd"
+  "abc".gsub("z", "X")
+  assert_nil $~
+  assert_nil $&
+  assert_nil $`
+  assert_nil $1
+end
+
+assert("String#sub / #gsub with a String pattern leave the subject unread") do
+  # CRuby searches for a literal byte by byte and reads the subject as UTF-8
+  # nowhere along the way, so a subject that spells no character is answered
+  # for here where the same call with a Regexp is refused.
+  s = "a\x80b"
+  assert_equal "a\x80!", s.sub("b", "!")
+  assert_equal "a\x80!", s.gsub("b", "!")
+  assert_equal "a\x80!", s.dup.sub!("b", "!")
+  assert_equal "a\x80!", s.dup.gsub!("b", "!")
+  if __ENCODING__ == "UTF-8"
+    assert_raise(ArgumentError) { s.sub(/b/, "!") }
+    assert_raise(ArgumentError) { s.gsub(/b/, "!") }
+    assert_raise(ArgumentError) { s.gsub(/b/) { "!" } }
+  end
+end
+
+assert("String#gsub with an empty String pattern steps one character") do
+  assert_equal "-a-b-", "ab".gsub("", "-")
+  assert_equal "-", "".gsub("", "-")
+  assert_equal "-a-", "a".sub("", "-") + "-"
+  # A character and not a byte, where the subject is read as characters, and a
+  # byte where it is read as bytes.
+  if "あ".length == 1
+    assert_equal "-a-あ-b-", "aあb".gsub("", "-")
+  end
+  assert_equal "-a-\xE3-\x81-\x82-b-", "aあb".b.gsub("", "-")
+end
+
+assert("String#sub / #gsub expand the replacement of a String pattern") do
+  assert_equal "a[b]c", "abc".sub("b", "[\\0]")
+  assert_equal "a[b]c", "abc".sub("b", "[\\&]")
+  assert_equal "a<a>c", "abc".sub("b", "<\\`>")
+  assert_equal "a<c>c", "abc".sub("b", "<\\'>")
+  assert_equal "a\\c", "abc".sub("b", "\\\\")
+  assert_equal "a[b]c[b]", "abcb".gsub("b", "[\\&]")
+  # A literal has no groups, so a group reference names nothing and stands for
+  # nothing, as in CRuby.
+  assert_equal "ac", "abc".sub("b", "\\1")
+  assert_equal "ac", "abc".sub("b", "\\+")
+end
+
+assert("String#sub! / #gsub! with a String pattern answer the one search they make") do
+  s = "a.c.e"
+  assert_equal "aXc.e", s.sub!(".", "X")
+  assert_equal "aXc.e", s
+  s = "a.c.e"
+  assert_equal "aXcXe", s.gsub!(".", "X")
+  assert_equal "aXcXe", s
+
+  # nil for nothing matched, and self even where the substitution changed no
+  # byte: the question is about the match, not the result.
+  assert_nil "abc".dup.sub!("z", "X")
+  assert_nil "abc".dup.gsub!("z", "X")
+  s = "aaa"
+  assert_equal "aaa", s.dup.gsub!("a", "a")
+
+  # A miss clears the globals, and a hit leaves the last match behind.
+  /b(c)/ =~ "abcd"
+  assert_nil "abc".dup.gsub!("z", "X")
+  assert_nil $~
+  "a.c.e".dup.gsub!(".", "X")
+  assert_equal 3, $~.begin(0)
+end
+
+assert("String#gsub with a block that changes the receiver") do
+  # CRuby's `str_gsub` reads the stretch before each match, the next match
+  # and the step over an empty match from the receiver as the block left it,
+  # so a change the block makes in place shows in the answer from the first
+  # match on.  The stretch before a match used to be copied before the block
+  # ran, so a change there was lost.
+  s = "hello"
+  assert_equal "HeXXo", s.gsub(/l/) { s.tr!("h", "H"); "X" }
+  s = "hello"
+  assert_equal "HEXLO", s.gsub(/l/) { s.upcase!; "X" }
+  # long enough not to sit inside the string object, so that the write moves
+  # the receiver off the buffer the match was made on
+  s = "abcb" * 20
+  assert_equal "A-CB" + ("ABCB" * 19), s.gsub(/b/) { s.upcase!; "-" }
+  s = "hello"
+  n = 0
+  assert_equal "heXXO", s.gsub(/l/) { n += 1; s.upcase! if n == 2; "X" }
+  s = "abc"
+  assert_equal "x!z", s.gsub(/b/) { s.replace("xyz"); "!" }
+  s = "abcb"
+  assert_equal "Z!c!", s.gsub(/b/) { s[0] = "Z"; "!" }
+  # the next match is searched for in the changed string, so a match the block
+  # writes in after the current one is found, and one it writes away is not
+  s = "abcd"
+  assert_equal "a!c!", s.gsub(/b/) { s[3] = "b"; "!" }
+  s = "abcb"
+  assert_equal "a!cz", s.gsub(/b/) { s[3] = "z"; "!" }
+  s = "abc"
+  assert_equal "-A-B-C-", s.gsub(//) { s.upcase!; "-" }
+  # What the walk takes after the block is what the block left, which needs
+  # the bytes read again rather than the pointer the search was made with. A
+  # replacement of the same length moves the buffer without changing the
+  # length, so this stands whatever a check on the length would say: reading
+  # the old pointer keeps one byte of the subject as it was.
+  s = "a" * 200
+  assert_equal "-" + "b" * 200, s.gsub(/(?=a)/) { s.replace("b" * 200); "-" }
+  # a quoted String pattern goes the same way
+  s = "hello"
+  assert_equal "HeXXo", s.gsub("l") { s.tr!("h", "H"); "X" }
+  # `gsub!` replaces the receiver with the same answer
+  s = "hello"
+  assert_equal "HeXXo", s.gsub!(/l/) { s.tr!("h", "H"); "X" }
+  assert_equal "HeXXo", s
+
+  # A block that changes the length is refused, as `str_mod_check` refuses
+  # it, since the offsets of the match no longer name the bytes they named.
+  # The length is compared in bytes, and against the receiver as it was when
+  # the loop began, so a change undone before the block returns passes.
+  s = "abc"
+  assert_raise_with_message(RuntimeError, "string modified") { s.gsub(/b/) { s << "zz"; "!" } }
+  s = "abc"
+  assert_raise_with_message(RuntimeError, "string modified") { s.gsub(/b/) { s.replace("xy"); "!" } }
+  s = "abc"
+  assert_raise_with_message(RuntimeError, "string modified") { s.gsub(/b/) { s.clear; "!" } }
+  s = "aébé"
+  assert_raise_with_message(RuntimeError, "string modified") { s.gsub(/é/) { s.replace("aebe"); "!" } }
+  s = "hello"
+  assert_raise_with_message(RuntimeError, "string modified") { s.gsub("l") { s << "z"; "X" } }
+  # an empty match reads the receiver for the character it steps over
+  # before the next search, so a block that shrank it is refused there too
+  s = "ab"
+  assert_raise_with_message(RuntimeError, "string modified") { s.gsub(/x*/) { s.clear; "!" } }
+  s = "ab"
+  assert_raise_with_message(RuntimeError, "string modified") { s.gsub(/x*/) { s.chop!; "!" } }
+  s = "abc"
+  assert_equal "a!c", s.gsub(/b/) { s << "z"; s.chop!; "!" }
+  # the receiver keeps what the block did to it, and the last match stays
+  # published, since the loop ends on the raise and not on a failed search
+  s = "abc"
+  assert_raise(RuntimeError) { s.gsub!(/b/) { s << "zz"; "!" } }
+  assert_equal "abczz", s
+  assert_equal "b", $&
+  assert_equal "abc", $~.string
+
+  # `sub` builds its answer from a copy of the receiver, as `rb_str_sub`
+  # does, so the block reaches nothing it reads and no length is checked.
+  s = "hello"
+  assert_equal "heXlo", s.sub(/l/) { s.upcase!; "X" }
+  s = "abc"
+  assert_equal "a!c", s.sub(/b/) { s << "zz"; "!" }
+end
+
+assert("String#sub! with a block that changes the receiver") do
+  # `rb_str_sub_bang` splices the replacement into the receiver as the block
+  # left it, where `sub` reads the copy it made before the block ran.
+  s = "hello"
+  assert_equal "HEXLO", s.sub!(/l/) { s.upcase!; "X" }
+  assert_equal "HEXLO", s
+  s = "hello"
+  assert_equal "HeXlo", s.sub!(/l/) { s.tr!("h", "H"); "X" }
+  s = "abc"
+  assert_equal "x!z", s.sub!(/b/) { s.replace("xyz"); "!" }
+  # $~ is the match the replacement was made for, on the subject as matched
+  assert_equal "b", $&
+  assert_equal "abc", $~.string
+  # a change of length is refused here too, and the receiver keeps it
+  s = "abc"
+  assert_raise_with_message(RuntimeError, "string modified") { s.sub!(/b/) { s << "zz"; "!" } }
+  assert_equal "abczz", s
+  s = "abc"
+  assert_raise_with_message(RuntimeError, "string modified") { s.sub!(/b/) { s.replace("ab"); "!" } }
+  assert_equal "ab", s
+  # a receiver the block freezes cannot take the replacement
+  s = "abc"
+  assert_raise(FrozenError) { s.sub!(/b/) { s.freeze; "!" } }
+  assert_equal "abc", s
+  s = "abc"
+  assert_raise(FrozenError) { s.gsub!(/b/) { s.freeze; "!" } }
+  assert_equal "abc", s
+end
+
+assert("MatchData#regexp compiles a literal pattern only when asked for one") do
+  # Nothing compiled a pattern to search with, so the Regexp the match names is
+  # built out of the bytes it matched, the first time something asks. The same
+  # literal asked for twice running answers the same object, which is what
+  # CRuby's `rb_reg_regcomp` answers for the same quoted pattern.
+  "abc".gsub("b", "X")
+  first = $~.regexp
+  "zbz".gsub("b", "Y")
+  assert_true first.equal?($~.regexp)
+
+  # One entry, as CRuby keeps one: a literal asked for in between drops it.
+  "abc".gsub("b", "X")
+  first = $~.regexp
+  "abc".gsub("c", "Y")
+  $~.regexp
+  "zbz".gsub("b", "Z")
+  assert_false first.equal?($~.regexp)
+
+  # A call that never asks compiles nothing, so it cannot drop what the entry
+  # holds either.
+  "abc".gsub("b", "X")
+  first = $~.regexp
+  "abc".gsub("c", "Y")
+  "zbz".gsub("b", "Z")
+  assert_true first.equal?($~.regexp)
+
+  # A match answers the same Regexp however often it is asked, the entry
+  # behind it having moved on.
+  "abc".gsub("b", "X")
+  md = $~
+  first = md.regexp
+  "abc".gsub("c", "Y")
+  $~.regexp
+  assert_true first.equal?(md.regexp)
+
+  # The literal reaches the entry as it was matched, so a pattern modified
+  # afterwards cannot answer for what it used to spell.
+  pattern = "b".dup
+  "abc".gsub(pattern, "X")
+  first = $~.regexp
+  pattern << "c"
+  "zbz".gsub("b", "Y")
+  assert_true first.equal?($~.regexp)
+  assert_equal "b", first.source
+
+  # A literal has no groups, so a name reaches none, as in CRuby.
+  "a.c".sub(".", "-")
+  assert_equal({}, $~.named_captures)
+  assert_raise(IndexError) { $~[:x] }
+  "abc".sub("", "-")
+  assert_equal "", $~.regexp.source
 end

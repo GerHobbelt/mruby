@@ -1761,6 +1761,22 @@ mrb_task_reset_context(mrb_state *mrb, mrb_value task)
 /*
  * Set proc for task
  */
+/* Body of the stack growth in mrb_task_proc_set(): mrb->c already points at
+   the task's context, and the caller's is kept so MRB_ENSURE can put it back
+   whether the extend returns or raises. */
+struct task_stack_grow_ctx {
+  mrb_int need;
+  struct mrb_context *prev_c;
+};
+
+static mrb_value
+task_stack_grow_body(mrb_state *mrb, void *data)
+{
+  struct task_stack_grow_ctx *ctx = (struct task_stack_grow_ctx*)data;
+  mrb_stack_extend(mrb, ctx->need);
+  return mrb_nil_value();
+}
+
 MRB_API void
 mrb_task_proc_set(mrb_state *mrb, mrb_value task, struct RProc *proc)
 {
@@ -1768,6 +1784,27 @@ mrb_task_proc_set(mrb_state *mrb, mrb_value task, struct RProc *proc)
 
   mrb_task *t = (mrb_task*)mrb_data_check_get_ptr(mrb, task, &mrb_task_type);
   if (!t) return;
+
+  struct mrb_context *c = &t->c;
+
+  /* Grow the task's stack to fit the proc being set. It may need more
+   * registers than the original proc the stack was sized for.
+   * mrb_stack_extend() works on mrb->c, so point mrb->c at the task context
+   * across the call, and put it back through MRB_ENSURE: the extend
+   * allocates, and an allocation that fails raises, which would otherwise
+   * leave mrb->c on the task's context for whatever runs next. */
+  if (c->stbase && !MRB_PROC_CFUNC_P(proc) && proc->body.irep) {
+    size_t cur = (size_t)(c->stend - c->stbase);
+    size_t need = (size_t)proc->body.irep->nregs;
+    if (need > cur) {
+      struct task_stack_grow_ctx ctx = { (mrb_int)need, mrb->c };
+      mrb_value result;
+      mrb->c = c;
+      MRB_ENSURE(mrb, result, task_stack_grow_body, &ctx) {
+        mrb->c = ctx.prev_c;
+      }
+    }
+  }
 
   /* Handle environment resize if needed */
   if (t->c.cibase && t->c.cibase->u.env) {
