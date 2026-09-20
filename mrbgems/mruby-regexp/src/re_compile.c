@@ -37,9 +37,24 @@ static void compile_alt(re_compiler *c);  /* forward */
 static void
 compile_error(re_compiler *c, const char *msg)
 {
+  /* Format the message before freeing c->stripped (which may alias c->src
+     in extended mode). c->src is not NUL-terminated, so use %l with the
+     explicit length from c->src_end. */
+  mrb_value emsg = mrb_format(c->mrb, "%s: /%l/",
+                              msg, c->src, (size_t)(c->src_end - c->src));
+
+  /* Free compile buffers before raising, since mrb_exc_raise longjmps out
+     and the stack-local re_compiler is abandoned without a chance to clean
+     up. mrb_free doesn't trigger GC, so emsg stays valid across these. */
+  mrb_free(c->mrb, c->code);
+  c->code = NULL;
+  mrb_free(c->mrb, c->classes);
+  c->classes = NULL;
   if (c->stripped) mrb_free(c->mrb, c->stripped);
   c->stripped = NULL;
-  mrb_raisef(c->mrb, mrb_exc_get_id(c->mrb, MRB_SYM(RegexpError)), "%s: /%s/", msg, c->src);
+
+  mrb_exc_raise(c->mrb,
+    mrb_exc_new_str(c->mrb, mrb_exc_get_id(c->mrb, MRB_SYM(RegexpError)), emsg));
 }
 
 static uint32_t
@@ -766,6 +781,7 @@ first_set_walk(const re_inst *code, uint32_t code_len,
       pc = code[pc].offset;
       continue;
     case RE_CHAR:
+      if (code[pc].a >= 128) return FALSE;  /* non-ASCII: bm covers ASCII only */
       bm[code[pc].a >> 3] |= (1 << (code[pc].a & 7));
       return TRUE;
     case RE_CLASS: {

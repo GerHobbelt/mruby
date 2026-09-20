@@ -51,15 +51,14 @@ typedef struct mpz_context {
 } mpz_ctx_t;
 
 /* Convenience macros for context creation.
- * Uses per-member assignment instead of a C99 compound literal with
- * designated initializers so the file compiles as C++ on legacy
- * toolchains (pre-C++20). */
+ * Uses positional aggregate initialization instead of a C99 compound
+ * literal with designated initializers, so the file compiles as C++
+ * on legacy toolchains (pre-C++20).  Member order must match the
+ * mpz_context struct declaration above. */
 #define MPZ_CTX_INIT(mrb_ptr, ctx, pool_ptr) \
   mpz_pool_t pool ## _storage = {{0}};\
   mpz_pool_t *pool_ptr = &pool ## _storage;\
-  mpz_ctx_t ctx ## _struct; \
-  ctx ## _struct.mrb = (mrb_ptr); \
-  ctx ## _struct.pool = (pool_ptr); \
+  mpz_ctx_t ctx ## _struct = { (mrb_ptr), (pool_ptr) }; \
   mpz_ctx_t *ctx = &(ctx ## _struct);
 
 /* Access macros for readability */
@@ -347,6 +346,14 @@ mpz_move(mpz_ctx_t *ctx, mpz_t *y, mpz_t *x)
   x->p = NULL;
   x->sn = 0;
   x->sz = 0;
+}
+
+static inline void
+mpz_swap(mpz_t *a, mpz_t *b)
+{
+  mpz_t tmp = *a;
+  *a = *b;
+  *b = tmp;
 }
 
 static size_t
@@ -1241,7 +1248,8 @@ mpn_add_var(mp_limb *rp, const mp_limb *ap, size_t an,
       rp[i] = LOW(sum);
       carry = HIGH(sum);
     }
-  } else {
+  }
+  else {
     for (; i < bn; i++) {
       mp_dbl_limb sum = (mp_dbl_limb)bp[i] + carry;
       rp[i] = LOW(sum);
@@ -1565,7 +1573,8 @@ mpz_mul_toom3(mpz_ctx_t *ctx, mp_limb *result,
     mpn_add(t2, t2, w_len, w0, w_len);
     mpn_add(t2, t2, w_len, winf, w_len);
     mpn_neg(t2, t2, w_len);
-  } else {
+  }
+  else {
     mpn_sub(t2, t2, w_len, w0, w_len);
     mpn_sub(t2, t2, w_len, winf, w_len);
   }
@@ -4822,7 +4831,11 @@ mpz_power_of_2_p(mpz_t *x)
   return (limb != 0) && ((limb & (limb - 1)) == 0);
 }
 
-/* Binary GCD algorithm (Stein's algorithm) - faster than Euclidean GCD */
+/* Binary GCD (Stein's algorithm): factor out common powers of 2,
+   then iterate on odd operands with subtract + trailing-zero shift.
+   For heavily unbalanced pairs (one operand has at least two more
+   limbs than the other) a single Euclidean step via mpz_mod replaces
+   many Stein subtracts. */
 static void
 mpz_gcd(mpz_ctx_t *ctx, mpz_t *gg, mpz_t *aa, mpz_t *bb)
 {
@@ -4894,14 +4907,29 @@ mpz_gcd(mpz_ctx_t *ctx, mpz_t *gg, mpz_t *aa, mpz_t *bb)
   mpz_div_2exp(ctx, &a, &a, a_zeros);
   mpz_div_2exp(ctx, &b, &b, b_zeros);
 
-  /* Euclidean algorithm for multi-limb numbers */
+  /* Stein main loop. Invariant: a and b are positive and odd.
+     Euclidean fallback when b has >=2 more limbs than a. */
   while (!zero_p(&b)) {
-    mpz_t temp;
-    mpz_init_temp(ctx, &temp, a.sz);
-    mpz_mod(ctx, &temp, &a, &b);
-    mpz_move(ctx, &a, &b);
-    mpz_move(ctx, &b, &temp);
-    mpz_clear(ctx, &temp);
+    if (mpz_cmp(ctx, &a, &b) > 0) {
+      mpz_swap(&a, &b);
+    }
+    if (b.sz >= a.sz + 2) {
+      mpz_t temp;
+      mpz_init_temp(ctx, &temp, a.sz);
+      mpz_mod(ctx, &temp, &b, &a);
+      mpz_move(ctx, &b, &temp);
+      mpz_clear(ctx, &temp);
+      if (zero_p(&b)) break;
+      size_t bz = mpz_trailing_zeros(&b);
+      if (bz > 0)
+        mpz_div_2exp(ctx, &b, &b, bz);
+    }
+    else {
+      mpz_sub(ctx, &b, &b, &a);
+      if (zero_p(&b)) break;
+      size_t bz = mpz_trailing_zeros(&b);
+      mpz_div_2exp(ctx, &b, &b, bz);
+    }
   }
   mpz_mul_2exp(ctx, gg, &a, shift);
   mpz_clear(ctx, &a);

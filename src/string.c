@@ -1358,6 +1358,16 @@ mrb_str_dup(mrb_state *mrb, mrb_value str)
   return str_replace(mrb, dup, s);
 }
 
+MRB_API mrb_value
+mrb_str_dup_frozen(mrb_state *mrb, mrb_value str)
+{
+  if (!mrb_frozen_p(mrb_basic_ptr(str))) {
+    str = mrb_str_dup(mrb, str);
+    mrb_basic_ptr(str)->frozen = TRUE;
+  }
+  return str;
+}
+
 enum str_convert_range {
   /* `beg` and `len` are byte unit in `0 ... str.bytesize` */
   STR_BYTE_RANGE_CORRECTED = 1,
@@ -2014,18 +2024,18 @@ mrb_byte_hash_step(const uint8_t *s, mrb_int len, uint32_t hval)
   const uint8_t *send = s + len;
 
   /*
-   * FNV-1 hash each octet in the buffer
+   * FNV-1a hash each octet in the buffer
    */
   while (s < send) {
+    /* xor the bottom with the current octet */
+    hval ^= (uint32_t)*s++;
+
     /* multiply by the 32-bit FNV magic prime mod 2^32 */
 #if defined(NO_FNV_GCC_OPTIMIZATION)
     hval *= FNV_32_PRIME;
 #else
     hval += (hval<<1) + (hval<<4) + (hval<<7) + (hval<<8) + (hval<<24);
 #endif
-
-    /* xor the bottom with the current octet */
-    hval ^= (uint32_t)*s++;
   }
 
   /* return our new hash value */
