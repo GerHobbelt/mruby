@@ -47,6 +47,14 @@ assert("Regexp - character class") do
   assert_equal "abc", md[0]
 end
 
+assert("Regexp - \\b inside character class is backspace") do
+  # Outside [...], \b is the word boundary assertion; inside [...]
+  # it must mean U+0008 (backspace), matching MRI/Onigmo.
+  assert_equal "Ruby", "Ruby".gsub(/[\b]/, "X")
+  assert_equal "aXc", "a\bc".gsub(/[\b]/, "X")
+  assert_equal ["\b", "\t", "\n"], "ABC\b\t\n".scan(/[\b-\n]/)
+end
+
 assert("Regexp - dot") do
   re = Regexp.new("a.c")
   assert_true re.match?("abc")
@@ -171,6 +179,17 @@ assert("Regexp#hash") do
   r3 = Regexp.new("abc")
   assert_equal r1.hash, r2.hash
   assert_not_equal r1.hash, r3.hash
+end
+
+assert("Regexp#hash/== on uninitialized regexp") do
+  # Regexp.allocate yields an object with no @source IV; hash/== must
+  # not crash (regression: ObjectSpace.each_object could expose a
+  # half-initialized Regexp after Regexp.new raised a compile error).
+  r = Regexp.allocate
+  assert_kind_of Integer, r.hash
+  assert_true r == r
+  assert_false r == Regexp.allocate
+  assert_false r == Regexp.new("abc")
 end
 
 assert("Regexp#options") do
@@ -359,6 +378,25 @@ assert("MatchData#named_captures") do
   nc = md.named_captures
   assert_equal "user", nc["a"]
   assert_equal "host", nc["b"]
+end
+
+assert("Regexp - named captures survive /x preprocessing") do
+  # Regression: with /x, re_compile freed the stripped buffer that
+  # named_captures[i].name pointed into.
+  re = /(?<n>\d+) # comment
+       \s* (?<u>\w+) /x
+  m = re.match("42 px")
+  assert_equal "42", m[:n]
+  assert_equal "px", m[:u]
+end
+
+assert("Regexp - named captures survive source string mutation") do
+  # Regression: name pointer used to alias RSTRING_PTR of the source.
+  s = String.new("(?<key>\\d+)")
+  re = Regexp.new(s)
+  s.replace("X" * 10000)   # force buffer reallocation
+  m = re.match("abc 123 def")
+  assert_equal "123", m[:key]
 end
 
 assert("Regexp - positive lookahead (?=...)") do

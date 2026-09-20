@@ -25,6 +25,7 @@ module MRuby
       alias :author= :authors=
 
       attr_accessor :rbfiles, :objs
+      attr_reader :port_objs
       attr_writer :test_objs, :test_rbfiles
       attr_accessor :test_args, :test_preload
 
@@ -60,10 +61,20 @@ module MRuby
         @rbfiles = Dir.glob("#{@dir}/mrblib/**/*.rb").sort
         @objs = srcs_to_objs("src")
 
-        # Add platform-specific sources from ports/<name>/ directories
+        # Add platform-specific sources from the first matching
+        # ports/<name>/ directory.  effective_ports is a fallback
+        # chain: later names act as defaults for gems that don't ship
+        # a port for the earlier names.  These objs are tracked
+        # separately so List#resolve_external_hal! can drop them when
+        # an external HAL provider (gem named hal-<short>-*) is loaded.
+        @port_objs = []
         build.effective_ports.each do |port|
           port_dir = "#{@dir}/ports/#{port}"
-          @objs += srcs_to_objs("ports/#{port}") if File.directory?(port_dir)
+          if File.directory?(port_dir)
+            @port_objs = srcs_to_objs("ports/#{port}")
+            @objs += @port_objs
+            break
+          end
         end
 
         @test_preload = nil # 'test/assert.rb'
@@ -451,6 +462,28 @@ module MRuby
           self.each(&:setup)
           gemset = self.setup_dependencies(build).keys.sort
         end until gemset == gemset_prev
+        resolve_external_hal!
+      end
+
+      # A gem named `hal-<short>-<conf>` is treated as the external
+      # HAL provider for the gem whose name's last `-`-separated
+      # segment is <short> (e.g., hal-task-glib provides the HAL for
+      # mruby-task).  The target gem's ports/* sources are dropped
+      # from its object list -- the matching gem supplies the
+      # implementation.  Two or more matches is a build error.
+      def resolve_external_hal!
+        each do |target|
+          next if target.port_objs.nil? || target.port_objs.empty?
+          short = target.name.split('-').last
+          pattern = /\Ahal-#{Regexp.escape(short)}-.+\z/
+          overriders = select { |g| g != target && g.name =~ pattern }
+          next if overriders.empty?
+          if overriders.size > 1
+            fail "Multiple HAL providers for '#{target.name}': " +
+                 overriders.map(&:name).join(", ")
+          end
+          target.objs.reject! { |o| target.port_objs.include?(o) }
+        end
       end
 
       def setup_build

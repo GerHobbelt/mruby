@@ -67,6 +67,7 @@ typedef struct mrb_regexp_pattern {
   uint16_t num_captures;   /* number of capture groups (including group 0) */
   uint32_t flags;
   re_named_capture *named_captures;
+  char *named_arena;       /* owned storage for named_captures[i].name; NULL if num_named == 0 */
   uint16_t num_named;
   mrb_bool has_backref;    /* true if pattern uses \1-\9 */
   mrb_bool needs_backtrack; /* true if pattern needs backtracking engine */
@@ -94,6 +95,12 @@ typedef struct mrb_regexp_pattern {
 /* Step limit for ReDoS protection */
 #ifndef MRB_REGEXP_STEP_LIMIT
 #define MRB_REGEXP_STEP_LIMIT 1000000
+#endif
+
+/* Recursion-depth limit for bt_match: bounds C stack growth on
+   patterns like `(?=)+` that recurse without consuming input. */
+#ifndef MRB_REGEXP_RECURSION_LIMIT
+#define MRB_REGEXP_RECURSION_LIMIT 1000
 #endif
 
 /* Maximum captures */
