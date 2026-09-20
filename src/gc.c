@@ -264,8 +264,6 @@ mrb_static_assert(MRB_GC_RED <= GC_COLOR_MASK);
 #define other_white_part(s) ((s)->current_white_part ^ GC_WHITES)
 #define is_dead(s, o) (((o)->gc_color & other_white_part(s) & GC_WHITES) || (o)->tt == MRB_TT_FREE)
 
-mrb_noreturn void mrb_raise_nomemory(mrb_state *mrb);
-
 static size_t incremental_gc_finish(mrb_state *mrb, mrb_gc *gc);
 static size_t incremental_gc_run(mrb_state *mrb, mrb_gc *gc);
 
@@ -345,13 +343,7 @@ mrb_realloc(mrb_state *mrb, void *p, size_t len)
 
   p2 = mrb_realloc_simple(mrb, p, len);
   if (len == 0) return p2;
-  if (p2 == NULL) {
-    mrb->gc.out_of_memory = TRUE;
-    mrb_raise_nomemory(mrb);
-  }
-  else {
-    mrb->gc.out_of_memory = FALSE;
-  }
+  if (p2 == NULL) mrb_raise_nomemory(mrb);
 
   return p2;
 }

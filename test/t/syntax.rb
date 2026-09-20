@@ -183,6 +183,32 @@ assert('safe navigation operator-assignment short-circuits on nil') do
   assert_equal 7, d.x
 end
 
+assert('local variable or/and-assignment yields its value') do
+  # gen_assignment_lvar() only moves, so the local-variable branch has to push
+  # the result the way the other branches do. Without it the expression yields
+  # nothing and every later register is off by one, which the VM catches as
+  # `bidx < irep->nregs`.
+  q = 1;   assert_equal 1, (q ||= 7); assert_equal 1, q
+  r = nil; assert_equal 7, (r ||= 7); assert_equal 7, r
+  s = 1;   assert_equal 7, (s &&= 7); assert_equal 7, s
+  t = nil; assert_nil (t &&= 7)
+
+  # in argument position, where the register slip used to assert
+  u = 1
+  assert_equal [1], [].push(u ||= 7)
+  v = 1
+  assert_equal [1, 8], [(v ||= 7), 8]
+
+  # combined with a splat argument (clusterfuzz 6212427713413120)
+  w = 1
+  assert_equal [1, :h], [(w ||= 7), *[:h]]
+
+  # and in a nested scope, through an upvar
+  outer = nil
+  [1].each { outer ||= 5 }
+  assert_equal 5, outer
+end
+
 assert('attribute or/and-assignment persists the write in a value context') do
   acc = Class.new { attr_accessor :x }
 
@@ -1551,3 +1577,32 @@ end
 # NOTE: `&nil` block-forbidding parameters live in syntax_block_forbid.rb,
 # which the build excludes when compiling with mruby-compiler-prism (the
 # Prism parser does not accept `&nil` yet).
+
+assert('brace-less variable interpolation') do
+  # `"#@iv"` is the short form of `"#{@iv}"`. It reaches the codegen as an
+  # EmbeddedVariableNode, which used to be unimplemented.
+  @iv = "IV"
+  $gv = "GV"
+
+  assert_equal "aIVb", "a#@iv" + "b"
+  assert_equal "xGVy", "x#$gv" + "y"
+  assert_equal "IVGV", "#@iv#$gv"
+  assert_equal :sIV, :"s#@iv"
+
+  # a class variable, which is only readable from a class body or method
+  c = Class.new do
+    @@cv = "CV"
+    def self.t; "c#@@cv"; end
+  end
+  assert_equal "cCV", c.t
+
+  # non-string values go through to_s, as with #{}
+  @n = 42
+  @u = nil
+  assert_equal "42", "#@n"
+  assert_equal "", "#@u"
+
+  # `#` not followed by a variable sigil stays literal
+  assert_equal "# x", "# x"
+  assert_equal 3, "#@ ".length
+end

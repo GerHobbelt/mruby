@@ -4,23 +4,45 @@ class String
   # back to the core implementation.
   alias __split split
 
-  def match(re, pos = 0)
-    re = Regexp.new(re) if re.is_a?(String)
-    re.match(self, pos)
+  # `match` and `match?` accept a Regexp or a String and reject everything
+  # else.  The check lives in C (see Regexp.__match_pattern) so that the
+  # argument cannot steer it: it cannot pose as a Regexp, and there is no
+  # helper on String for a subclass to redefine.  Compiling an accepted String
+  # stays here, so the check does not have to call back into the VM; `String
+  # ===` goes through `Module#===` and cannot be redefined either.
+  def match(re, pos = 0, &block)
+    re = Regexp.__match_pattern(re)
+    re = Regexp.new(re) if String === re
+    re.match(self, pos, &block)
   end
 
   def match?(re, pos = 0)
-    re = Regexp.new(re) if re.is_a?(String)
+    re = Regexp.__match_pattern(re)
+    re = Regexp.new(re) if String === re
     re.match?(self, pos)
   end
 
   def =~(re)
+    # A String argument would dispatch back to this method and recurse, so
+    # reject it up front (CRuby raises the same TypeError).
+    raise TypeError, "type mismatch: String given" if re.is_a?(String)
     re =~ self
   end
 
-  def sub(pattern, replacement = nil, &block)
+  def sub(*args, &block)
+    # CRuby accepts 1..2 arguments with a block, but demands exactly 2
+    # without one, and reports the expected count accordingly.
+    if block
+      unless (1..2).include?(args.length)
+        raise ArgumentError, "wrong number of arguments (given #{args.length}, expected 1..2)"
+      end
+    elsif args.length != 2
+      raise ArgumentError, "wrong number of arguments (given #{args.length}, expected 2)"
+    end
+    pattern, replacement = *args
     pattern = Regexp.new(Regexp.escape(pattern)) if pattern.is_a?(String)
-    unless block
+    # A replacement argument wins over the block, as in CRuby.
+    if args.length == 2
       return pattern.__sub_str(self, replacement.to_s)
     end
     md = pattern.match(self)
@@ -28,9 +50,18 @@ class String
     md.pre_match + block.call(md[0]).to_s + md.post_match
   end
 
-  def gsub(pattern, replacement = nil, &block)
+  def gsub(*args, &block)
+    unless (1..2).include?(args.length)
+      raise ArgumentError, "wrong number of arguments (given #{args.length}, expected 1..2)"
+    end
+    # Without mruby-enumerator this is core Kernel#to_enum, which raises
+    # NotImplementedError; every other path here stays usable, so the gem does
+    # not depend on Enumerator.
+    return to_enum(:gsub, *args) if args.length == 1 && !block
+    pattern, replacement = *args
     pattern = Regexp.new(Regexp.escape(pattern)) if pattern.is_a?(String)
-    unless block
+    # A replacement argument wins over the block, as in CRuby.
+    if args.length == 2
       return pattern.__gsub_str(self, replacement.to_s)
     end
     # block case: keep in Ruby to avoid VM callback from C

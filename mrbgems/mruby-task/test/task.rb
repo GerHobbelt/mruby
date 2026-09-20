@@ -303,3 +303,130 @@ assert("exception raised from C after blocking is not leaked into Task#value") d
 
   assert_equal :rescued, child.value
 end
+
+# Scheduler hook tests (mrb_task_set_scheduler_hook)
+
+assert("scheduler hook fires at every scheduler entry") do
+  TaskTest.install_probe_hook(0)
+  c0 = TaskTest.probe_count(0)
+  Task.pass            # entry: task_run_one_iteration (root-context Task.pass)
+  c1 = TaskTest.probe_count(0)
+  TaskTest.run_once    # entry: mrb_task_run_once
+  c2 = TaskTest.probe_count(0)
+  Task.new(name: "hook_noop") { }
+  Task.run             # entry: task_run_body loop
+  c3 = TaskTest.probe_count(0)
+  TaskTest.clear_hook
+  assert_true c0 + 1 <= c1
+  assert_true c1 + 1 <= c2
+  assert_true c2 + 1 <= c3
+end
+
+assert("scheduler hook wakes a queue-blocked task in the same iteration") do
+  q = Task::Queue.new
+  ran = []
+  t = Task.new(name: "hook_waker") do
+    ran << q.pop
+  end
+  Task.pass  # runs the task until it parks inside q.pop
+  TaskTest.install_wake_hook(q)
+  # The hook fires before the ready-queue read, so the push it makes must
+  # wake the task and get it selected within this single Task.pass. If the
+  # hook ran after the read, a second pass would be needed.
+  Task.pass
+  TaskTest.clear_hook
+  assert_equal [42], ran
+end
+
+assert("setting a new scheduler hook replaces the previous one") do
+  TaskTest.install_probe_hook(0)
+  Task.pass
+  a_after_first = TaskTest.probe_count(0)
+  TaskTest.install_probe_hook(1)
+  Task.pass
+  TaskTest.clear_hook
+  assert_equal a_after_first, TaskTest.probe_count(0)
+  assert_true 1 <= TaskTest.probe_count(1)
+end
+
+assert("scheduler hook cleared with NULL stops firing") do
+  TaskTest.install_probe_hook(0)
+  Task.pass
+  fired = TaskTest.probe_count(0)
+  TaskTest.clear_hook
+  Task.pass
+  Task.pass
+  assert_true 1 <= fired
+  assert_equal fired, TaskTest.probe_count(0)
+end
+
+# Envs on a task stack must be detached before the stack is freed
+
+assert("closure escaping a closed task survives GC") do
+  t = Task.new(name: "escaper") do
+    a1 = 1; a2 = 2; a3 = 3; a4 = 4; a5 = 5; a6 = 6
+    $task_escaped_proc = -> { a1 + a2 + a3 + a4 + a5 + a6 }
+    Task.current.suspend
+  end
+  Task.pass
+  assert_equal 21, $task_escaped_proc.call
+  t.terminate
+  t.close                 # frees the task's stack
+  GC.start                # marks the escaped env; must not read freed memory
+  junk = []
+  i = 0
+  while i < 200
+    junk << "x" * 64      # reuse the freed stack region
+    i += 1
+  end
+  GC.start
+  assert_equal 21, $task_escaped_proc.call
+  $task_escaped_proc = nil
+end
+
+assert("closure escaping a task whose context is reinitialized survives GC") do
+  t = Task.new(name: "reinit") do
+    b1 = 7; b2 = 8; b3 = 9
+    $task_escaped_proc2 = -> { b1 + b2 + b3 }
+    Task.current.suspend
+  end
+  Task.pass
+  assert_equal 24, $task_escaped_proc2.call
+  t.terminate
+  # Reuse the task's context for another proc: the old stack is freed
+  # inside mrb_task_init_context, with the escaped env still pointing at it.
+  TaskTest.reinit_context(t) { 0 }
+  GC.start
+  junk = []
+  i = 0
+  while i < 200
+    junk << "y" * 48
+    i += 1
+  end
+  GC.start
+  assert_equal 24, $task_escaped_proc2.call
+  $task_escaped_proc2 = nil
+  t.close
+end
+
+assert("closure escaping a synchronously executed proc survives GC") do
+  result = TaskTest.run_sync do
+    c1 = 10; c2 = 20
+    $task_escaped_proc3 = -> { c1 + c2 }
+    "sync-result"
+  end
+  # The teardown frees the temporary task's stack; both the returned
+  # object and the escaped env must survive it.
+  assert_equal "sync-result", result
+  GC.start
+  junk = []
+  i = 0
+  while i < 200
+    junk << "z" * 48
+    i += 1
+  end
+  GC.start
+  assert_equal 30, $task_escaped_proc3.call
+  assert_equal "sync-result", result
+  $task_escaped_proc3 = nil
+end
