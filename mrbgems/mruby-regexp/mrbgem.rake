@@ -6,7 +6,7 @@ MRuby::Gem::Specification.new('mruby-regexp') do |spec|
   spec.add_dependency 'mruby-string-ext', :core => 'mruby-string-ext'
 
   # The engine reads UTF-8 whatever a build's strings index by, so it asks core
-  # for the two functions that answer what a run of bytes spells. They wait
+  # for the functions that answer what a run of bytes spells. They wait
   # behind MRB_UTF8_STRING otherwise, and this build has no reason to set that:
   # mruby-encoding is what does, and the default gembox carries this gem
   # without it.
@@ -25,6 +25,13 @@ MRuby::Gem::Specification.new('mruby-regexp') do |spec|
   # the test skips.
   if build.gems.any? {|g| g.name == 'mruby-enumerator'}
     spec.add_dependency 'mruby-enumerator', :core => 'mruby-enumerator'
+  end
+
+  # Same deal for what a piece of a match is read as: the marking a byte-read
+  # string carries is only visible through mruby-encoding, so mrbtest can only
+  # ask about it when that gem is part of the state.
+  if build.gems.any? {|g| g.name == 'mruby-encoding'}
+    spec.add_test_dependency 'mruby-encoding', :core => 'mruby-encoding'
   end
 
   # Same deal for `Symbol#[]` and `#slice`, which live in mruby-symbol-ext and

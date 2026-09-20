@@ -115,12 +115,17 @@ class String
     # get_pat.  Only the quoting is taken from it: get_pat_quoted also accepts
     # anything answering `to_str`, where `__check_pattern` keeps to a real
     # String, as `match` already does.
-    pattern = Regexp.new(Regexp.escape(pattern)) if String === pattern
+    literal = String === pattern
+    # CRuby searches for a literal byte by byte and never reads the subject as
+    # UTF-8 on the way, so quoting one into a Regexp here must not put the
+    # subject through a check CRuby does not make: `"a\x80b".sub("b", "!")`
+    # answers there, where the same call with `/b/` is refused.
+    pattern = Regexp.new(Regexp.escape(pattern)) if literal
     # A replacement argument wins over the block, as in CRuby.
     if args.length == 2
-      return Regexp.__sub_str(pattern, self, replacement.to_s)
+      return Regexp.__sub_str(pattern, self, replacement.to_s, literal)
     end
-    md = Regexp.__search(pattern, self)
+    md = Regexp.__search(pattern, self, 0, literal)
     return self.dup unless md
     md.pre_match + block.call(md[0]).to_s + md.post_match
   end
@@ -141,19 +146,23 @@ class String
     # Resolved here rather than left to `sub` because the match below decides
     # the return value, and a String pattern is a literal on both paths.
     pattern = Regexp.__check_pattern(args[0])
-    pattern = Regexp.new(Regexp.escape(pattern)) if String === pattern
+    literal = String === pattern
+    pattern = Regexp.new(Regexp.escape(pattern)) if literal
     raise FrozenError, "can't modify frozen String" if frozen?
     # Whether a substitution happened is a question about the match, not about
     # the result: `"aaa".sub!(/a/, "a")` returns self even though the string is
     # unchanged.  A full search and not `match?`, so a failed match clears $~.
-    return nil unless Regexp.__search(pattern, self)
+    return nil unless Regexp.__search(pattern, self, 0, literal)
     # `sub` matches again and publishes its own $~ over this one, leaving the
     # caller the match `sub` would have left, a block's own matches included.
     # The resolved pattern takes the place of the original argument so that a
-    # String is not quoted and compiled a second time.  Overwriting `self`
-    # afterwards is safe: a MatchData snapshots its subject, so $~ keeps
-    # describing the string as it was matched.
-    str = args.length == 2 ? self.sub(pattern, args[1], &block) : self.sub(pattern, &block)
+    # String is not quoted and compiled a second time; a literal goes down as
+    # the String it was instead, since that is what tells `sub` to leave the
+    # subject unread, and quoting it twice is the price of saying so.
+    # Overwriting `self` afterwards is safe: a MatchData snapshots its subject,
+    # so $~ keeps describing the string as it was matched.
+    down = literal ? args[0] : pattern
+    str = args.length == 2 ? self.sub(down, args[1], &block) : self.sub(down, &block)
     self.replace(str)
   end
 
@@ -169,10 +178,13 @@ class String
     # After the to_enum return above, so that `"abc".gsub(:b)` yields an
     # Enumerator and raises on the first iteration, as CRuby does.
     pattern = Regexp.__check_pattern(pattern)
-    pattern = Regexp.new(Regexp.escape(pattern)) if String === pattern
+    # A String pattern is a literal, as in `sub`, and reaches the subject the
+    # way CRuby reaches it: byte by byte, with no reading of it as UTF-8.
+    literal = String === pattern
+    pattern = Regexp.new(Regexp.escape(pattern)) if literal
     # A replacement argument wins over the block, as in CRuby.
     if args.length == 2
-      return Regexp.__gsub_str(pattern, self, replacement.to_s)
+      return Regexp.__gsub_str(pattern, self, replacement.to_s, literal)
     end
     # block case: keep in Ruby to avoid VM callback from C
     parts = []
@@ -185,7 +197,7 @@ class String
     # nothing to restore and keeps the cleared state, as CRuby does.
     last = nil
     while pos <= len
-      md = Regexp.__byte_search(pattern, self, pos)
+      md = Regexp.__byte_search(pattern, self, pos, literal)
       break unless md
       last = md
       # gsub works in byte space (match pos, byteslice). begin/end report
@@ -227,12 +239,15 @@ class String
     end
     return to_enum(:gsub!, *args) if args.length == 1 && !block
     pattern = Regexp.__check_pattern(args[0])
-    pattern = Regexp.new(Regexp.escape(pattern)) if String === pattern
+    literal = String === pattern
+    pattern = Regexp.new(Regexp.escape(pattern)) if literal
     # As in `sub!`: the match decides the return value, and a failed search
     # clears $~.  What it publishes on success is replaced right away by the
     # last match of the `gsub` below, which is the one CRuby leaves behind.
-    return nil unless Regexp.__search(pattern, self)
-    str = args.length == 2 ? self.gsub(pattern, args[1], &block) : self.gsub(pattern, &block)
+    # A literal goes down as the String it was, for the reason `sub!` gives.
+    return nil unless Regexp.__search(pattern, self, 0, literal)
+    down = literal ? args[0] : pattern
+    str = args.length == 2 ? self.gsub(down, args[1], &block) : self.gsub(down, &block)
     self.replace(str)
   end
 
@@ -271,6 +286,13 @@ class String
     # could steer itself around the check below and reach `__split` instead.
     # `Module#===` reads the real type and cannot be redefined.
     if NilClass === pattern || String === pattern
+      # `__split` is core's `split`, which reaches no search of this gem's, so
+      # the subject would go unread on this path where every other one refuses
+      # it. CRuby refuses a String or nil pattern too, unlike the literal a
+      # search is given, which is why this is not the exemption `sub` takes.
+      # A limit of 1 hands the subject back whole without looking into it, and
+      # CRuby answers for that as well, so the check waits behind it.
+      Regexp.__check_encoding(self) unless limit == 1
       return limit_given ? __split(pattern, limit) : __split(pattern)
     end
     return self.empty? ? [] : [self] if limit == 1
@@ -493,28 +515,49 @@ class String
     md && md.begin(0)
   end
 
-  # The last match that starts at or before `limit`, or nil, with the match
-  # globals left describing it.  `limit` is a byte offset when `bytes` is
-  # true and a character offset otherwise, which is the whole of the
-  # difference between `byterindex` and `rindex`.
+  # The last match that starts at or before `limit`, a byte offset, or nil,
+  # with the match globals left describing it.
   #
   # The engine searches forward only, so this walks the subject from the
   # start and keeps the last match that qualifies: linear in the number of
   # positions a match starts at, where the backward search CRuby hands to
-  # Onig is not.  Each step resumes one character past the match start and
-  # not at the match end, which is what keeps overlapping matches in view:
+  # Onig is not.  Each step resumes one byte past the match start and not at
+  # the match end, which is what keeps overlapping matches in view:
   # `"aaa".rindex(/aa/)` is 1, where resuming at the end would answer 0.
-  def __regexp_rsearch(pattern, limit, bytes)
+  #
+  # The walk is in byte space so that its length is what it looks like.  A
+  # character offset is not a place the subject can be read from: every one
+  # handed to `Regexp.__search` is counted out from the start of the subject
+  # again, and every one read back off a match with `begin` is counted the
+  # same way, so a walk that speaks characters pays for the whole subject on
+  # every turn and takes quadratic time on a multibyte one.  Nothing is given
+  # up by leaving them: a byte inside a character is not a position a match
+  # can start at, and the engine steps over one on its own rather than seed a
+  # match attempt there, so `+ 1` reaches the next character by itself.
+  #
+  # `Regexp.__byte_search` does not range check its position, so the walk
+  # stops itself at the end of the subject.  An empty match there is the one
+  # that reaches it: it leaves `pos` one past the last byte.
+  #
+  # The walk publishes none of what it passes over.  A search that publishes
+  # cuts the whole subject into the pre match and post match globals, and
+  # every match here but the last is one this method already means to
+  # replace, so publishing them costs the subject once per match and leaves
+  # behind nothing anything reads.  The answer is published below instead,
+  # which is where it was published from before.
+  def __regexp_rsearch(pattern, limit)
     found = nil
     pos = 0
-    while (md = Regexp.__search(pattern, self, pos))
-      break if (bytes ? md.__byte_begin(0) : md.begin(0)) > limit
+    size = self.bytesize
+    while pos <= size && (md = Regexp.__byte_search(pattern, self, pos, false, false))
+      start = md.__byte_begin(0)
+      break if start > limit
       found = md
-      pos = md.begin(0) + 1
+      pos = start + 1
     end
-    # The loop leaves behind whatever its last search published: the clear a
-    # failed one does, or a match past `limit` that is not the answer.  Both
-    # have to give way to what the search found.
+    # The globals still describe whatever they described before the call, the
+    # walk having said nothing to them, so the answer is published here and a
+    # search that found none clears them itself.
     found ? found.__set_globals : Regexp.__search(pattern, nil)
     found
   end
@@ -546,7 +589,14 @@ class String
         pos = len
       end
     end
-    md = __regexp_rsearch(args[0], pos, false)
+    # The walk reads the subject by byte, so the character position it is to
+    # stop at has to be read as one here.  A position at the end of the
+    # subject is the end of its bytes and needs no reading, which is the form
+    # `rindex` is called in when it is called with one argument at all; only
+    # a position named by the caller is measured, once, where the walk would
+    # otherwise have measured one on every turn.
+    byte_pos = pos == len ? self.bytesize : self[0, pos].bytesize
+    md = __regexp_rsearch(args[0], byte_pos)
     md && md.begin(0)
   end
 
@@ -592,7 +642,7 @@ class String
         pos = len
       end
     end
-    md = __regexp_rsearch(args[0], pos, true)
+    md = __regexp_rsearch(args[0], pos)
     md && md.__byte_begin(0)
   end
 
@@ -614,7 +664,7 @@ class String
     return __rpartition(sep) unless Regexp === sep
     # The last match anywhere in the subject, so the limit is its end and the
     # walk below never stops early.
-    md = __regexp_rsearch(sep, self.length, false)
+    md = __regexp_rsearch(sep, self.bytesize)
     # No match puts the whole subject in the tail, which is the row this
     # method is most often got wrong on.
     return ["", "", self.byteslice(0, self.bytesize)] unless md

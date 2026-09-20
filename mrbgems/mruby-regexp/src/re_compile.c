@@ -448,9 +448,11 @@ parse_escape(re_compiler *c)
   }
 }
 
-/* Reject what has no UTF-8 encoding. CRuby reports both a surrogate and a
-   value past the last plane as "invalid Unicode range", so neither ever
-   reaches mrb_utf8_to_buf(). */
+/* Reject what a pattern may not name. CRuby reports both a surrogate and a
+   value past the last plane as "invalid Unicode range", and reports it where
+   the pattern is read rather than where it is emitted, so the check stays
+   here: mrb_utf8_to_buf() refuses the second on its own but spells the first,
+   and neither reaches it anyway. */
 static void
 check_unicode_cp(re_compiler *c, uint32_t cp)
 {
@@ -596,8 +598,8 @@ read_class_atom(re_compiler *c, re_charclass *cc, mrb_bool *is_byte)
   }
   /* Multi-byte UTF-8 leader: decode the full codepoint. An invalid leader
      decodes as itself over one byte, so it is a byte like the rest. */
-  int len = 0;
-  uint32_t cp = mrb_re_utf8_decode(c->p, c->src_end, &len);
+  mrb_int len = 0;
+  uint32_t cp = mrb_utf8_decode(c->p, c->src_end, &len);
   c->p += len;
   if (len == 1) *is_byte = TRUE;
   return cp;
@@ -838,14 +840,25 @@ compute_fixed_len(re_compiler *c, uint32_t start, uint32_t end, int *chars_out)
   while (pc < end) {
     re_inst inst = c->code[pc];
     switch (inst.op) {
-    case RE_CHAR:
-      /* a multibyte literal is a run of one-byte RE_CHAR instructions,
-         so each one is exactly one byte by construction, and the run is
-         one character per lead byte in it */
-      len += 1;
-      if ((inst.a & 0xC0) != 0x80) chars += 1;
-      pc++;
+    case RE_CHAR: {
+      /* A multibyte literal is a run of one-byte RE_CHAR instructions, and
+         what a byte spells depends on the bytes after it, so hand the run to
+         mrb_utf8len rather than read the lead bit alone: a continuation byte
+         no lead reaches is a character of its own, which is the rule the
+         executor rewinds by. Four bytes is the longest character there is,
+         and a run never splits one. */
+      char buf[4];
+      int n = 0;
+      while (n < 4 && pc + (uint32_t)n < end && c->code[pc + n].op == RE_CHAR) {
+        buf[n] = (char)c->code[pc + n].a;
+        n++;
+      }
+      int clen = (int)mrb_utf8len(buf, buf + n);
+      len += clen;
+      chars += 1;
+      pc += (uint32_t)clen;
       break;
+    }
     case RE_CLASS:
     case RE_NCLASS:
     case RE_ANY:
@@ -1015,8 +1028,8 @@ static mrb_bool
 emit_char_folded(re_compiler *c, int ch)
 {
   if (ch < 128 || !(c->flags & RE_FLAG_IGNORECASE)) return FALSE;
-  int len = 0;
-  uint32_t cp = mrb_re_utf8_decode(c->p - 1, c->src_end, &len);
+  mrb_int len = 0;
+  uint32_t cp = mrb_utf8_decode(c->p - 1, c->src_end, &len);
   if (len == 1) return FALSE;
   if (!emit_cp_folded(c, cp)) return FALSE;
   c->p += len - 1;
@@ -1039,7 +1052,7 @@ emit_codepoint(re_compiler *c, uint32_t cp)
   }
   if ((c->flags & RE_FLAG_IGNORECASE) && emit_cp_folded(c, cp)) return;
   char buf[4];
-  int len = (int)mrb_utf8_to_buf(buf, cp);
+  int len = (int)mrb_utf8_to_buf(buf, (mrb_int)cp);
   for (int i = 0; i < len; i++) {
     emit(c, RE_CHAR, (uint8_t)buf[i], 0);
   }

@@ -12,7 +12,7 @@ end
 assert('String#dump') do
   assert_equal("\"\\x00\"", "\0".dump)
   assert_equal("\"foo\"", "foo".dump)
-  assert_equal('"\xe3\x82\x8b"', "る".dump)
+  assert_equal('"\xE3\x82\x8B"', "る".dump)
   assert_nothing_raised { ("\1" * 100).dump }   # regress #1210
 end
 
@@ -20,12 +20,37 @@ assert('String#inspect of a binary string escapes every byte') do
   # `inspect` passes a whole character through unescaped so it stays readable,
   # which a string holding no characters has nothing to gain from. `dump` on
   # the same string escaped every byte already, so the two agree there.
-  if UTF8STRING
-    assert_equal('"る"', "る".inspect)
-    assert_equal('"\xe3\x82\x8b"', "る".b.inspect)
-    assert_equal("る".b.dump, "る".b.inspect)
+  assert_equal('"る"', "る".inspect)
+  assert_equal('"\xE3\x82\x8B"', "る".b.inspect)
+  assert_equal("る".b.dump, "る".b.inspect)
+end if UTF8STRING
+
+assert('String#inspect leaves a malformed sequence malformed') do
+  # `inspect` remembers a string it walked without meeting a character of
+  # several bytes, so that whatever reads it next may step by bytes. A byte
+  # spelling no character is escaped one at a time as well, and was remembered
+  # the same way, after which it came back as a character the string does not
+  # hold.
+  ["\x80", "\xE3\x81", "\xC0\xAF", "\xED\xA0\x80", "\xF4\x90\x80\x80",
+   "a\x80b"].each do |str|
+    s = str.dup
+    s.inspect
+    assert_raise(ArgumentError) { s.codepoints }
   end
-end
+
+  s = "\xED\xA0\x80"
+  s.inspect
+  assert_raise(ArgumentError) { s.ord }
+  s = "\xED\xA0\x80"
+  s.inspect
+  assert_equal "\u{FFFD}" * 3, s.scrub
+
+  # an ASCII string does hold one character per byte, and is still read so
+  s = "abc"
+  s.inspect
+  assert_equal [97, 98, 99], s.codepoints
+  assert_equal "abc", s.scrub
+end if UTF8STRING
 
 assert('String#strip') do
   s = "  abc  "
@@ -894,84 +919,78 @@ assert('String#chop! on a binary string removes one byte') do
   # `chop!` cuts at the last character, and a byte-indexed string ends in a
   # byte rather than in a character. Reading it as UTF-8 took the whole of a
   # multi-byte sequence off, or all of a string that held only one.
-  if UTF8STRING
-    s = "\u{1F600}".b   # F0 9F 98 80: four bytes, one character
-    s.chop!
-    assert_equal "\xF0\x9F\x98".b, s
-    t = "a\u{1F600}".b
-    t.chop!
-    assert_equal "a\xF0\x9F\x98".b, t
-    # a string read as UTF-8 still loses the whole character
-    u = "\u{1F600}"
-    u.chop!
-    assert_equal "", u
-    # and the \r\n pair is still taken together
-    v = "a\r\n".b
-    v.chop!
-    assert_equal "a", v
-  end
-end
+  s = "\u{1F600}".b   # F0 9F 98 80: four bytes, one character
+  s.chop!
+  assert_equal "\xF0\x9F\x98".b, s
+  t = "a\u{1F600}".b
+  t.chop!
+  assert_equal "a\xF0\x9F\x98".b, t
+  # a string read as UTF-8 still loses the whole character
+  u = "\u{1F600}"
+  u.chop!
+  assert_equal "", u
+  # and the \r\n pair is still taken together
+  v = "a\r\n".b
+  v.chop!
+  assert_equal "a", v
+end if UTF8STRING
 
 assert('String#rindex on a binary string counts bytes') do
   # `rindex` reads a byte-indexed string as UTF-8 unless the single-byte flag
   # is already set, so it stepped over the bytes inside a multi-byte sequence
   # and moved a negative position by characters. `index` counts bytes there,
   # and the two have to meet.
-  if UTF8STRING
-    s = "aあb".b # "\x61\xe3\x81\x82\x62"
-    assert_equal 2, s.rindex("\x81".b)
-    assert_equal s.index("\x81".b), s.rindex("\x81".b)
-    assert_equal 1, s.rindex("\xe3".b)
-    assert_equal 4, s.rindex("b".b)
-    assert_equal 2, s.rindex("\x81".b, -2)
-    assert_equal 2, s.rindex("\x81".b, -3)
-    assert_nil s.rindex("\x81".b, 1)
-    assert_equal 4, s.rindex("b".b, -1)
-    # the same answers once #length has set the single-byte flag
-    assert_equal 5, s.length
-    assert_equal 2, s.rindex("\x81".b)
-    assert_equal 2, s.rindex("\x81".b, -2)
-  end
-end
+  s = "aあb".b # "\x61\xe3\x81\x82\x62"
+  assert_equal 2, s.rindex("\x81".b)
+  assert_equal s.index("\x81".b), s.rindex("\x81".b)
+  assert_equal 1, s.rindex("\xe3".b)
+  assert_equal 4, s.rindex("b".b)
+  assert_equal 2, s.rindex("\x81".b, -2)
+  assert_equal 2, s.rindex("\x81".b, -3)
+  assert_nil s.rindex("\x81".b, 1)
+  assert_equal 4, s.rindex("b".b, -1)
+  # the same answers once #length has set the single-byte flag
+  assert_equal 5, s.length
+  assert_equal 2, s.rindex("\x81".b)
+  assert_equal 2, s.rindex("\x81".b, -2)
+end if UTF8STRING
 
 assert('a needle that spells no character is found nowhere') do
   # A search reads its needle as the encoding the needle is taken to be in,
   # and bytes that spell no character name nothing to look for. CRuby answers
   # the same way. A byte-indexed needle claims no encoding, so it is still
   # searched for byte by byte, which is how the byte cases below get asked.
-  if UTF8STRING
-    s = "aあb"                       # 61 E3 81 82 62
-    assert_nil s.index("\x81")
-    assert_nil s.rindex("\x81")
-    assert_nil s.byteindex("\x81")
-    assert_nil s.byterindex("\x81")
-    assert_nil s["\x81"]
-    assert_false s.include?("\x81")
-    assert_false s.end_with?("\x82")
-    assert_equal [s, "", ""], s.partition("\x81")
-    assert_equal ["", "", s], s.rpartition("\x81")
-    assert_equal s, s.chomp("\x82")
-    t = s.dup
-    assert_nil t.slice!("\x81")
-    assert_equal s, t
+  s = "aあb"                       # 61 E3 81 82 62
+  assert_nil s.index("\x81")
+  assert_nil s.rindex("\x81")
+  assert_nil s.byteindex("\x81")
+  assert_nil s.byterindex("\x81")
+  assert_nil s["\x81"]
+  assert_false s.include?("\x81")
+  assert_false s.end_with?("\x82")
+  assert_equal [s, "", ""], s.partition("\x81")
+  assert_equal ["", "", s], s.rpartition("\x81")
+  assert_equal s, s.chomp("\x82")
+  t = s.dup
+  assert_nil t.slice!("\x81")
+  assert_equal s, t
 
-    # byte-indexed, the same bytes are bytes and every search answers
-    b = s.b
-    assert_equal 2, b.index("\x81".b)
-    assert_equal 2, b.rindex("\x81".b)
-    assert_equal 2, b.byteindex("\x81".b)
-    assert_equal 2, b.byterindex("\x81".b)
-    assert_equal 1, b.byterindex("\xe3".b)
-    assert_true b.include?("\x81".b)
-    assert_equal 3, "あ\x80x".b.rindex("\x80".b)
-    assert_equal 2, "\xC0\x80a".b.rindex("a".b)
+  # byte-indexed, the same bytes are bytes and every search answers
+  b = s.b
+  assert_equal 2, b.index("\x81".b)
+  assert_equal 2, b.rindex("\x81".b)
+  assert_equal 2, b.byteindex("\x81".b)
+  assert_equal 2, b.byterindex("\x81".b)
+  assert_equal 1, b.byterindex("\xe3".b)
+  assert_true b.include?("\x81".b)
+  assert_equal 3, "あ\x80x".b.rindex("\x80".b)
+  assert_equal 2, "\xC0\x80a".b.rindex("a".b)
 
-    # a whole character is still found, and so is ASCII
-    assert_equal 1, s.index("あ")
-    assert_equal 2, s.index("b")
-    assert_equal 4, s.byterindex("b")
-  end
-end
+  # a whole character is still found, and so is ASCII
+  assert_equal 1, s.index("あ")
+  assert_equal 2, s.index("b")
+  assert_equal 4, s.byterindex("b")
+end if UTF8STRING
 
 assert('String#codepoints') do
   expect = [104, 101, 108, 108, 111, 33]
@@ -1011,6 +1030,56 @@ assert('String#ord rejects malformed sequences') do
   assert_raise(ArgumentError) { "\xC0\xAF".ord }
   assert_raise(ArgumentError) { "\xED\xA0\x80".ord }
   assert_raise(ArgumentError) { "\xF4\x90\x80\x80".ord }
+end if UTF8STRING
+
+assert('a malformed sequence stays malformed once the string is counted') do
+  # Counting characters remembers a string that holds one per byte, so that
+  # whatever reads it next may step by bytes. Bytes that spell no character
+  # count one per byte as well, and were remembered the same way, after which
+  # they came back as the characters the string does not hold.
+  counters = {
+    "length"    => ->(s) { s.length },
+    "chars"     => ->(s) { s.chars },
+    "each_char" => ->(s) { s.each_char { |c| } },
+    "[]"        => ->(s) { s[0] },
+  }
+  broken = ["\x80", "\xE3\x81", "\xC0\xAF", "\xED\xA0\x80", "\xF4\x90\x80\x80",
+            "a\x80b", "あ\x80"]
+  # #ord reads the first character, so it answers wherever that one is whole
+  ord_answers = { "a\x80b" => 97, "あ\x80" => 12354 }
+
+  counters.each do |name, count|
+    broken.each do |str|
+      s = str.dup
+      count.call(s)
+      assert_raise(ArgumentError, "#{str.inspect}.codepoints after #{name}") { s.codepoints }
+    end
+    broken.each do |str|
+      s = str.dup
+      count.call(s)
+      want = ord_answers[str]
+      if want
+        assert_equal want, s.ord, "#{str.inspect}.ord after #{name}"
+      else
+        assert_raise(ArgumentError, "#{str.inspect}.ord after #{name}") { s.ord }
+      end
+    end
+
+    # scrub has nothing to replace only where the bytes read as characters
+    s = "\xED\xA0\x80"
+    count.call(s)
+    assert_equal "\u{FFFD}" * 3, s.scrub
+    s = "\xED\xA0\x80"
+    count.call(s)
+    assert_equal "???", s.scrub("?")
+
+    # an ASCII string does hold one character per byte, and is still read so
+    s = "abc"
+    count.call(s)
+    assert_equal [97, 98, 99], s.codepoints
+    assert_equal 97, s.ord
+    assert_equal "abc", s.scrub
+  end
 end if UTF8STRING
 
 assert('String#each_codepoint') do

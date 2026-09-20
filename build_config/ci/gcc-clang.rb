@@ -20,7 +20,7 @@ MRuby::Build.new('full-debug') do |conf|
   conf.enable_test
 end
 
-MRuby::Build.new do |conf|
+MRuby::Build.new('bintest') do |conf|
   conf.toolchain
 
   # include all core GEMs
@@ -48,4 +48,19 @@ MRuby::Build.new('cxx_abi') do |conf|
   conf.enable_test
 
   conf.enable_cxx_abi
+end
+
+MRuby::Build.new('default') do |conf|
+  conf.toolchain
+
+  # The one build here on the default gembox. It leaves out mruby-encoding,
+  # which is what defines MRB_UTF8_STRING, so its strings index by byte. The
+  # tests written as the byte-indexed mirror of the UTF-8 ones (String#scrub
+  # degrading to a no-op, the byte-counting halves of mruby-regexp and
+  # mruby-string-ext) run nowhere else: every other build in CI, here and in
+  # ci/msvc, takes full-core. Tests only, since the binaries this gembox adds
+  # are the same ones the bintest above already covers.
+  conf.gembox 'default'
+
+  conf.enable_test
 end

@@ -336,15 +336,26 @@ mrb_gc_free_str(mrb_state *mrb, struct RString *str)
 #define MASK01 0x01010101ul
 #endif
 
-/*
- * Encode a Unicode codepoint to UTF-8 bytes.
- * buf must have at least 4 bytes of space.
- * Returns the number of bytes written (1-4), or 0 for invalid codepoint.
- */
+/* Encode a Unicode codepoint to UTF-8 bytes, into a buffer of at least four.
+   Returns the number of bytes written (1-4), or 0 for a value outside
+   U+0000..U+10FFFF, which spells no character. The value arrives as an
+   mrb_int so that a negative one and one past the range are both this
+   function's answer to give; a caller reporting them differs only in which
+   exception it raises, and each raises what CRuby raises there.
+
+   A surrogate does encode. What CRuby writes for one is what mruby writes:
+   sprintf("%c", 0xD800) and [0xD800].pack("U") both yield ED A0 80 there.
+   Reading those bytes back is a separate question, and mrb_utf8len() answers
+   it by RFC 3629, under which a surrogate spells nothing. So what this writes
+   is deliberately wider than what that reads, and a string built from one is
+   valid_encoding? == false. */
 mrb_int
-mrb_utf8_to_buf(char *buf, uint32_t cp)
+mrb_utf8_to_buf(char *buf, mrb_int cp)
 {
-  if (cp < 0x80) {
+  if (cp < 0) {
+    return 0;
+  }
+  else if (cp < 0x80) {
     buf[0] = (char)cp;
     return 1;
   }
@@ -366,7 +377,7 @@ mrb_utf8_to_buf(char *buf, uint32_t cp)
     buf[3] = (char)(0x80 | (cp & 0x3F));
     return 4;
   }
-  return 0;  /* invalid codepoint */
+  return 0;  /* above U+10FFFF */
 }
 
 /* What a run of bytes spells is a question apart from whether String indexes
@@ -439,6 +450,39 @@ mrb_utf8_char_head(const char *beg, const char *p, const char *end)
     return mrb_utf8len(lead, end) > back ? lead : p;
   }
   return p;
+}
+
+/* Decode a UTF-8 character and return its codepoint.
+   *lenp is set to the byte length consumed. mrb_utf8len() answers 1 for every
+   sequence it rejects, so those consume a single byte and come back as the
+   lead byte itself. */
+uint32_t
+mrb_utf8_decode(const char *p, const char *e, mrb_int *lenp)
+{
+  uint8_t c = (uint8_t)p[0];
+  uint32_t cp;
+  mrb_int n = mrb_utf8len(p, e);
+
+  *lenp = n;
+  switch (n) {
+  case 2:
+    cp = (c & 0x1f) << 6;
+    cp |= ((uint8_t)p[1] & 0x3f);
+    return cp;
+  case 3:
+    cp = (c & 0x0f) << 12;
+    cp |= ((uint8_t)p[1] & 0x3f) << 6;
+    cp |= ((uint8_t)p[2] & 0x3f);
+    return cp;
+  case 4:
+    cp = (c & 0x07) << 18;
+    cp |= ((uint8_t)p[1] & 0x3f) << 12;
+    cp |= ((uint8_t)p[2] & 0x3f) << 6;
+    cp |= ((uint8_t)p[3] & 0x3f);
+    return cp;
+  default:
+    return c;  /* ASCII, or invalid/truncated byte returned as-is */
+  }
 }
 
 #endif  /* MRB_UTF8_STRING || MRB_UTF8_SCAN */
@@ -618,9 +662,22 @@ mrb_str_char_len(mrb_state *mrb, mrb_value str)
     return byte_len;
   }
   else {
-    mrb_int utf8_len = mrb_utf8_strlen(RSTR_PTR(s), byte_len);
+    const char *p = RSTR_PTR(s);
+    const char *e = p + byte_len;
+    const char *np = search_nonascii(p, e);
+
+    /* Every character a non-ASCII byte begins spells two bytes or more, and a
+       non-ASCII byte that begins none spells no character at all, so a string
+       holds one character per byte exactly when every byte of it is ASCII.
+       Counts that come out equal do not say that: a byte spelling no character
+       is counted as one too, so a string of them set the flag as well, and the
+       readers of it went on to hand those bytes back as characters. */
+    if (np == e) {
+      RSTR_SET_SINGLE_BYTE_FLAG(s);
+      return byte_len;
+    }
+    mrb_int utf8_len = (mrb_int)(np - p) + mrb_utf8_strlen(np, (mrb_int)(e - np));
     mrb_assert(utf8_len <= byte_len);
-    if (byte_len == utf8_len) RSTR_SET_SINGLE_BYTE_FLAG(s);
     return utf8_len;
   }
 }
@@ -632,19 +689,45 @@ mrb_str_valid_encoding_p(mrb_state *mrb, mrb_value str)
   (void)mrb;
   struct RString *s = mrb_str_ptr(str);
   /* A byte-indexed string makes no such claim, so it is valid whatever its
-     bytes are. MRB_STR_SINGLE_BYTE is deliberately not read here: it says one
-     byte per character, which a string of stray bytes satisfies too, so only
-     the walk below decides. */
+     bytes are. */
   if (RSTR_BINARY_P(s)) return TRUE;
   if (RSTR_VALID_ENC_P(s)) return TRUE;
+  /* The walk below reads the whole string to answer FALSE, so a string already
+     read as broken is answered off the mark that walk left instead. */
+  if (RSTR_BROKEN_ENC_P(s)) return FALSE;
+  /* A string of one character per byte holds nothing but ASCII, and ASCII
+     reads as UTF-8 as it stands, so it is valid without a walk. This is what
+     a string counted before it is asked about comes in carrying. */
+  if (RSTR_SINGLE_BYTE_P(s)) {
+    RSTR_SET_VALID_ENC_FLAG(s);
+    return TRUE;
+  }
 
   mrb_int byte_len = RSTR_LEN(s);
   mrb_bool valid = TRUE;
   mrb_int utf8_len = utf8_strlen_check(RSTR_PTR(s), byte_len, &valid);
 
-  if (!valid) return FALSE;
+  if (!valid) {
+    RSTR_SET_BROKEN_ENC_FLAG(s);
+    return FALSE;
+  }
   if (byte_len == utf8_len) RSTR_SET_SINGLE_BYTE_FLAG(s);
   RSTR_SET_VALID_ENC_FLAG(s);
+  return TRUE;
+}
+
+/* whether every byte of the string is ASCII. A walk that finds nothing else
+   made the statement MRB_STR_SINGLE_BYTE makes, so the answer is left there
+   for the next asker to read off. */
+static mrb_bool
+str_ascii_p(struct RString *s)
+{
+  if (RSTR_SINGLE_BYTE_P(s)) return TRUE;
+
+  const char *p = RSTR_PTR(s);
+  const char *e = p + RSTR_LEN(s);
+  if (search_nonascii(p, e) != e) return FALSE;
+  RSTR_SET_SINGLE_BYTE_FLAG(s);
   return TRUE;
 }
 
@@ -776,6 +859,7 @@ mrb_str_valid_encoding_p(mrb_state *mrb, mrb_value str)
   (void)str;
   return TRUE;
 }
+#define str_ascii_p(s) TRUE
 #endif
 
 /* memsearch_swar (SWAR stands for SIMD within a register)                 */
@@ -921,6 +1005,12 @@ mrb_str_byte_subseq(mrb_state *mrb, mrb_value str, mrb_int beg, mrb_int len)
     s->as.heap.len = (mrb_ssize)len;
   }
   RSTR_COPY_SINGLE_BYTE_FLAG(s, orig);
+  /* A subrange of a byte-read string holds nothing but bytes of it, so it is
+     read the same way. Neither answer about the encoding travels with it:
+     cutting can leave a character in pieces, and it can also cut away the
+     piece that spelled none, so a subrange inherits validity in neither
+     direction. */
+  RSTR_COPY_BINARY_FLAG(s, orig);
   return mrb_obj_value(s);
 }
 
@@ -1016,6 +1106,7 @@ str_replace(mrb_state *mrb, struct RString *s1, struct RString *s2)
   if (s1 == s2) return mrb_obj_value(s1);
   RSTR_COPY_SINGLE_BYTE_FLAG(s1, s2);
   RSTR_COPY_VALID_ENC_FLAG(s1, s2);
+  RSTR_COPY_BROKEN_ENC_FLAG(s1, s2);
   RSTR_COPY_BINARY_FLAG(s1, s2);
   if (RSTR_SHARED_P(s1)) {
     str_decref(mrb, s1->as.heap.aux.shared);
@@ -1188,6 +1279,7 @@ mrb_str_modify_keep_ascii(mrb_state *mrb, struct RString *s)
   /* Every in-place write reaches here, including the ones that keep the string
      ASCII, so this is where the walk's answer stops holding. */
   RSTR_UNSET_VALID_ENC_FLAG(s);
+  RSTR_UNSET_BROKEN_ENC_FLAG(s);
 }
 
 /*
@@ -1302,6 +1394,34 @@ mrb_str_plus(mrb_state *mrb, mrb_value a, mrb_value b)
   memcpy(pt, p, slen);
   memcpy(pt + slen, p2, s2len);
 
+  /* The sum is a string with no history, so its reading comes from the bytes
+     it was built out of rather than from either operand's standing. Two
+     byte-read operands stay that way, and one byte-read operand carrying a
+     byte above ASCII hands the sum bytes no other reading holds, so its
+     reading wins. A byte-read operand of ASCII bytes carries no such evidence
+     and yields to the other operand.
+
+     Two places this does not answer as CRuby does, both on purpose:
+
+     - `"abc".b + "def"` is UTF-8 here and ASCII-8BIT there. Where both
+       operands are entirely ASCII, CRuby keeps the receiver's encoding; this
+       rule is symmetric in the operands, because the one bit it tracks says
+       "bytes read as bytes landed here" and ASCII bytes never say that.
+       `mrb_str_cat_str()` answers ASCII-8BIT for the same pair, and the two
+       part company on purpose: appending changes a string that was already
+       being read some way, while `+` builds one that was not being read at
+       all. Following CRuby on `+` alone would put it at odds with `join`,
+       and following it there too would mean taking the byte reading back off
+       a string that carries it, which nothing here does.
+     - The pairs CRuby refuses outright with Encoding::CompatibilityError come
+       out byte-read, saying nothing rather than something false. mruby has no
+       such exception. */
+  if ((RSTR_BINARY_P(s) && RSTR_BINARY_P(s2)) ||
+      (RSTR_BINARY_P(s) && !str_ascii_p(s)) ||
+      (RSTR_BINARY_P(s2) && !str_ascii_p(s2))) {
+    t->flags |= MRB_STR_BINARY;
+  }
+
   return mrb_obj_value(t);
 }
 
@@ -1383,6 +1503,15 @@ mrb_str_times(mrb_state *mrb, mrb_value self)
   p[RSTR_LEN(str2)] = '\0';
   RSTR_COPY_SINGLE_BYTE_FLAG(str2, mrb_str_ptr(self));
   RSTR_COPY_VALID_ENC_FLAG(str2, mrb_str_ptr(self));
+  /* a repetition of a byte-read string holds nothing but its bytes over
+     again, so it is read the same way */
+  RSTR_COPY_BINARY_FLAG(str2, mrb_str_ptr(self));
+  /* A repetition of broken bytes reaches the same broken place the first copy
+     does, so it is broken too. Nought copies keep none of the bytes, and an
+     empty string is not broken whatever it was made from. */
+  if (len > 0) {
+    RSTR_COPY_BROKEN_ENC_FLAG(str2, mrb_str_ptr(self));
+  }
 
   return mrb_obj_value(str2);
 }
@@ -1717,6 +1846,13 @@ str_replace_partial(mrb_state *mrb, mrb_value src, mrb_int pos, mrb_int end, mrb
   memmove(strp + newlen - (len - end), strp + end, len - end);
   if (!mrb_nil_p(rep)) {
     memmove(strp + pos, RSTRING_PTR(rep), replen);
+    /* bytes spliced in mark the string they land in the way appended ones
+       do: byte-read bytes above ASCII spell no character here and hand
+       their reading over, ASCII bytes move nothing */
+    struct RString *repp = mrb_str_ptr(rep);
+    if (!RSTR_BINARY_P(str) && RSTR_BINARY_P(repp) && !str_ascii_p(repp)) {
+      str->flags |= MRB_STR_BINARY;
+    }
   }
   RSTR_SET_LEN(str, newlen);
   strp[newlen] = '\0';
@@ -1730,6 +1866,12 @@ str_replace_partial(mrb_state *mrb, mrb_value src, mrb_int pos, mrb_int end, mrb
 
 #define IS_EVSTR(p,e) ((p) < (e) && (*(p) == '$' || *(p) == '@' || *(p) == '{'))
 
+/* A `\xNN` escape spells its byte in upper case, as CRuby writes it.
+   `mrb_digitmap` is lower case because `Integer#to_s` reads a number
+   through it and CRuby spells that in lower case, so the two cannot share
+   one table. */
+static const char escape_hexmap[] = "0123456789ABCDEF";
+
 static mrb_value
 str_escape(mrb_state *mrb, mrb_value str, mrb_bool inspect)
 {
@@ -1737,7 +1879,8 @@ str_escape(mrb_state *mrb, mrb_value str, mrb_bool inspect)
   char buf[4];  /* `\x??` or UTF-8 character */
   mrb_value result = mrb_str_new_lit(mrb, "\"");
 #ifdef MRB_UTF8_STRING
-  uint32_t sb_flag = MRB_STR_SINGLE_BYTE;
+  uint32_t sb_flag = MRB_STR_SINGLE_BYTE;      /* what `result` comes out as */
+  uint32_t src_sb_flag = MRB_STR_SINGLE_BYTE;  /* what the walk found `str` to be */
 #endif
 
   p = RSTRING_PTR(str); pend = RSTRING_END(str);
@@ -1752,6 +1895,12 @@ str_escape(mrb_state *mrb, mrb_value str, mrb_bool inspect)
 #ifdef MRB_UTF8_STRING
     if (inspect) {
       mrb_int clen = mrb_utf8len(p, pend);
+      /* A non-ASCII byte either begins a character of several bytes or begins
+         no character at all, and either way `str` is not one byte per
+         character. The escape below turns the second into `\xNN`, so `result`
+         still is, and only a whole character copied across takes that from
+         it. */
+      if (NOASCII(*p)) src_sb_flag = 0;
       if (clen > 1) {
         mrb_str_cat(mrb, result, p, clen);
         p += clen-1;
@@ -1789,15 +1938,15 @@ str_escape(mrb_state *mrb, mrb_value str, mrb_bool inspect)
     }
     else {
       buf[1] = 'x';
-      buf[3] = mrb_digitmap[c % 16]; c /= 16;
-      buf[2] = mrb_digitmap[c % 16];
+      buf[3] = escape_hexmap[c % 16]; c /= 16;
+      buf[2] = escape_hexmap[c % 16];
       mrb_str_cat(mrb, result, buf, 4);
     }
   }
   mrb_str_cat_lit(mrb, result, "\"");
 #ifdef MRB_UTF8_STRING
   if (inspect) {
-    mrb_str_ptr(str)->flags |= sb_flag;
+    mrb_str_ptr(str)->flags |= src_sb_flag;
     mrb_str_ptr(result)->flags |= sb_flag;
   }
   else {
@@ -3370,6 +3519,7 @@ str_modify_cat(mrb_state *mrb, struct RString *s, mrb_int addlen)
       shared->reserved = off + s->as.heap.len + addlen;
       RSTR_UNSET_SINGLE_BYTE_FLAG(s);
       RSTR_UNSET_VALID_ENC_FLAG(s);
+      RSTR_UNSET_BROKEN_ENC_FLAG(s);
       return capa;
     }
   }
@@ -3467,10 +3617,30 @@ mrb_str_cat_cstr(mrb_state *mrb, mrb_value str, const char *ptr)
 MRB_API mrb_value
 mrb_str_cat_str(mrb_state *mrb, mrb_value str, mrb_value str2)
 {
-  if (mrb_str_ptr(str) == mrb_str_ptr(str2)) {
-    mrb_str_modify(mrb, mrb_str_ptr(str));
+  struct RString *s = mrb_str_ptr(str);
+  struct RString *s2 = mrb_str_ptr(str2);
+
+  if (s == s2) {
+    mrb_str_modify(mrb, s);
   }
-  return mrb_str_cat(mrb, str, RSTRING_PTR(str2), RSTRING_LEN(str2));
+  /* Appended bytes that were read as bytes and go above ASCII spell no
+     character in the string they land in, so they hand it the byte reading
+     along with themselves. ASCII bytes read the same under any reading and
+     say nothing. Decided before the append so a raise leaves the string as
+     it was, applied after so it lands on the string the append made.
+
+     The flag only ever goes on: a string already read as bytes stays read
+     that way whatever lands in it, which is where CRuby lifts an all-ASCII
+     byte-read receiver to the argument's encoding. Taking the reading back
+     off would mean a buffer turning into text partway through being filled.
+     mrb_str_plus() decides a fresh string instead and answers differently for
+     the same pair; the comment there has the boundary. */
+  mrb_bool binary = !RSTR_BINARY_P(s) && RSTR_BINARY_P(s2) && !str_ascii_p(s2);
+  mrb_value ret = mrb_str_cat(mrb, str, RSTRING_PTR(str2), RSTRING_LEN(str2));
+  if (binary) {
+    mrb_str_ptr(ret)->flags |= MRB_STR_BINARY;
+  }
+  return ret;
 }
 
 /*
@@ -3649,14 +3819,18 @@ mrb_str_byteslice(mrb_state *mrb, mrb_value str)
 static mrb_value
 sub_replace(mrb_state *mrb, mrb_value self)
 {
-  char *p, *match;
-  mrb_int plen, mlen;
+  mrb_value replace, pat;
   mrb_int found, offset;
+  mrb_bool self_taken = FALSE, match_taken = FALSE;
 
-  mrb_get_args(mrb, "ssi", &p, &plen, &match, &mlen, &found);
+  mrb_get_args(mrb, "SSi", &replace, &pat, &found);
   if (found < 0 || RSTRING_LEN(self) < found) {
     mrb_raise(mrb, E_RUNTIME_ERROR, "argument out of range");
   }
+  const char *p = RSTRING_PTR(replace);
+  mrb_int plen = RSTRING_LEN(replace);
+  const char *match = RSTRING_PTR(pat);
+  mrb_int mlen = RSTRING_LEN(pat);
   mrb_value result = mrb_str_new(mrb, 0, 0);
   for (mrb_int i=0; i<plen; i++) {
     if (p[i] != '\\' || i+1==plen) {
@@ -3670,14 +3844,17 @@ sub_replace(mrb_state *mrb, mrb_value self)
       break;
     case '`':
       mrb_str_cat(mrb, result, RSTRING_PTR(self), found);
+      self_taken = TRUE;
       break;
     case '&': case '0':
       mrb_str_cat(mrb, result, match, mlen);
+      match_taken = TRUE;
       break;
     case '\'':
       offset = found + mlen;
       if (RSTRING_LEN(self) > offset) {
         mrb_str_cat(mrb, result, RSTRING_PTR(self)+offset, RSTRING_LEN(self)-offset);
+        self_taken = TRUE;
       }
       break;
     case '1': case '2': case '3':
@@ -3689,6 +3866,20 @@ sub_replace(mrb_state *mrb, mrb_value self)
       mrb_str_cat(mrb, result, &p[i-1], 2);
       break;
     }
+  }
+  /* The splice holds bytes of the replacement and of whatever the escapes
+     copied in, so it is read as bytes exactly when one of those sources
+     handed it byte-read bytes above ASCII, the same as any other append.
+
+     A source is asked about as a whole, not about the part the escape
+     actually copied: how a string is read is a property of the string, which
+     is what CRuby asks too, so a `\`` that lands only on the ASCII head of a
+     byte-read subject still reports it. Narrowing this to the copied bytes
+     would answer differently from CRuby, not more precisely. */
+  if ((RSTR_BINARY_P(mrb_str_ptr(replace)) && !str_ascii_p(mrb_str_ptr(replace))) ||
+      (match_taken && RSTR_BINARY_P(mrb_str_ptr(pat)) && !str_ascii_p(mrb_str_ptr(pat))) ||
+      (self_taken && RSTR_BINARY_P(mrb_str_ptr(self)) && !str_ascii_p(mrb_str_ptr(self)))) {
+    mrb_str_ptr(result)->flags |= MRB_STR_BINARY;
   }
   return result;
 }

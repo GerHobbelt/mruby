@@ -344,6 +344,40 @@ assert("String#rindex with regexp") do
   assert_nil "hello".rindex(/l/, -10)
 end
 
+assert("String#rindex bounds the match start in characters") do
+  # The position `rindex` takes is a character offset and the one
+  # `byterindex` takes is a byte offset. On a single-byte subject the two
+  # name the same place, so only a multibyte one says which is being read.
+  skip unless __ENCODING__ == "UTF-8"
+  str = "あいうあいう"    # 6 characters, 18 bytes
+
+  assert_equal 4, str.rindex(/い/)
+  assert_equal 12, str.byterindex(/い/)
+
+  # 1 as a character offset is the second character, which the first `い` is;
+  # as a byte offset it is inside the first character and reaches no match at
+  # all
+  assert_equal 1, str.rindex(/い/, 1)
+  assert_nil str.rindex(/い/, 0)
+  assert_equal 3, str.byterindex(/い/, 3)
+
+  # 4 as a character offset reaches the second `い`, where the same number of
+  # bytes is still short of the first
+  assert_equal 4, str.rindex(/い/, 4)
+  assert_equal 1, str.rindex(/い/, 3)
+
+  # a negative position counts back in the same space it counts forward in
+  assert_equal 4, str.rindex(/い/, -1)
+  assert_equal 1, str.rindex(/い/, -3)
+
+  # overlapping matches stay in view across a multibyte character, where a
+  # walk that resumed at the match end would answer 0
+  assert_equal 1, "あああ".rindex(/ああ/)
+  assert_equal 3, "あああ".byterindex(/ああ/)
+  assert_equal ["あ", "ああ", ""], "あああ".rpartition(/ああ/)
+  assert_equal ["あい", "うあ", "いう"], str.rpartition(/うあ/)
+end
+
 assert("String#index and String#rindex with regexp set the match globals") do
   assert_equal 1, "abc".index(/(b)/)
   assert_equal "b", $1
@@ -542,6 +576,45 @@ assert("String#partition and String#rpartition with regexp set the match globals
   "zzz" =~ /z/
   assert_equal ["", "", "abc"], "abc".rpartition(/x/)
   assert_nil $~
+end
+
+assert("a backward search publishes every global of the match it settled on") do
+  # `$~` and `$1` are what the tests above read back. The rest of what a match
+  # leaves behind is published by the same act and is asserted here, since the
+  # walk these three share passes matches on the way to the one it answers
+  # with and none of those may be what is left standing.
+  assert_equal 4, "abcabc".rindex(/(b)(c)/)
+  assert_equal "bc", $&
+  assert_equal "abca", $`
+  assert_equal "", $'
+  assert_equal "b", $1
+  assert_equal "c", $2
+  assert_equal "c", $+
+  assert_equal "abca", $~.pre_match
+  assert_equal "", $~.post_match
+
+  assert_equal 4, "abcabc".byterindex(/(b)(c)/)
+  assert_equal "bc", $&
+  assert_equal "abca", $`
+
+  assert_equal ["abca", "bc", ""], "abcabc".rpartition(/(b)(c)/)
+  assert_equal "bc", $&
+  assert_equal "abca", $`
+  assert_equal "c", $+
+
+  # a group that did not take part leaves nil behind, and `$+` reaches past it
+  assert_equal 1, "abc".rindex(/(b)(z)?/)
+  assert_nil $2
+  assert_equal "b", $+
+
+  # and a search that finds nothing clears all of them, not `$~` alone
+  "zzz" =~ /(z)/
+  assert_nil "abc".rindex(/x/)
+  assert_nil $&
+  assert_nil $`
+  assert_nil $'
+  assert_nil $1
+  assert_nil $+
 end
 
 assert("String#partition and String#rpartition delegate every non-regexp argument") do

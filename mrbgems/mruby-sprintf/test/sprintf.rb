@@ -137,11 +137,74 @@ assert('sprintf("%c") with an integer that has no UTF-8 encoding') do
   # whatever byte the stack happened to hold there.
   assert_raise(ArgumentError) { sprintf("%c", 0x110000) }
   assert_raise(ArgumentError) { sprintf("%c", -1) }
-  # The encoder takes a uint32_t, so a value that wraps into the Unicode range
-  # must not come out as the character it wraps to. The shift is computed at
-  # run time because the constant folder would reject the literal on a build
-  # with a 32-bit mrb_int and no bigint, where there is nothing to test.
+  # A value that would land inside the Unicode range if it were truncated to
+  # 32 bits must not come out as the character it truncates to.
+  # The shift width comes from a variable because `1 << 32` written out is
+  # constant folded, and the fold fails while this file is compiled on
+  # MRB_INT32 without bigint, dropping every test in it.
   shift = 32
-  wrapping = ((1 << shift) + 0x41) rescue nil
-  assert_raise(ArgumentError) { sprintf("%c", wrapping) } if wrapping.is_a?(Integer)
+  wrapping = nil
+  wide = begin
+    wrapping = (1 << shift) + 0x41  # RangeError where mrb_int is 32 bits and bigint is absent
+    [][wrapping]                    # nil for an mrb_int index, RangeError for a big integer
+    true
+  rescue RangeError
+    false
+  end
+  # A big integer is not an mrb_int either: `%c` takes it down the branch for
+  # an argument that is not an integer and refuses it there, so the encoder
+  # never sees the value and the truncation this guards against never runs.
+  assert_raise(ArgumentError) { sprintf("%c", wrapping) } if wide
+end
+
+assert('sprintf("%c") with a UTF-16 surrogate') do
+  skip unless __ENCODING__ == "UTF-8"
+  # A surrogate has a spelling here even though it is not a character: CRuby
+  # writes these three bytes too, and refuses the value in Integer#chr rather
+  # than here. So what the encoder writes is wider than what the character
+  # scanner reads back, and the string it builds is not valid UTF-8.
+  assert_equal "\xED\xA0\x80", sprintf("%c", 0xD800)
+  assert_equal "\xED\xBF\xBF", sprintf("%c", 0xDFFF)
+  assert_equal "\xED\x9F\xBF", sprintf("%c", 0xD7FF)
+  assert_equal "\xEE\x80\x80", sprintf("%c", 0xE000)
+end
+
+assert('what the string sprintf builds claims') do
+  # The bytes go through: a byte-read argument lands in the result whole, and
+  # a byte-read format string lays its own bytes down as they are. The reading
+  # goes with them now: the format string's own reading is what the result is
+  # built with, and an argument read as bytes and going above ASCII hands it
+  # over the way any appended byte-read bytes do. Whether a string is read as
+  # bytes or as UTF-8 is only visible through mruby-encoding, so ask only
+  # where it is present.
+  skip unless "".respond_to?(:encoding)
+  skip unless __ENCODING__ == "UTF-8"
+  bin = 171.chr   # a byte spelling no character, read as bytes
+  assert_equal [171], ("%s" % [bin]).bytes
+  ["%s" % [bin], "[%s]" % [bin], "%10s" % [bin], "%-10s" % [bin],
+   "%s %s" % [bin, "x"], "%<x>s" % {x: bin}, "%{x}" % {x: bin},
+   "%c" % [bin], sprintf("%s", bin)].each do |s|
+    assert_equal Encoding::BINARY, s.encoding
+    assert_true s.valid_encoding?
+  end
+  # what an argument is read as is a property of the argument, so precision
+  # cutting the byte above ASCII off the written part moves nothing
+  assert_equal Encoding::BINARY, ("%.1s" % ["a\xABb".force_encoding(Encoding::BINARY)]).encoding
+  # a byte-read format string, with nothing written into it and with an
+  # argument written into it
+  assert_equal Encoding::BINARY, ("ab".force_encoding(Encoding::BINARY) % []).encoding
+  assert_equal Encoding::BINARY, ("%s".force_encoding(Encoding::BINARY) % ["ab"]).encoding
+  # what says nothing about the reading either way: ASCII bytes read the same
+  # under any reading, an Integer is a code point, and inspect builds a string
+  # of its own
+  assert_equal Encoding::UTF_8, ("%s" % ["ab".force_encoding(Encoding::BINARY)]).encoding
+  assert_equal Encoding::UTF_8, ("%c" % [171]).encoding
+  assert_equal Encoding::UTF_8, ("%d" % [171]).encoding
+  assert_equal Encoding::UTF_8, ("%p" % [bin]).encoding
+  # A byte-read format string of nothing but ASCII keeps the byte reading even
+  # where the argument is UTF-8 and goes above ASCII. CRuby answers UTF-8 here:
+  # its rule lets an all-ASCII side yield to the other one, and this one never
+  # takes the byte reading back off a string that carries it. `"".b << "あ"`
+  # is the same cell, answered the same way on purpose.
+  assert_equal Encoding::BINARY, ("%s".force_encoding(Encoding::BINARY) % ["あ"]).encoding
 end

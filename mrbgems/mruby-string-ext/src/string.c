@@ -20,7 +20,17 @@ int_chr_binary(mrb_state *mrb, mrb_value num)
   }
   char c = (char)cp;
   mrb_value str = mrb_str_new(mrb, &c, 1);
-  RSTR_SET_ASCII_FLAG(mrb_str_ptr(str));
+  /* A byte below 0x80 is a character of its own and the string is ASCII. Above
+     it the byte spells no UTF-8 character at all, so the string is not one
+     character per byte and saying that it is left every reader of the flag
+     handing the byte back as a character. What it is instead is a string read
+     by bytes, which is what MRB_STR_BINARY says. */
+  if (cp < 0x80) {
+    RSTR_SET_ASCII_FLAG(mrb_str_ptr(str));
+  }
+  else {
+    mrb_str_ptr(str)->flags |= MRB_STR_BINARY;
+  }
   return str;
 }
 
@@ -33,11 +43,14 @@ int_chr_utf8(mrb_state *mrb, mrb_value num)
   mrb_int len;
   mrb_value str;
 
-  /* Reject negative, above U+10FFFF, and UTF-16 surrogates (RFC 3629). */
-  if (cp < 0 || 0x10FFFF < cp || (0xD800 <= cp && cp <= 0xDFFF)) {
+  /* A value outside the Unicode range spells no character and comes back as a
+     zero length. A surrogate does spell one to the encoder, because CRuby's
+     sprintf("%c") and pack("U") spell one; Integer#chr is where CRuby refuses
+     it, so the refusal belongs here rather than in the encoder. */
+  len = mrb_utf8_to_buf(utf8, cp);
+  if (len == 0 || (0xD800 <= cp && cp <= 0xDFFF)) {
     mrb_raisef(mrb, E_RANGE_ERROR, "%v out of char range", num);
   }
-  len = mrb_utf8_to_buf(utf8, (uint32_t)cp);
   str = mrb_str_new(mrb, utf8, len);
   if (len == 1) {
     RSTR_SET_ASCII_FLAG(mrb_str_ptr(str));
@@ -98,6 +111,23 @@ str_swapcase(mrb_state *mrb, mrb_value self)
   return str;
 }
 
+/* Bytes that were read as bytes and go above ASCII spell no character in the
+   string they are spliced into, so they hand it the byte reading along with
+   themselves, the same as an append through mrb_str_cat_str(). ASCII bytes
+   read the same under any reading and move nothing. */
+static void
+str_mark_spliced_bytes(mrb_value recv, mrb_value src)
+{
+  struct RString *r = mrb_str_ptr(recv);
+  struct RString *s = mrb_str_ptr(src);
+
+  if (RSTR_BINARY_P(r) || !RSTR_BINARY_P(s)) return;
+  const char *p = RSTR_PTR(s);
+  const char *e = p + RSTR_LEN(s);
+  while (p < e && !(*p & 0x80)) p++;
+  if (p < e) r->flags |= MRB_STR_BINARY;
+}
+
 static void
 str_concat(mrb_state *mrb, mrb_value self, mrb_value str, mrb_bool binary)
 {
@@ -115,7 +145,15 @@ str_concat(mrb_state *mrb, mrb_value self, mrb_value str, mrb_bool binary)
   }
   else
     mrb_ensure_string_type(mrb, str);
-  mrb_str_cat_str(mrb, self, str);
+  if (binary) {
+    /* append_as_bytes takes only the bytes of its argument, and a byte-read
+       receiver already reads everything as bytes, so neither lets the
+       argument's own reading move the receiver's. */
+    mrb_str_cat(mrb, self, RSTRING_PTR(str), RSTRING_LEN(str));
+  }
+  else {
+    mrb_str_cat_str(mrb, self, str);
+  }
 }
 
 static mrb_value
@@ -970,25 +1008,18 @@ str_succ(mrb_state *mrb, mrb_value self)
 
 #ifdef MRB_UTF8_STRING
 /* Decodes the UTF-8 character starting at p, storing its byte length through
-   lenp when that is not NULL. mrb_utf8len() answers 1 for every sequence it
-   rejects, so a lead byte measured as one byte is invalid. */
+   lenp when that is not NULL. mrb_utf8_decode() hands back a rejected
+   sequence as its lead byte over one byte; String treats that as an error. */
 MRB_INLINE mrb_int
 utf8code(mrb_state* mrb, const unsigned char* p, const unsigned char *e, mrb_int *lenp)
 {
-  mrb_int len = mrb_utf8len((const char*)p, (const char*)e);
+  mrb_int len;
+  uint32_t cp = mrb_utf8_decode((const char*)p, (const char*)e, &len);
   if (lenp) *lenp = len;
-  if (len == 1) {
-    if (p[0] >= 0x80) {
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid UTF-8 byte sequence");
-    }
-    return p[0];
+  if (len == 1 && p[0] >= 0x80) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid UTF-8 byte sequence");
   }
-
-  mrb_int cp = p[0] & (0xff >> (len + 1));
-  for (mrb_int i = 1; i < len; i++) {
-    cp = (cp << 6) | (p[i] & 0x3f);
-  }
-  return cp;
+  return (mrb_int)cp;
 }
 
 static mrb_value
@@ -1425,7 +1456,11 @@ str_lines(mrb_state *mrb, mrb_value self)
     while (p < e && *p != '\n') p++;
     if (*p == '\n') p++;
     mrb_int len = (mrb_int) (p - t);
-    mrb_ary_push(mrb, result, mrb_str_new(mrb, t, len));
+    /* a line of a byte-read string is a subrange of its bytes, read the
+       same way */
+    mrb_value line = mrb_str_new(mrb, t, len);
+    RSTR_COPY_BINARY_FLAG(mrb_str_ptr(line), mrb_str_ptr(self));
+    mrb_ary_push(mrb, result, line);
     mrb_gc_arena_restore(mrb, ai);
   }
   return result;
@@ -1752,8 +1787,8 @@ str_chars_ary(mrb_state *mrb, mrb_value self)
   struct RString *s = mrb_str_ptr(self);
   const char *p = RSTR_PTR(s);
   const char *e = p + RSTR_LEN(s);
-  /* the count comes first: it is the exact capacity, and it settles the
-     single-byte flag the walk reads */
+  /* the count comes first: it is the exact capacity, and where every byte is
+     ASCII it also settles the single-byte flag the walk reads */
   mrb_value result = mrb_ary_new_capa(mrb, mrb_str_char_len(mrb, self));
 
 #ifdef MRB_UTF8_STRING
@@ -1767,9 +1802,12 @@ str_chars_ary(mrb_state *mrb, mrb_value self)
   }
 #endif
 
-  /* one character per byte */
+  /* one character per byte; a piece of a byte-read string is read the same
+     way, so the marking goes with each one */
   while (p < e) {
-    mrb_ary_push(mrb, result, mrb_str_new(mrb, p, 1));
+    mrb_value piece = mrb_str_new(mrb, p, 1);
+    RSTR_COPY_BINARY_FLAG(mrb_str_ptr(piece), s);
+    mrb_ary_push(mrb, result, piece);
     p++;
   }
   return result;
@@ -1872,7 +1910,13 @@ str_rjust_core(mrb_state *mrb, mrb_value self)
     }
   }
 
-  return mrb_str_cat_str(mrb, padding, self);
+  mrb_value result = mrb_str_cat_str(mrb, padding, self);
+  /* the padded string is the receiver's bytes in wider clothes, so it is
+     read the way the receiver was, ASCII bytes and all */
+  if (RSTR_BINARY_P(mrb_str_ptr(self))) {
+    mrb_str_ptr(result)->flags |= MRB_STR_BINARY;
+  }
+  return result;
 }
 
 /*
@@ -1940,7 +1984,13 @@ str_center_core(mrb_state *mrb, mrb_value self)
   }
 
   mrb_value result = mrb_str_cat_str(mrb, left_padding, self);
-  return mrb_str_cat_str(mrb, result, right_padding);
+  result = mrb_str_cat_str(mrb, result, right_padding);
+  /* the padded string is the receiver's bytes in wider clothes, so it is
+     read the way the receiver was, ASCII bytes and all */
+  if (RSTR_BINARY_P(mrb_str_ptr(self))) {
+    mrb_str_ptr(result)->flags |= MRB_STR_BINARY;
+  }
+  return result;
 }
 
 static mrb_value
@@ -2005,6 +2055,10 @@ mrb_str_slice_bang(mrb_state *mrb, mrb_value self)
   }
 
   mrb_value result = mrb_str_new(mrb, RSTRING_PTR(self) + byte_beg, byte_len);
+  /* the piece cut out is a subrange of the receiver's bytes, read the same
+     way; copied rather than shared, since the memmove below would slide the
+     receiver's remaining bytes through a shared buffer */
+  RSTR_COPY_BINARY_FLAG(mrb_str_ptr(result), str);
 
   mrb_str_modify(mrb, str);
   ptr = RSTRING_PTR(self);
@@ -2030,6 +2084,17 @@ str_clear(mrb_state *mrb, mrb_value self)
   mrb_str_modify(mrb, s);
   RSTR_SET_LEN(s, 0);
   return self;
+}
+
+/* A piece cut out of a string holds nothing but bytes of it, so it is read the
+   way the string is. An empty piece stands for a place in the string and is
+   read the same way, having no bytes to say otherwise. */
+static mrb_value
+str_cut_piece(mrb_state *mrb, mrb_value str, const char *p, mrb_int len)
+{
+  mrb_value piece = mrb_str_new(mrb, p, len);
+  RSTR_COPY_BINARY_FLAG(mrb_str_ptr(piece), mrb_str_ptr(str));
+  return piece;
 }
 
 /*
@@ -2061,8 +2126,8 @@ str_partition(mrb_state *mrb, mrb_value self)
   mrb_value result_ary = mrb_ary_new_capa(mrb, 3);
 
   if (sep_len == 0) {
-    mrb_ary_push(mrb, result_ary, mrb_str_new_lit(mrb, ""));
-    mrb_ary_push(mrb, result_ary, mrb_str_new_lit(mrb, ""));
+    mrb_ary_push(mrb, result_ary, str_cut_piece(mrb, self, self_ptr, 0));
+    mrb_ary_push(mrb, result_ary, mrb_str_dup(mrb, sep));
     mrb_ary_push(mrb, result_ary, mrb_str_dup(mrb, self));
     return result_ary;
   }
@@ -2083,14 +2148,14 @@ str_partition(mrb_state *mrb, mrb_value self)
     mrb_int pre_len = found_ptr - self_ptr;
     mrb_int post_len = self_len - pre_len - sep_len;
 
-    mrb_ary_push(mrb, result_ary, mrb_str_new(mrb, self_ptr, pre_len));
+    mrb_ary_push(mrb, result_ary, str_cut_piece(mrb, self, self_ptr, pre_len));
     mrb_ary_push(mrb, result_ary, mrb_str_dup(mrb, sep));
-    mrb_ary_push(mrb, result_ary, mrb_str_new(mrb, found_ptr + sep_len, post_len));
+    mrb_ary_push(mrb, result_ary, str_cut_piece(mrb, self, found_ptr + sep_len, post_len));
   }
   else {
     mrb_ary_push(mrb, result_ary, mrb_str_dup(mrb, self));
-    mrb_ary_push(mrb, result_ary, mrb_str_new_lit(mrb, ""));
-    mrb_ary_push(mrb, result_ary, mrb_str_new_lit(mrb, ""));
+    mrb_ary_push(mrb, result_ary, str_cut_piece(mrb, self, self_ptr, 0));
+    mrb_ary_push(mrb, result_ary, str_cut_piece(mrb, self, self_ptr, 0));
   }
 
   return result_ary;
@@ -2126,8 +2191,8 @@ str_rpartition(mrb_state *mrb, mrb_value self)
 
   if (sep_len == 0) {
     mrb_ary_push(mrb, result_ary, mrb_str_dup(mrb, self));
-    mrb_ary_push(mrb, result_ary, mrb_str_new_lit(mrb, ""));
-    mrb_ary_push(mrb, result_ary, mrb_str_new_lit(mrb, ""));
+    mrb_ary_push(mrb, result_ary, mrb_str_dup(mrb, sep));
+    mrb_ary_push(mrb, result_ary, str_cut_piece(mrb, self, self_ptr, 0));
     return result_ary;
   }
 
@@ -2147,13 +2212,13 @@ str_rpartition(mrb_state *mrb, mrb_value self)
     mrb_int pre_len = found_ptr - self_ptr;
     mrb_int post_len = self_len - pre_len - sep_len;
 
-    mrb_ary_push(mrb, result_ary, mrb_str_new(mrb, self_ptr, pre_len));
+    mrb_ary_push(mrb, result_ary, str_cut_piece(mrb, self, self_ptr, pre_len));
     mrb_ary_push(mrb, result_ary, mrb_str_dup(mrb, sep));
-    mrb_ary_push(mrb, result_ary, mrb_str_new(mrb, found_ptr + sep_len, post_len));
+    mrb_ary_push(mrb, result_ary, str_cut_piece(mrb, self, found_ptr + sep_len, post_len));
   }
   else {
-    mrb_ary_push(mrb, result_ary, mrb_str_new_lit(mrb, ""));
-    mrb_ary_push(mrb, result_ary, mrb_str_new_lit(mrb, ""));
+    mrb_ary_push(mrb, result_ary, str_cut_piece(mrb, self, self_ptr, 0));
+    mrb_ary_push(mrb, result_ary, str_cut_piece(mrb, self, self_ptr, 0));
     mrb_ary_push(mrb, result_ary, mrb_str_dup(mrb, self));
   }
 
@@ -2203,6 +2268,7 @@ str_insert(mrb_state *mrb, mrb_value self)
   char *p = RSTRING_PTR(self);
   memmove(p + idx + insert_len, p + idx, self_len - idx);
   memcpy(p + idx, RSTRING_PTR(str_to_insert), insert_len);
+  str_mark_spliced_bytes(self, str_to_insert);
 
   return self;
 }
@@ -2276,6 +2342,7 @@ str_prepend(mrb_state *mrb, mrb_value self)
       memcpy(p + offset, src, arg_len);
       offset += arg_len;
     }
+    str_mark_spliced_bytes(self, argv[i]);
   }
 
   return self;
