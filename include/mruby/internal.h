@@ -257,6 +257,17 @@ mrb_int mrb_str_byte_to_char(mrb_state *mrb, mrb_value str, mrb_int bi);
    definition in string.c for what it reads and what it leaves behind. */
 mrb_bool mrb_str_valid_encoding_p(mrb_state *mrb, mrb_value str);
 
+#ifdef MRB_UTF8_STRING
+/* What RSTR_SINGLE_BYTE_P() reads, asking the bytes where the string does not
+   say rather than answering no for one nothing has read yet. See the
+   definition in string.c for what it leaves behind.
+
+   Only a build that reads its strings as characters has anything to tell a
+   single-byte string from, so a build indexing by byte carries no answer here
+   rather than one saying TRUE of every string. */
+mrb_bool mrb_str_single_byte_p(mrb_state *mrb, mrb_value str);
+#endif
+
 /* Raise IndexError when `pos` lands inside a character of `str`, and return
    otherwise. See the definition in string.c for which offsets are positions
    the string has; a build without MRB_UTF8_STRING has one per byte, so this
@@ -376,11 +387,13 @@ int mrb_str_case_convert_unicode(mrb_state *mrb, mrb_value str, enum mrb_case_mo
 #define mrb_str_case_convert_unicode(mrb, str, mode) (-1)
 #endif
 
-#ifdef MRB_UTF8_STRING
+#if defined(MRB_UTF8_STRING) && !defined(MRB_USE_ASCII_CASE)
 /* What case a character has, from the tables in unicase.c. A string is
    converted through mrb_str_case_convert_unicode() above; these are for a
    caller holding a codepoint rather than a string, which is mruby-regexp
-   under /i. */
+   under /i. A build converting case by ASCII compiles none of this, the
+   table under it being what it asked to leave behind, so a caller reaching
+   for one of these there is a compile error rather than a link one. */
 
 /* Which table a character is looked up in. The last three hold a difference
    rather than a mapping: title case against upper case, swapping against the
@@ -403,10 +416,11 @@ enum mrb_case_kind {
    bytes it took, or 0 for a character that maps to itself. */
 mrb_int mrb_uni_case_map(enum mrb_case_kind kind, uint32_t cp, char *buf);
 
-#ifdef MRB_UNICODE_CASE
-/* The foldings below are what /i reads under MRB_UNICODE_CASE, and the walks
-   over the table cost more than the table itself, so a build that does not
-   ask for them does not carry them. */
+#ifdef HAVE_MRUBY_REGEXP_GEM
+/* The four below are the foldings /i reads off the same table, in the two
+   directions a pattern needs them. A build without mruby-regexp has nothing
+   that reads them, so a caller reaching for one there is a compile error
+   rather than a link one. */
 
 /* Simple case folding: the folded codepoint, or cp itself when it folds to
    nothing else. A codepoint whose folding spells several characters (U+FB00
@@ -430,8 +444,8 @@ void mrb_uni_case_fold_range(uint32_t lo, uint32_t hi,
                              void (*add)(void *, uint32_t, uint32_t), void *user);
 void mrb_uni_case_unfold_range(uint32_t lo, uint32_t hi,
                                void (*add)(void *, uint32_t, uint32_t), void *user);
-#endif  /* MRB_UNICODE_CASE */
-#endif
+#endif  /* HAVE_MRUBY_REGEXP_GEM */
+#endif  /* MRB_UTF8_STRING && !MRB_USE_ASCII_CASE */
 
 /* attr accessor bodies (class.c); the VM compares function pointers against
    these to run attr calls without a full method-call frame */

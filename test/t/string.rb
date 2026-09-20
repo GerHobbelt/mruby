@@ -2,6 +2,7 @@
 # String ISO Test
 
 UTF8STRING = __ENCODING__ == "UTF-8"
+UNICODECASE = "\u00C4".downcase == "\u00E4"
 
 assert('String', '15.2.10') do
   assert_equal Class, String.class
@@ -90,6 +91,17 @@ assert('String#[](UTF-8) indexes a byte that spells no character on its own') do
   assert_equal "b", "a\xE3\x81b"[3]
   assert_equal "\x80", "あ\x80"[1]
   assert_equal "あ", "\x80あ"[1]
+end if UTF8STRING
+
+assert('String#[](UTF-8) counts a negative index back from the end') do
+  # Stepping back off the first character leaves the string, so a negative
+  # index reaching past the head names no position rather than wrapping to
+  # one. The length the range asks for is clamped to what is left after it.
+  assert_equal "あ", "あい"[-2]
+  assert_nil "あい"[-3]
+  assert_equal "あ", "あい"[-2, 1]
+  assert_nil "あい"[-3, 1]
+  assert_equal "あい", "あい"[-2, 5]
 end if UTF8STRING
 
 assert('String#[] with Range') do
@@ -331,7 +343,7 @@ assert('String#capitalize - Unicode') do
   assert_equal 'Ა', 'ა'.upcase
   assert_equal 'ა', 'ა'.capitalize
   assert_nil 'ა'.capitalize!
-end if UTF8STRING
+end if UNICODECASE
 
 assert('String#downcase - Unicode') do
   assert_equal 'äöü', 'ÄÖÜ'.downcase
@@ -348,7 +360,7 @@ assert('String#downcase - Unicode') do
   # A script without case has nothing to map.
   assert_equal '日本', '日本'.downcase
   assert_nil '日本'.downcase!
-end if UTF8STRING
+end if UNICODECASE
 
 assert('String case conversion - bytes that spell no character') do
   # A run of bytes that spells no character has no case, and answering as
@@ -366,7 +378,7 @@ assert('String case conversion - bytes that spell no character') do
   # conversion that would have changed nothing.
   assert_raise(ArgumentError) { "abc\x80".downcase }
   assert_raise(ArgumentError) { "\x80".downcase }
-end if UTF8STRING
+end if UNICODECASE
 
 assert('String#upcase - Unicode') do
   assert_equal 'ÄÖÜ', 'äöü'.upcase
@@ -380,7 +392,7 @@ assert('String#upcase - Unicode') do
   assert_equal 1, 'ı'.upcase.bytesize
   assert_equal '日本', '日本'.upcase
   assert_nil '日本'.upcase!
-end if UTF8STRING
+end if UNICODECASE
 
 assert('String#chomp', '15.2.10.5.9') do
   a = 'abc'.chomp

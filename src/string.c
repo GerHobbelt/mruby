@@ -722,6 +722,22 @@ str_ascii_p(struct RString *s)
   return TRUE;
 }
 
+/* Whether a character index into this string is already a byte index, asking
+   the bytes where the string does not say. RSTR_SINGLE_BYTE_P() reads what is
+   recorded and answers no for a string nothing has read yet, which sends every
+   later caller down the walking path however plain the bytes are. A string is
+   walked whole at most once here: the walk records what it finds, and it is
+   the same walk the character indexing would go on to do anyway. */
+mrb_bool
+mrb_str_single_byte_p(mrb_state *mrb, mrb_value str)
+{
+  struct RString *s = mrb_str_ptr(str);
+  if (RSTR_CODERANGE(s) == MRB_STR_CODERANGE_UNKNOWN) {
+    mrb_str_valid_encoding_p(mrb, str);
+  }
+  return RSTR_SINGLE_BYTE_P(s);
+}
+
 /* map character index to byte offset index */
 mrb_int
 mrb_str_char_to_byte(mrb_state *mrb, mrb_value str, mrb_int off, mrb_int idx)
@@ -740,16 +756,14 @@ mrb_str_char_to_byte(mrb_state *mrb, mrb_value str, mrb_int off, mrb_int idx)
 
   while (p<e && i<idx) {
     if ((*p & 0x80) == 0) {
-      const char *np = search_nonascii(p, e);
-      ptrdiff_t alen = np - p;
-      if (idx < i+alen) {
-        p += idx-i;
-        i=idx;
-      }
-      else {
-        p = np;
-        i += alen;
-      }
+      /* Every ASCII byte stands for a character of its own, so the run only
+         has to be followed as far as the index asks for. Reading to the end of
+         the string instead makes finding the character just past the head cost
+         what finding the last one does. */
+      const char *lim = (e - p) > (idx - i) ? p + (idx - i) : e;
+      const char *np = search_nonascii(p, lim);
+      i += np - p;
+      p = np;
     }
     else {
       p += mrb_utf8len(p, e);
@@ -1027,12 +1041,57 @@ mrb_str_beg_len(mrb_int str_len, mrb_int *begp, mrb_int *lenp)
   return TRUE;
 }
 
+#ifdef MRB_UTF8_STRING
+/* What a substring needs of the string is where two positions are, not how
+   many the string has. Counting the whole of it to find that out reads every
+   byte however near the head the range sits, so the walk here stops at the
+   range instead: forward to `beg` for a position counted from the head, and
+   backward from the end for one counted from there. A position past the end is
+   what the forward walk reports by coming back longer than the string, since
+   mrb_str_char_to_byte() answers one byte more than it reached when the string
+   ends before the index does. */
+static mrb_value
+str_substr(mrb_state *mrb, mrb_value str, mrb_int beg, mrb_int len)
+{
+  struct RString *s = mrb_str_ptr(str);
+  mrb_int slen = RSTR_LEN(s);
+
+  if (mrb_str_single_byte_p(mrb, str)) {
+    return mrb_str_beg_len(slen, &beg, &len) ?
+      mrb_str_byte_subseq(mrb, str, beg, len) : mrb_nil_value();
+  }
+  if (len < 0) return mrb_nil_value();
+
+  const char *o = RSTR_PTR(s);
+  mrb_int bbeg;
+  if (beg < 0) {
+    const char *e = o + slen;
+    const char *p = e;
+    for (mrb_int n = beg; n < 0; n++) {
+      /* stepping back off the first character leaves the string, which is the
+         negative index that names no position */
+      if (p == o) return mrb_nil_value();
+      p = mrb_utf8_char_head(o, p-1, e);
+    }
+    bbeg = (mrb_int)(p - o);
+  }
+  else {
+    bbeg = mrb_str_char_to_byte(mrb, str, 0, beg);
+    if (bbeg > slen) return mrb_nil_value();
+  }
+
+  mrb_int blen = mrb_str_char_to_byte(mrb, str, bbeg, len);
+  if (blen > slen - bbeg) blen = slen - bbeg;
+  return mrb_str_byte_subseq(mrb, str, bbeg, blen);
+}
+#else
 static mrb_value
 str_substr(mrb_state *mrb, mrb_value str, mrb_int beg, mrb_int len)
 {
   return mrb_str_beg_len(mrb_str_char_len(mrb, str), &beg, &len) ?
     str_subseq(mrb, str, beg, len) : mrb_nil_value();
 }
+#endif
 
 /*
  * @param mrb The mruby state.
@@ -1127,10 +1186,15 @@ str_byterindex(mrb_value str, mrb_value sub, mrb_int pos)
 
   sbeg = RSTR_PTR(ps);
   t = RSTRING_PTR(sub);
+  /* The first byte has to match wherever the rest does, and comparing it here
+     settles all but the positions that carry it. Handing every position to
+     memcmp() instead pays for a call at each one, which is what the search
+     spends nearly all of its time on where the needle is not there to find. */
+  const char head = t[0];
   /* count down an index rather than a pointer: stepping a pointer past the
      first byte to end the search would leave the buffer */
   for (mrb_int i = pos; 0 <= i; i--) {
-    if (memcmp(sbeg+i, t, len) == 0) {
+    if (sbeg[i] == head && memcmp(sbeg+i, t, len) == 0) {
       return i;
     }
   }
@@ -1162,8 +1226,11 @@ str_char_rindex(mrb_value str, mrb_value sub, mrb_int pos)
     /* a match may start only at a character boundary, and `pos` need not be
        one: the clamp above answers the last byte `sub` fits at */
     s = mrb_utf8_char_head(sbeg, s, send);
+    /* see str_byterindex(): the first byte settles all but the positions
+       carrying it, and it is read here anyway to step back from */
+    const char head = t[0];
     for (;;) {
-      if ((mrb_int)(send - s) >= len && memcmp(s, t, len) == 0) {
+      if (*s == head && (mrb_int)(send - s) >= len && memcmp(s, t, len) == 0) {
         return (mrb_int)(s - sbeg);
       }
       /* the character before `s`, which there is none of once the search has
@@ -1999,7 +2066,7 @@ mrb_str_aset_m(mrb_state *mrb, mrb_value str)
   return replace;
 }
 
-#ifdef MRB_UTF8_STRING
+#if defined(MRB_UTF8_STRING) && !defined(MRB_USE_ASCII_CASE)
 
 /* What the walk below makes of an ASCII character. Each method keeps its own
    loop over a string that holds nothing but ASCII, so this is reached only for
@@ -2114,9 +2181,24 @@ mrb_str_case_convert_unicode(mrb_state *mrb, mrb_value str, enum mrb_case_mode m
   if (RSTR_BINARY_P(s) || str_ascii_p(s)) return -1;
 
   str_modify_keep_cr(mrb, s);
-  if (RSTR_LEN(s) == 0 || RSTR_PTR(s) == NULL) return -1;
 
   return str_case_convert_utf8(mrb, str, mode) ? 1 : 0;
+}
+
+#elif defined(MRB_UTF8_STRING)
+
+/* The walk above is what a build asking for ASCII case gives up, and this is
+   where it says so: every caller of it converts the ASCII of a string in a
+   loop of its own and reaches for the walk only where the string holds more.
+   Answering that there was nothing to walk sends each of them back to that
+   loop, which is the conversion such a build asked for. */
+int
+mrb_str_case_convert_unicode(mrb_state *mrb, mrb_value str, enum mrb_case_mode mode)
+{
+  (void)mrb;
+  (void)str;
+  (void)mode;
+  return -1;
 }
 
 #endif  /* MRB_UTF8_STRING */
@@ -2257,6 +2339,14 @@ mrb_str_chomp_bang(mrb_state *mrb, mrb_value str)
     if (!RSTR_SINGLE_BYTE_P(s) && mrb_utf8_char_head(p, pp, p + len) != pp) {
       return mrb_nil_value();
     }
+    /* Cutting bytes that are nothing but ASCII leaves what the rest is read as
+       standing, non-ASCII and all, so the coderange str_modify_keep_cr() kept
+       is still the answer. Cutting a non-ASCII byte can have taken the last of
+       them, and a string of nothing but ASCII stands at 7BIT rather than
+       VALID: what it is has to be asked again. */
+    if (search_nonascii(pp, pp + rslen) != pp + rslen) {
+      RSTR_CODERANGE_SET(s, MRB_STR_CODERANGE_UNKNOWN);
+    }
 #endif
     RSTR_SET_LEN(s, len - rslen);
     p[RSTR_LEN(s)] = '\0';
@@ -2330,6 +2420,14 @@ mrb_str_chop_bang(mrb_state *mrb, mrb_value str)
         len--;
       }
     }
+#ifdef MRB_UTF8_STRING
+    /* see mrb_str_chomp_bang(): the character cut here is the last one, so a
+       non-ASCII lead byte at `len` is the whole of what leaves the string, and
+       it can have been the last non-ASCII there was. */
+    if ((signed char)RSTR_PTR(s)[len] < 0) {
+      RSTR_CODERANGE_SET(s, MRB_STR_CODERANGE_UNKNOWN);
+    }
+#endif
     RSTR_SET_LEN(s, len);
     RSTR_PTR(s)[len] = '\0';
     return str;
@@ -2623,7 +2721,7 @@ mrb_str_byteindex_m(mrb_state *mrb, mrb_value str)
 static mrb_value
 mrb_str_index_m(mrb_state *mrb, mrb_value str)
 {
-  if (RSTR_CODERANGE(mrb_str_ptr(str)) == MRB_STR_CODERANGE_7BIT) {
+  if (mrb_str_single_byte_p(mrb, str)) {
     return mrb_str_byteindex_m(mrb, str);
   }
 
@@ -2922,8 +3020,7 @@ mrb_str_byterindex_m(mrb_state *mrb, mrb_value str)
 static mrb_value
 mrb_str_rindex_m(mrb_state *mrb, mrb_value str)
 {
-  struct RString *s = mrb_str_ptr(str);
-  if (RSTR_SINGLE_BYTE_P(s)) {
+  if (mrb_str_single_byte_p(mrb, str)) {
     return mrb_str_byterindex_m(mrb, str);
   }
 
