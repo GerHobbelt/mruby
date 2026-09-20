@@ -376,6 +376,97 @@ assert("String#rindex bounds the match start in characters") do
   assert_equal 3, "あああ".byterindex(/ああ/)
   assert_equal ["あ", "ああ", ""], "あああ".rpartition(/ああ/)
   assert_equal ["あい", "うあ", "いう"], str.rpartition(/うあ/)
+
+  # the position bounds where the match starts and not how far the subject is
+  # read: `$` still asserts at the end of the subject, and a match that
+  # reaches it is still found from a position well before it
+  assert_nil "あいうい".rindex(/い$/, 1)
+  assert_equal 3, "あいうい".rindex(/い$/)
+  assert_equal 1, str.rindex(/いうあいう/, 1)
+end
+
+assert("a backward search bounds where a match starts, not how far it reads") do
+  # `$` and `\z` assert at the end of the subject. A position that bounded
+  # how much of the subject was read would put that end at the bound instead,
+  # and the `b` at 1 would answer where it must not.
+  assert_nil "abcb".rindex(/b$/, 1)
+  assert_nil "abcb".rindex(/b\z/, 1)
+  assert_equal 3, "abcb".rindex(/b$/)
+
+  # and a match may reach past the bound, since what the bound names is where
+  # the match begins
+  assert_equal 1, "abcabc".rindex(/bcabc/, 1)
+  assert_equal 1, "abcabc".byterindex(/bcabc/, 1)
+end
+
+assert("a backward search answers a match far from the end of the subject") do
+  # A backward search asks about the end of the subject first, and only what
+  # it does not find there sends it over the whole subject. A subject long
+  # enough for those to be two different paths says that both answer what a
+  # short one answers.
+  str = "ab" + "c" * 4000
+
+  assert_equal 0, str.rindex(/ab/)
+  assert_equal 1, str.rindex(/b/)
+  assert_equal 4001, str.rindex(/c/)
+  assert_nil str.rindex(/z/)
+  assert_equal 0, str.byterindex(/ab/)
+  assert_equal 4001, str.byterindex(/c/)
+  assert_equal ["", "ab", "c" * 4000], str.rpartition(/ab/)
+
+  # a match at the end and further ones behind it: the last is still the
+  # answer when the search starts from the end rather than the front
+  tail = "c" * 4000 + "abab"
+  assert_equal 4002, tail.rindex(/ab/)
+  # overlapping matches stay in view there too, as they do on a short subject
+  assert_equal 4001, tail.rindex(/ba/)
+  assert_equal ["c" * 4000 + "ab", "ab", ""], tail.rpartition(/ab/)
+
+  # the bound is read the same way whichever path answers
+  assert_equal 0, str.rindex(/ab/, 0)
+  assert_nil str.rindex(/b/, 0)
+  assert_equal 4000, tail.rindex(/ab/, 4000)
+
+  # and the match it settles on is the one the globals describe
+  assert_equal 4002, tail.rindex(/a(b)/)
+  assert_equal "b", $1
+  assert_equal "ab", Regexp.last_match(0)
+  assert_nil str.rindex(/(z)/)
+  assert_nil $1
+  assert_nil Regexp.last_match(0)
+end
+
+assert("a backward search answers a long multibyte subject") do
+  # The subject above is single-byte, so the two paths of the search were
+  # asked about characters only on a short one. A search reads the subject by
+  # byte wherever it starts from, so a place it starts from falls inside a
+  # character as often as not, and the path that reaches the front of a long
+  # subject is not the path that answers from the end of it.
+  skip unless __ENCODING__ == "UTF-8"
+  mb = "あい" + "うえ" * 2000    # 4,002 characters, 12,006 bytes
+
+  # near the end, where the search settles without crossing the subject
+  assert_equal 4001, mb.rindex(/え/)
+  assert_equal 12003, mb.byterindex(/え/)
+  assert_equal 4000, mb.rindex(/うえ/)
+  assert_equal 12000, mb.byterindex(/うえ/)
+
+  # at the front, which is the far end of the same subject
+  assert_equal 0, mb.rindex(/あい/)
+  assert_equal 0, mb.byterindex(/あい/)
+  assert_nil mb.rindex(/お/)
+  assert_equal ["", "あい", "うえ" * 2000], mb.rpartition(/あい/)
+
+  # overlapping matches stay in view at that end too
+  assert_equal 1, ("あああ" + "い" * 3000).rindex(/ああ/)
+
+  # and the position is still a character offset for one of the pair and a
+  # byte offset for the other
+  assert_equal 0, mb.rindex(/あい/, 0)
+  assert_nil mb.rindex(/うえ/, 1)
+  assert_equal 2, mb.rindex(/うえ/, 2)
+  assert_equal 6, mb.byterindex(/うえ/, 6)
+  assert_nil mb.byterindex(/うえ/, 3)
 end
 
 assert("String#index and String#rindex with regexp set the match globals") do

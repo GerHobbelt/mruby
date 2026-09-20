@@ -6,12 +6,18 @@ all_prerequisites = ->(task_name, prereqs) do
   end
 end
 
+# Every target first, before the walk below resolves a rule: the products of
+# one target reach the objects of another (a build reaches the mrbc build it
+# generated), and a rule resolved for those objects must see the same include
+# paths as the compile that follows it.
 MRuby.each_target do |build|
-  presym = build.presym
-
   include_dir = "#{build.build_dir}/include"
   build.compilers.each{|c| c.include_paths << include_dir}
   build.gems.each{|gem| gem.compilers.each{|c| c.include_paths << include_dir}}
+end
+
+MRuby.each_target do |build|
+  presym = build.presym
 
   prereqs = {}
   ppps = []
@@ -43,7 +49,25 @@ MRuby.each_target do |build|
         presym.send("write_#{type}_header", presyms)
       end
       presym.write_list(presyms)
+    elsif !presym.headers_exist?
+      # The headers are made from the list, so a header that is gone is
+      # written again from the list as it stands. The list itself is left
+      # alone: its timestamp is what every object depends on, and nothing
+      # about the symbols changed. Only the header that is gone is written,
+      # since a new `id.h` recompiles every object that includes it.
+      mkdir_p presym.header_dir
+      %w[id table].each do |type|
+        next if File.exist?(presym.send("#{type}_header_path"))
+        presym.send("write_#{type}_header", presyms)
+      end
     end
+  end
+
+  # The list is the file of the task above, so Rake runs it only when a
+  # preprocessed file is newer than the list. The headers are made from the
+  # list, so a header that is gone needs the task too, with the list as it is.
+  presym_task.define_singleton_method :needed? do
+    super() || !presym.headers_exist?
   end
 
   # Don't directly write dependency tasks in the "task" arguments.
@@ -65,7 +89,7 @@ MRuby.each_target do |build|
   # This is critical when a build's .o files are compiled during another
   # build's presym scanning chain (before :gensym completes), e.g.:
   #   - internal sub-builds (mrbc) triggered by their parent build
-  #   - the implicit host build triggered by a cross build needing mrbc
+  #   - the mrbc build generated for a cross build that has none to borrow
   prereqs.each_key do |prereq|
     next unless File.extname(prereq) == build.exts.object
     next unless prereq.start_with?(build_dir)
