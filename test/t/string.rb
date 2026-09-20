@@ -321,6 +321,20 @@ assert('String#chomp', '15.2.10.5.9') do
   assert_equal "abc\n", f
 end
 
+assert('String#chomp does not cut inside a character') do
+  # The separator is matched byte by byte, so it can line up with the tail of
+  # a character rather than a character of its own. Cutting there would leave
+  # a string that is not UTF-8, so it counts as no match.
+  assert_equal "あ", "あ".chomp("\x82")
+  assert_equal "あ", "あ".chomp("\x81\x82")
+  assert_equal "あい", "あい".chomp("\x84")
+  assert_equal "aあ", "aあ".chomp("\x82")
+  assert_nil "あ".chomp!("\x82")
+  # a separator that is a whole character still cuts
+  assert_equal "", "あ".chomp("あ")
+  assert_equal "あ", "あい".chomp("い")
+end if UTF8STRING
+
 assert('String#chomp!', '15.2.10.5.10') do
   a = 'abc'
   b = ''
@@ -387,6 +401,22 @@ assert('String#chop!(UTF-8)', '15.2.10.5.12') do
   assert_equal a, ''
   assert_equal b, 'あいうえ'
   assert_equal c, 'あいう'
+end if UTF8STRING
+
+assert('String#chop! cuts where String#length counts a character') do
+  # The last character starts where the character covering the last byte
+  # starts, and a byte that no lead byte reaches is a character of its own.
+  assert_equal "あ", "あ\x82".chop
+  assert_equal "\x80\x80", "\x80\x80\x80".chop
+  # A sequence RFC 3629 forbids spells no character, so its bytes stand alone.
+  assert_equal "\xC0", "\xC0\x80".chop
+  assert_equal "\xED\xA0", "\xED\xA0\x80".chop
+  # A lead byte the string end cuts short reaches none of the bytes after it.
+  assert_equal "a\xE3", "a\xE3\x81".chop
+  # a whole character still goes at once, however many bytes it spells
+  assert_equal "", "\u{1F600}".chop
+  # and the \r\n pair is still taken together after one
+  assert_equal "あ", "あ\r\n".chop
 end if UTF8STRING
 
 assert('String#downcase', '15.2.10.5.13') do
@@ -506,8 +536,11 @@ assert('String#index(UTF-8)', '15.2.10.5.22') do
   assert_equal 6, '⓿➊➋➌➍➎⓿➊➋➌➍➎'.index('⓿', -7)
   assert_equal 6, "⓿➊➋➌➍➎".index("", 6)
   assert_equal nil, "⓿➊➋➌➍➎".index("", 7)
-  assert_equal 0, '⓿➊➋➌➍➎'.index("\xe2")
-  assert_equal nil, '⓿➊➋➌➍➎'.index("\xe3")
+  # A needle whose bytes spell no character is found nowhere; the
+  # byte-indexed counterparts live in mruby-string-ext's tests, where
+  # String#b is available to write them.
+  assert_nil '⓿➊➋➌➍➎'.index("\xe2")
+  assert_nil '⓿➊➋➌➍➎'.index("\xe3")
   assert_equal 6, "\xd1\xd1\xd1\xd1\xd1\xd1⓿➊➋➌➍➎".index('⓿')
 end if UTF8STRING
 
@@ -665,7 +698,10 @@ assert('String#rindex steps by the characters String#length counts') do
   str = "あ\x80x"
   assert_equal 3, str.length
   assert_equal 0, str.rindex("あ", -2)
-  assert_equal 1, str.rindex("\x80")
+  # The byte is a position of its own, but a needle spelling no character is
+  # found nowhere, so neither direction reports it. They agree, which is what
+  # this block is about.
+  assert_nil str.rindex("\x80")
   assert_equal str.index("\x80"), str.rindex("\x80")
 
   # Searching backward from `pos` may not answer a position after it.
@@ -675,10 +711,37 @@ assert('String#rindex steps by the characters String#length counts') do
   # A sequence RFC 3629 forbids spells no character either, and its bytes
   # stand alone the same way.
   assert_equal 3, "\xC0\x80a".length
-  assert_equal 0, "\xC0\x80a".rindex("\xC0")
-  assert_equal 1, "\xC0\x80a".rindex("\x80")
+  assert_nil "\xC0\x80a".rindex("\xC0")
+  assert_nil "\xC0\x80a".rindex("\x80")
   assert_equal 3, "\xED\xA0\x80".length
-  assert_equal 2, "\xED\xA0\x80".rindex("\x80")
+  assert_nil "\xED\xA0\x80".rindex("\x80")
+
+  # A lead byte the string end cuts short reaches none of the bytes that
+  # follow it, so those stand alone too.
+  assert_equal 3, "a\xE3\x81".length
+  assert_nil "a\xE3\x81".rindex("\xE3")
+  assert_nil "a\xE3\x81".rindex("\x81")
+end if UTF8STRING
+
+assert('a byte search refuses an offset inside a character') do
+  # An offset that lands inside a character names no position the string has,
+  # so searching from it is refused rather than started from the middle of
+  # one. The boundaries are the ones #length counts over.
+  s = "aあb"          # 61 E3 81 82 62; boundaries 0, 1, 4, 5
+  assert_equal 4, s.byteindex("b", 1)
+  assert_equal 4, s.byteindex("b", 4)
+  assert_raise(IndexError) { s.byteindex("b", 2) }
+  assert_raise(IndexError) { s.byteindex("b", 3) }
+  assert_raise(IndexError) { s.byterindex("a", 2) }
+  # a negative offset is counted from the end first, then asked the same
+  assert_equal 4, s.byteindex("b", -1)
+  assert_raise(IndexError) { s.byteindex("b", -2) }
+  # past either end is out of range rather than off a boundary
+  assert_nil s.byteindex("b", 6)
+  assert_nil s.byteindex("b", -6)
+  assert_equal 0, s.byterindex("a", 99)
+  # ASCII has a boundary at every byte, and so does a byte-indexed string
+  assert_equal 2, "abc".byteindex("c", 1)
 end if UTF8STRING
 
 assert('String#byterindex searches bytes') do
@@ -686,13 +749,18 @@ assert('String#byterindex searches bytes') do
   # `byteindex` does. Walking characters instead, it passed over every byte
   # inside a multi-byte sequence and reported nothing there.
   str = "aあb" # "\x61\xe3\x81\x82\x62"
-  assert_equal 1, str.byterindex("\xe3")
-  assert_equal 2, str.byterindex("\x81")
-  assert_equal 3, str.byterindex("\x82")
-  assert_equal str.byteindex("\x81"), str.byterindex("\x81")
   assert_equal 4, str.byterindex("b")
-  assert_equal 2, str.byterindex("\x81", 2)
-  assert_nil str.byterindex("\x81", 1)
+  # Whatever a needle that spells no character answers, the two directions
+  # answer it alike, which is what this block is about. On a UTF-8 build that
+  # is nil, since such a needle names nothing to look for; the byte search
+  # itself is asked of a byte-indexed subject in mruby-string-ext's tests,
+  # where String#b is available to write one.
+  assert_equal str.byteindex("\x81"), str.byterindex("\x81")
+  if UTF8STRING
+    assert_nil str.byterindex("\xe3")
+    assert_nil str.byterindex("\x81")
+    assert_nil str.byterindex("\x81", 1)
+  end
 
   assert_equal 3, 'abcabc'.byterindex('a')
   assert_equal 0, 'abcabc'.byterindex('a', 1)
@@ -1088,7 +1156,11 @@ assert('String#bytesplice') do
 
   # check the overflow to index and length (to be pass without crash)
   assert_nothing_raised { "0123456789".bytesplice(8, ~(-1 << 31), "ab") } # for MRB_INT32
-  assert_nothing_raised { begin; "0123456789".bytesplice(8, ~(-1 << 63), "ab"); rescue ArgumentError, RangeError; end } # for MRB_INT64
+  # The shift width comes from a variable because `1 << 63` written out is
+  # constant folded, and the fold fails while this file is compiled on
+  # MRB_INT32 without bigint, dropping every test in it.
+  shift = 63
+  assert_nothing_raised { begin; "0123456789".bytesplice(8, ~(-1 << shift), "ab"); rescue ArgumentError, RangeError; end } # for MRB_INT64
 
   # check the negative index
   assert_equal "0ab3456789", "0123456789".bytesplice(-9, 2, "ab")

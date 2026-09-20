@@ -795,6 +795,34 @@ assert("Regexp - lookbehind against a binary subject rewinds by bytes") do
   assert_equal "x", bin.match(/(?<=.)x/)[0]
 end
 
+assert("Regexp - lookbehind measures bytes that spell no character") do
+  # A byte no lead byte reaches is a character of its own, which is what the
+  # rewind steps back over, so the width has to count it as one. Counting the
+  # lead bytes of the run alone made such a byte part of the character before
+  # it, rewound too little, and the lookbehind then failed on text it
+  # describes, or succeeded where the negative form describes it.
+  # The subjects carrying such a byte are byte-indexed, since one read as
+  # UTF-8 spells no character where the byte is and is refused before the
+  # search. That leaves the byte measurement as the one these can ask about,
+  # and it was right before the character one was fixed to agree with it, so
+  # what they pin is that the two still answer alike rather than the fix
+  # itself. No subject that reaches the character measurement can tell the
+  # two apart: it takes a byte spelling no character to make them differ, and
+  # a subject holding one no longer arrives.
+  assert_equal 2, ("\x80ab".b =~ Regexp.new("(?<=\x80a)b"))
+  assert_nil ("\x80ab".b =~ Regexp.new("(?<!\x80a)b"))
+  # a sequence cut short spells no character either, so each of its bytes is
+  # one: E3 leads three bytes and only two follow it here
+  assert_equal 3, ("\xE3\x81ab".b =~ Regexp.new("(?<=\xE3\x81a)b"))
+  assert_nil ("\xE3\x81ab".b =~ Regexp.new("(?<!\xE3\x81a)b"))
+  # the pattern still holds the byte where the subject does not, and a whole
+  # UTF-8 subject goes through as it always did
+  assert_nil ("ab" =~ /(?<=\x80a)b/)
+  # a whole character is still one whatever its byte count
+  assert_equal "b", "Āab".match(/(?<=Āa)b/)[0]
+  assert_nil "aab".match(/(?<=Āa)b/)
+end
+
 assert("Regexp - lookbehind measures an ASCII-only class") do
   assert_equal "x", "ax".match(/(?<=[a-z])x/)[0]
   assert_nil "1x".match(/(?<=[a-z])x/)

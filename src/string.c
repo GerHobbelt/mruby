@@ -369,6 +369,80 @@ mrb_utf8_to_buf(char *buf, uint32_t cp)
   return 0;  /* invalid codepoint */
 }
 
+/* What a run of bytes spells is a question apart from whether String indexes
+   by character, and mruby-regexp asks the first one whatever the build does.
+   So this much is here for any build that asks, through MRB_UTF8_SCAN or
+   MRB_UTF8_STRING; what indexes a string by character waits behind the latter
+   alone, below. A build with neither carries none of it. */
+#if defined(MRB_UTF8_STRING) || defined(MRB_UTF8_SCAN)
+
+#define utf8_islead(c) ((unsigned char)((c)&0xc0) != 0x80)
+
+/* the byte length a lead byte claims, read only through mrb_utf8len() */
+static const char mrb_utf8len_table[] = {
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 3, 3, 4, 0
+};
+
+mrb_int
+mrb_utf8len(const char* p, const char* e)
+{
+  mrb_int len = mrb_utf8len_table[(unsigned char)p[0] >> 3];
+  if (len > e - p) return 1;
+  switch (len) {
+  case 0:
+    return 1;
+  case 4:
+    if (utf8_islead(p[3])) return 1;
+  case 3:
+    if (utf8_islead(p[2])) return 1;
+  case 2:
+    if (utf8_islead(p[1])) return 1;
+  }
+  /* Reject overlong sequences, UTF-16 surrogates, and code points above
+     U+10FFFF (RFC 3629, Unicode D93b). */
+  switch ((unsigned char)p[0]) {
+  case 0xC0: case 0xC1:                       /* overlong (< U+0080) */
+    return 1;
+  case 0xE0:                                  /* overlong (< U+0800) */
+    if ((unsigned char)p[1] < 0xA0) return 1;
+    break;
+  case 0xED:                                  /* surrogate (U+D800..U+DFFF) */
+    if ((unsigned char)p[1] > 0x9F) return 1;
+    break;
+  case 0xF0:                                  /* overlong (< U+10000) */
+    if ((unsigned char)p[1] < 0x90) return 1;
+    break;
+  case 0xF4:                                  /* above U+10FFFF */
+    if ((unsigned char)p[1] > 0x8F) return 1;
+    break;
+  case 0xF5: case 0xF6: case 0xF7:            /* above U+10FFFF */
+    return 1;
+  }
+  return len;
+}
+
+/* The byte the character covering `p` starts at, or `p` itself when `p` is
+   already a character boundary. A continuation byte belongs to the character
+   that reaches it; one that no lead byte reaches belongs to none and stands as
+   a character of its own. Whether a lead byte reaches is mrb_utf8len()'s
+   answer, so the boundaries found here are the ones the character count is
+   taken over. Reading back three bytes covers it, since nothing longer than
+   four bytes spells a character. */
+const char*
+mrb_utf8_char_head(const char *beg, const char *p, const char *end)
+{
+  if (p >= end || utf8_islead(p[0])) return p;
+  for (mrb_int back = 1; back <= 3 && back <= p - beg; back++) {
+    const char *lead = p - back;
+    if (!utf8_islead(lead[0])) continue;  /* another continuation byte */
+    return mrb_utf8len(lead, end) > back ? lead : p;
+  }
+  return p;
+}
+
+#endif  /* MRB_UTF8_STRING || MRB_UTF8_SCAN */
+
 #ifdef MRB_UTF8_STRING
 
 #define NOASCII(c) ((c) & 0x80)
@@ -461,52 +535,6 @@ search_nonascii(const char *p, const char *e)
 }
 
 #endif  /* SIMPLE_SEARCH_NONASCII */
-
-#define utf8_islead(c) ((unsigned char)((c)&0xc0) != 0x80)
-
-/* the byte length a lead byte claims, read only through mrb_utf8len() */
-static const char mrb_utf8len_table[] = {
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-  0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 3, 3, 4, 0
-};
-
-mrb_int
-mrb_utf8len(const char* p, const char* e)
-{
-  mrb_int len = mrb_utf8len_table[(unsigned char)p[0] >> 3];
-  if (len > e - p) return 1;
-  switch (len) {
-  case 0:
-    return 1;
-  case 4:
-    if (utf8_islead(p[3])) return 1;
-  case 3:
-    if (utf8_islead(p[2])) return 1;
-  case 2:
-    if (utf8_islead(p[1])) return 1;
-  }
-  /* Reject overlong sequences, UTF-16 surrogates, and code points above
-     U+10FFFF (RFC 3629, Unicode D93b). */
-  switch ((unsigned char)p[0]) {
-  case 0xC0: case 0xC1:                       /* overlong (< U+0080) */
-    return 1;
-  case 0xE0:                                  /* overlong (< U+0800) */
-    if ((unsigned char)p[1] < 0xA0) return 1;
-    break;
-  case 0xED:                                  /* surrogate (U+D800..U+DFFF) */
-    if ((unsigned char)p[1] > 0x9F) return 1;
-    break;
-  case 0xF0:                                  /* overlong (< U+10000) */
-    if ((unsigned char)p[1] < 0x90) return 1;
-    break;
-  case 0xF4:                                  /* above U+10FFFF */
-    if ((unsigned char)p[1] > 0x8F) return 1;
-    break;
-  case 0xF5: case 0xF6: case 0xF7:            /* above U+10FFFF */
-    return 1;
-  }
-  return len;
-}
 
 #if defined(__GNUC__) || __has_builtin(__builtin_popcount)
 # ifdef MRB_64BIT
@@ -608,6 +636,7 @@ mrb_str_valid_encoding_p(mrb_state *mrb, mrb_value str)
      byte per character, which a string of stray bytes satisfies too, so only
      the walk below decides. */
   if (RSTR_BINARY_P(s)) return TRUE;
+  if (RSTR_VALID_ENC_P(s)) return TRUE;
 
   mrb_int byte_len = RSTR_LEN(s);
   mrb_bool valid = TRUE;
@@ -615,6 +644,7 @@ mrb_str_valid_encoding_p(mrb_state *mrb, mrb_value str)
 
   if (!valid) return FALSE;
   if (byte_len == utf8_len) RSTR_SET_SINGLE_BYTE_FLAG(s);
+  RSTR_SET_VALID_ENC_FLAG(s);
   return TRUE;
 }
 
@@ -689,28 +719,12 @@ mrb_str_byte_to_char(mrb_state *mrb, mrb_value str, mrb_int bi)
   return i;
 }
 
-/* The byte the character covering `p` starts at, or `p` itself when `p` is
-   already a character boundary. A continuation byte belongs to the character
-   that reaches it; one that no lead byte reaches belongs to none and stands as
-   a character of its own. Whether a lead byte reaches is mrb_utf8len()'s
-   answer, so the boundaries found here are the ones the character count is
-   taken over. Reading back three bytes covers it, since nothing longer than
-   four bytes spells a character. */
-static const char*
-str_char_head(const char *beg, const char *p, const char *end)
-{
-  if (p >= end || utf8_islead(p[0])) return p;
-  for (mrb_int back = 1; back <= 3 && back <= p - beg; back++) {
-    const char *lead = p - back;
-    if (!utf8_islead(lead[0])) continue;  /* another continuation byte */
-    return mrb_utf8len(lead, end) > back ? lead : p;
-  }
-  return p;
-}
-
 static mrb_int
 str_index_str_by_char(mrb_state *mrb, mrb_value str, mrb_value sub, mrb_int pos)
 {
+  /* see str_index_str() */
+  if (!mrb_str_valid_encoding_p(mrb, sub)) return -1;
+
   const char *ptr = RSTRING_PTR(sub);
   mrb_int len = RSTRING_LEN(sub);
 
@@ -983,6 +997,12 @@ mrb_str_index(mrb_state *mrb, mrb_value str, const char *sptr, mrb_int slen, mrb
 static mrb_int
 str_index_str(mrb_state *mrb, mrb_value str, mrb_value str2, mrb_int offset)
 {
+  /* A needle whose bytes are not the encoding it is taken to be in spells no
+     character to look for, so it is found nowhere. CRuby answers the same way
+     (is_broken_string in rb_str_index_m); a binary needle claims no encoding
+     and is still searched for byte by byte. */
+  if (!mrb_str_valid_encoding_p(mrb, str2)) return -1;
+
   const char *ptr = RSTRING_PTR(str2);
   mrb_int len = RSTRING_LEN(str2);
 
@@ -995,6 +1015,7 @@ str_replace(mrb_state *mrb, struct RString *s1, struct RString *s2)
   mrb_check_frozen(mrb, s1);
   if (s1 == s2) return mrb_obj_value(s1);
   RSTR_COPY_SINGLE_BYTE_FLAG(s1, s2);
+  RSTR_COPY_VALID_ENC_FLAG(s1, s2);
   RSTR_COPY_BINARY_FLAG(s1, s2);
   if (RSTR_SHARED_P(s1)) {
     str_decref(mrb, s1->as.heap.aux.shared);
@@ -1067,7 +1088,7 @@ str_char_rindex(mrb_value str, mrb_value sub, mrb_int pos)
   if (len) {
     /* a match may start only at a character boundary, and `pos` need not be
        one: the clamp above answers the last byte `sub` fits at */
-    s = str_char_head(sbeg, s, send);
+    s = mrb_utf8_char_head(sbeg, s, send);
     for (;;) {
       if ((mrb_int)(send - s) >= len && memcmp(s, t, len) == 0) {
         return (mrb_int)(s - sbeg);
@@ -1075,7 +1096,7 @@ str_char_rindex(mrb_value str, mrb_value sub, mrb_int pos)
       /* the character before `s`, which there is none of once the search has
          reached the first one */
       if (s == sbeg) break;
-      s = str_char_head(sbeg, s-1, send);
+      s = mrb_utf8_char_head(sbeg, s-1, send);
     }
     return -1;
   }
@@ -1164,6 +1185,9 @@ mrb_str_modify_keep_ascii(mrb_state *mrb, struct RString *s)
 {
   mrb_check_frozen(mrb, s);
   str_unshare_buffer(mrb, s);
+  /* Every in-place write reaches here, including the ones that keep the string
+     ASCII, so this is where the walk's answer stops holding. */
+  RSTR_UNSET_VALID_ENC_FLAG(s);
 }
 
 /*
@@ -1358,6 +1382,7 @@ mrb_str_times(mrb_state *mrb, mrb_value self)
   }
   p[RSTR_LEN(str2)] = '\0';
   RSTR_COPY_SINGLE_BYTE_FLAG(str2, mrb_str_ptr(self));
+  RSTR_COPY_VALID_ENC_FLAG(str2, mrb_str_ptr(self));
 
   return mrb_obj_value(str2);
 }
@@ -1937,6 +1962,8 @@ mrb_str_chomp_bang(mrb_state *mrb, mrb_value str)
   }
 
   if (len == 0 || mrb_nil_p(rs)) return mrb_nil_value();
+  /* see str_index_str(): a separator that spells no character ends nothing */
+  if (!mrb_str_valid_encoding_p(mrb, rs)) return mrb_nil_value();
   char *p = RSTR_PTR(s);
   mrb_int rslen = RSTRING_LEN(rs);
   if (rslen == 0) {
@@ -1963,6 +1990,16 @@ mrb_str_chomp_bang(mrb_state *mrb, mrb_value str)
   if (p[len-1] == newline &&
      (rslen <= 1 ||
      memcmp(RSTRING_PTR(rs), pp, rslen) == 0)) {
+#ifdef MRB_UTF8_STRING
+    /* The bytes line up, but they can be the tail of a character rather than
+       a character of its own, and cutting there would leave a string that is
+       not UTF-8: "あ".chomp("\x82") is the whole of the last byte of a
+       three-byte character. CRuby reads that as no match. */
+    if (!RSTR_BINARY_P(s) && !RSTR_SINGLE_BYTE_P(s) &&
+        mrb_utf8_char_head(p, pp, p + len) != pp) {
+      return mrb_nil_value();
+    }
+#endif
     RSTR_SET_LEN(s, len - rslen);
     p[RSTR_LEN(s)] = '\0';
     return str;
@@ -2019,14 +2056,12 @@ mrb_str_chop_bang(mrb_state *mrb, mrb_value str)
       len = RSTR_LEN(s) - 1;
     }
     else {
-      const char* t = RSTR_PTR(s), *p = t;
-      const char* e = p + RSTR_LEN(s);
-      while (p<e) {
-        mrb_int clen = mrb_utf8len(p, e);
-        if (p + clen>=e) break;
-        p += clen;
-      }
-      len = p - t;
+      /* The last character starts at the head of the one covering the last
+         byte, which is read backwards from there rather than by walking the
+         whole string. */
+      const char* t = RSTR_PTR(s);
+      const char* e = t + RSTR_LEN(s);
+      len = mrb_utf8_char_head(t, e-1, e) - t;
     }
 #else
     len = RSTR_LEN(s) - 1;
@@ -2262,6 +2297,26 @@ mrb_str_include(mrb_state *mrb, mrb_value self)
  *    'foo'.byteindex('oo') # => 1
  *    'foo'.byteindex('ooo') # => nil
  */
+/* A byte offset that lands inside a character names no position the string
+   has, so a byte search refuses it rather than starting from the middle of
+   one. A byte-indexed string has a position per byte, so every offset is one.
+   The boundaries are the ones String#length counts over, which is why a byte
+   no lead byte reaches is one of them. */
+static void
+str_check_byte_pos(mrb_state *mrb, mrb_value str, mrb_int pos)
+{
+#ifdef MRB_UTF8_STRING
+  struct RString *s = mrb_str_ptr(str);
+  if (RSTR_SINGLE_BYTE_P(s) || RSTR_BINARY_P(s)) return;
+
+  const char *b = RSTR_PTR(s);
+  const char *p = b + pos;
+  if (mrb_utf8_char_head(b, p, b + RSTR_LEN(s)) != p) {
+    mrb_raisef(mrb, E_INDEX_ERROR, "offset %i does not land on character boundary", pos);
+  }
+#endif
+}
+
 static mrb_value
 mrb_str_byteindex_m(mrb_state *mrb, mrb_value str)
 {
@@ -2277,6 +2332,10 @@ mrb_str_byteindex_m(mrb_state *mrb, mrb_value str)
       return mrb_nil_value();
     }
   }
+  if (pos > RSTRING_LEN(str)) return mrb_nil_value();
+  str_check_byte_pos(mrb, str, pos);
+  /* see str_index_str() */
+  if (!mrb_str_valid_encoding_p(mrb, sub)) return mrb_nil_value();
   pos = str_index_str(mrb, str, sub, pos);
 
   if (pos == -1) return mrb_nil_value();
@@ -2572,6 +2631,9 @@ mrb_str_byterindex_m(mrb_state *mrb, mrb_value str)
     }
     if (pos > len) pos = len;
   }
+  str_check_byte_pos(mrb, str, pos);
+  /* see str_index_str() */
+  if (!mrb_str_valid_encoding_p(mrb, sub)) return mrb_nil_value();
   pos = str_byterindex(str, sub, pos);
   if (pos < 0) {
     return mrb_nil_value();
@@ -2620,11 +2682,13 @@ mrb_str_rindex_m(mrb_state *mrb, mrb_value str)
        first character is the last step that stays in the string */
     while (pos < 0) {
       if (e == p) return mrb_nil_value();
-      e = str_char_head(p, e-1, send);
+      e = mrb_utf8_char_head(p, e-1, send);
       pos++;
     }
     pos = (mrb_int)(e - p);
   }
+  /* see str_index_str() */
+  if (!mrb_str_valid_encoding_p(mrb, sub)) return mrb_nil_value();
   pos = str_char_rindex(str, sub, pos);
   if (pos >= 0) {
     pos = mrb_str_byte_to_char(mrb, str, pos);
@@ -3305,6 +3369,7 @@ str_modify_cat(mrb_state *mrb, struct RString *s, mrb_int addlen)
          write over them. */
       shared->reserved = off + s->as.heap.len + addlen;
       RSTR_UNSET_SINGLE_BYTE_FLAG(s);
+      RSTR_UNSET_VALID_ENC_FLAG(s);
       return capa;
     }
   }
