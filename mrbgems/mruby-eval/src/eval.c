@@ -110,7 +110,16 @@ create_proc_from_string(mrb_state *mrb, const char *s, mrb_int len, mrb_value bi
     ci = c->cibase;
   }
   if (scope) {
-    target_class = MRB_PROC_TARGET_CLASS(scope);
+    /* The class the string's frame runs under is the one the caller's frame
+       runs under: the class the method was found in, or the one a block was
+       given to run under. A `super` in the string, and the caller's own
+       `super` once its frame has been given an env here, read it for the
+       class to look above. The proc's own class is its cref, which for a
+       method written in a `Class.new` or `class_eval` block is the scope
+       around that block, not the class the method was installed in. A
+       binding stands in for the frame it was taken from and carries that
+       frame's class on its scope. */
+    target_class = mrb_nil_p(binding) ? mrb_vm_ci_target_class(ci) : MRB_PROC_TARGET_CLASS(scope);
     if (!MRB_PROC_CFUNC_P(scope)) {
       if (e == NULL) {
         /* when `binding` is nil */
@@ -364,6 +373,7 @@ object_eval(mrb_state *mrb, mrb_value self, mrb_bool class_eval)
   }
   struct RProc *proc = create_proc_from_string(mrb, s, len, binding, file, line);
   MRB_PROC_SET_TARGET_CLASS(proc, c);
+  proc->flags |= MRB_PROC_CREF;
   mrb_assert(!MRB_PROC_CFUNC_P(proc));
   mrb_vm_ci_target_class_set(mrb->c->ci, c);
   /* The frame carries one class, and it is given to `c` here so that a `def`

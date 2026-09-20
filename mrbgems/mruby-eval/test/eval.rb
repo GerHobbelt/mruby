@@ -472,10 +472,14 @@ assert('`super` and `yield` in a string given to eval belong to the caller') do
   base = Class.new do
     def m(x); [:base, x]; end
     def blk; block_given? ? yield(:b) : :noblk; end
+    def kw(a:, b: 2); [a, b]; end
+    def rest(a:, **o); [a, o]; end
   end
   sub = Class.new(base) do
     def m(x); eval("super"); end
     def blk; eval("super"); end
+    def kw(a:, b: 2); eval("super"); end
+    def rest(a:, **o); eval("a = 7; [0].each { return super }"); end
     def y; eval("yield 21"); end
     def y_nested; eval("[1].map { yield 2 }"); end
     def y_args(a, b = 1, *r, c, d: 4, &e); eval("yield a"); end
@@ -484,6 +488,10 @@ assert('`super` and `yield` in a string given to eval belong to the caller') do
 
   assert_equal [:base, 1], o.m(1)
   assert_equal [:blk, :b], o.blk { |v| [:blk, v] }
+  # the keyword locals the string reads are the method's, by name, and the
+  # `rest` it copies is the one the method's frame holds
+  assert_equal [1, 3], o.kw(a: 1, b: 3)
+  assert_equal [7, {c: 2}], o.rest(a: 1, c: 2)
   assert_equal 42, o.y { |v| v * 2 }
   assert_equal [4], o.y_nested { |v| v * 2 }
   assert_equal 35, o.y_args(7, 8) { |v| v * 5 }
@@ -557,6 +565,40 @@ assert('a string given to eval in a `define_method` block sees the closure') do
   assert_equal 20, k.new.read
 end
 
+assert('a constant defined in a string given to eval belongs to the class the method was written in') do
+  # The frame of a method written `def self.name` carries the singleton
+  # class the method was found in, and a constant, class or module the
+  # string defines used to go there, or to `Object` through a binding.
+  # CRuby adds it to the cref, the class the code was written in.
+  class TestEvalConstDef
+    def self.direct; eval("FROM_DIRECT = 1"); end
+    def self.nested; proc { eval("FROM_NESTED = 2") }.call; end
+    def self.bound; binding.eval("FROM_BOUND = 3"); end
+    def self.opened; eval("class Opened; end; module OpenedMod; end"); end
+    class << self
+      def sclass; eval("FROM_SCLASS = 4"); end
+    end
+    def plain; eval("FROM_PLAIN = 5"); end
+  end
+  TestEvalConstDef.direct
+  TestEvalConstDef.nested
+  TestEvalConstDef.bound
+  TestEvalConstDef.opened
+  TestEvalConstDef.sclass
+  TestEvalConstDef.new.plain
+  assert_equal [1, 2, 3, 5], [
+    TestEvalConstDef::FROM_DIRECT, TestEvalConstDef::FROM_NESTED,
+    TestEvalConstDef::FROM_BOUND, TestEvalConstDef::FROM_PLAIN]
+  assert_true TestEvalConstDef.const_defined?(:Opened, false)
+  assert_true TestEvalConstDef.const_defined?(:OpenedMod, false)
+  sclass = TestEvalConstDef.singleton_class
+  assert_false sclass.const_defined?(:FROM_NESTED, false)
+  assert_false Object.const_defined?(:FROM_BOUND, false)
+  # A method written in `class << self` is written in the singleton class.
+  assert_equal 4, sclass::FROM_SCLASS
+  assert_false TestEvalConstDef.const_defined?(:FROM_SCLASS, false)
+end
+
 assert('a string given to eval in a `def` body has no scope around it') do
   # A method body carries no closure, so a local of the scope it was written
   # in is not a name it can reach: it is a method call there.
@@ -574,4 +616,124 @@ assert('a string given to eval in a `def` body has no scope around it') do
   assert_raise(NameError) { TestEvalDefScope.new.hidden }
   assert_raise(NameError) { TestEvalDefScope.hidden_singleton }
   assert_raise(NameError) { TestEvalDefScope.hidden_sclass }
+end
+
+class EvalVisHidden
+  private
+  def make; eval("def written; :w; end"); end
+end
+
+class EvalVisShown
+  public
+  def make; eval("def written; end"); end
+end
+
+class EvalVisGuarded
+  protected
+  def make; eval("def written; end"); end
+end
+
+class EvalVisLater
+  def make; eval("def written; end"); end
+  private
+end
+
+class EvalVisReopened
+  def make; eval("def written; end"); end
+end
+class EvalVisReopened
+  private
+end
+
+assert('eval string in a method starts at the visibility of the scope the method was written in') do
+  # A class body keeps one visibility for the whole of itself and a `def` in
+  # it keeps none of its own, so a string evaluated inside such a method
+  # reads the body's, as it stands rather than as it stood at the `def`.
+  o = EvalVisHidden.new
+  o.send(:make)
+  assert_false o.respond_to?(:written)
+  assert_true o.respond_to?(:written, true)
+  assert_equal :w, o.send(:written)
+
+  o = EvalVisShown.new
+  o.make
+  assert_true o.respond_to?(:written)
+
+  o = EvalVisGuarded.new
+  o.send(:make)
+  assert_false o.respond_to?(:written)
+  assert_true o.respond_to?(:written, true)
+
+  # written after the `def` and reaching it: one body, one visibility
+  o = EvalVisLater.new
+  o.send(:make)
+  assert_false o.respond_to?(:written)
+
+  # a body opened again is a scope of its own, and what it says reaches
+  # nothing the first one wrote
+  o = EvalVisReopened.new
+  o.make
+  assert_true o.respond_to?(:written)
+end
+
+module EvalFrameClassMaker
+  # A `Class.new` block written in a method: the methods it defines have
+  # this module for their cref, the way a script's have `Object`.
+  def self.subclass(base)
+    Class.new(base) do
+      def m(x); eval("super"); end
+      def m_args(x); eval("super(x + 1)"); end
+      def nested(x); [1].map { eval("super") }[0]; end
+      def has_super; eval("defined?(super)"); end
+      def own_super_after(x); eval("1"); super; end
+      def bound(x); binding.eval("super"); end
+    end
+  end
+end
+
+assert('a string given to eval runs under the class the calling frame runs under') do
+  # The string's frame, and the env the string leaves on the caller's frame,
+  # took their class from the caller's proc, which holds the cref: for a
+  # method written in a `Class.new` block that is the scope around the
+  # block, and for a block given a class to run under it is the scope the
+  # block was written in. A `super` in the string looked above that class,
+  # and once the env was there the caller's own `super`, and a `def` written
+  # after the call in a block given a class, went to it as well. The class a
+  # frame runs under is the one the method was found in, or the one the
+  # block was given.
+  base = Class.new do
+    def m(x); [:base, x]; end
+    def m_args(x); [:base, x]; end
+    def nested(x); [:base, x]; end
+    def has_super; end
+    def own_super_after(x); [:base, x]; end
+    def bound(x); [:base, x]; end
+  end
+  o = EvalFrameClassMaker.subclass(base).new
+  assert_equal [:base, 1], o.m(1)
+  assert_equal [:base, 2], o.m_args(1)
+  assert_equal [:base, 3], o.nested(3)
+  assert_equal 'super', o.has_super
+  assert_equal [:base, 4], o.own_super_after(4)
+  assert_equal [:base, 5], o.bound(5)
+
+  # a block given a class: a `def` after the call, one in a string, and one
+  # in a block made after the call all go to the given class
+  c = Class.new
+  c.class_eval { eval("1"); def after_call; end }
+  c.class_eval { eval("def in_string; end") }
+  c.class_eval { eval("1"); [1].each { def in_block; end } }
+  assert_equal [:after_call, :in_block, :in_string], c.instance_methods(false).sort
+  assert_false Object.new.respond_to?(:after_call, true)
+  assert_false Object.new.respond_to?(:in_string, true)
+  assert_false Object.new.respond_to?(:in_block, true)
+  o = Object.new
+  o.instance_eval { eval("1"); def on_self; end }
+  assert_equal [:on_self], o.singleton_methods
+
+  # a constant the string defines still belongs to the scope the block was
+  # written in, not to the class the block was given
+  k = Class.new { eval("EvalFrameClassConst = 1") }
+  assert_true Object.const_defined?(:EvalFrameClassConst, false)
+  assert_false k.const_defined?(:EvalFrameClassConst, false)
 end

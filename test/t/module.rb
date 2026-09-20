@@ -198,6 +198,80 @@ assert('Module#attr_writer', '15.2.2.4.14') do
   assert_equal 'test', AttrTestWriter.cattr_val
 end
 
+assert('Module#attr_* answer the names they define') do
+  r = w = a = nil
+  Class.new {
+    r = attr_reader :x, 'y'
+    w = attr_writer :x
+    a = attr_accessor :x, :y
+  }
+  assert_equal [:x, :y], r
+  assert_equal [:x=], w
+  assert_equal [:x, :x=, :y, :y=], a
+
+  # which is what a visibility written in front of them takes
+  c = Class.new {
+    def get; [r, a]; end
+    private attr_reader :r
+    private attr_accessor :a
+  }
+  assert_equal [nil, nil], c.new.get
+  assert_raise(NoMethodError) { c.new.r }
+  assert_raise(NoMethodError) { c.new.a = 2 }
+end
+
+assert('Module#attr_* take the visibility of the scope they are called in') do
+  c = Class.new {
+    def set; self.w = 1; self.a = 2; @r = 3; end
+    def get; [r, a]; end
+    def set_prot(other); other.r = 4; end
+    private
+    attr_reader :r
+    attr_writer :w
+    attr_accessor :a
+    protected
+    attr_writer :r
+  }
+  obj = c.new
+  obj.set
+  assert_equal [3, 2], obj.get
+  assert_raise(NoMethodError) { obj.r }
+  assert_raise(NoMethodError) { obj.a }
+  assert_raise(NoMethodError) { obj.r = 5 }
+  other = c.new
+  obj.set_prot(other)
+  assert_equal [4, nil], other.get
+  assert_false c.method_defined?(:r)
+  assert_false c.method_defined?(:a=)
+  assert_true c.method_defined?(:r=)
+
+  # a `class_eval` block is the body too
+  c = Class.new
+  c.class_eval { private; attr_reader :r }
+  assert_raise(NoMethodError) { c.new.r }
+
+  # a call on another class, or from inside a method, defines a public accessor
+  other = Class.new
+  c = Class.new {
+    private
+    other.attr_accessor :pub
+    def self.make; attr_reader :from_cm; end
+  }
+  c.make
+  assert_nil other.new.pub
+  assert_nil c.new.from_cm
+
+  # module_function scope: private, and no module method is made of it
+  mod = Module.new {
+    module_function
+    attr_reader :mf
+  }
+  assert_false mod.respond_to?(:mf)
+  klass = Class.new { include mod; def call_mf; mf; end }
+  assert_nil klass.new.call_mf
+  assert_raise(NoMethodError) { klass.new.mf }
+end
+
 assert('Module#class_eval', '15.2.2.4.15') do
   class Test4ClassEval
     @a = 11
@@ -433,6 +507,62 @@ assert('Module#method_defined? reports the methods a listing reports') do
   assert_true  answering.new.respond_to?(:no_such_method)
 end
 
+assert('Module#method_defined? with inherit false reports only the module\'s own methods') do
+  mod = Module.new do
+    def mpub; end
+  end
+  ahead = Module.new do
+    def apub; end
+  end
+  cls = Class.new do
+    include mod
+    prepend ahead
+    def pub; end
+    private def priv; end
+  end
+  sub = Class.new(cls)
+
+  # a method the class itself defines, wherever the walk would have found it
+  assert_true  cls.method_defined?(:pub, false)
+  assert_true  cls.method_defined?(:pub, true)
+  assert_false cls.method_defined?(:priv, false)
+  assert_false cls.method_defined?(:no_such_method, false)
+
+  # methods that come from an ancestor, an included module, a prepended
+  # module or Object are not the class's own
+  assert_false sub.method_defined?(:pub, false)
+  assert_true  sub.method_defined?(:pub)
+  assert_false cls.method_defined?(:mpub, false)
+  assert_true  cls.method_defined?(:mpub)
+  assert_false cls.method_defined?(:apub, false)
+  assert_true  cls.method_defined?(:apub)
+  assert_false cls.method_defined?(:inspect, false)
+  assert_true  cls.method_defined?(:inspect)
+
+  # a module is asked the same way, about the modules it includes
+  mod2 = Module.new { include mod }
+  assert_true  mod.method_defined?(:mpub, false)
+  assert_false mod2.method_defined?(:mpub, false)
+  assert_true  mod2.method_defined?(:mpub)
+
+  # a visibility changed in a subclass makes the method the subclass's own
+  shown = Class.new(cls) { public :priv }
+  assert_true  shown.method_defined?(:priv, false)
+  assert_false cls.method_defined?(:priv)
+
+  # a method undefined or left unimplemented is not there to be found, own or
+  # inherited; see "Kernel#respond_to? with an unimplemented method"
+  gone = Class.new(cls) { undef_method :pub }
+  assert_false gone.method_defined?(:pub, false)
+  assert_false gone.method_defined?(:pub)
+  assert_false TestNotImplement.method_defined?(:gone, false)
+
+  # inherit is read for truth, as in CRuby
+  assert_true  sub.method_defined?(:pub, 1)
+  assert_false sub.method_defined?(:pub, nil)
+  assert_raise(ArgumentError) { cls.method_defined?(:pub, false, false) }
+end
+
 assert('Module#module_eval', '15.2.2.4.35') do
   module Test4ModuleEval
     @a = 11
@@ -500,6 +630,178 @@ assert('Module#define_method') do
   assert_raise(TypeError) do
     Class.new { define_method(:n1, nil) }
   end
+end
+
+assert('Module#define_method takes the visibility of the scope it is called in') do
+  c = Class.new {
+    private
+    define_method(:priv) { :priv }
+    protected
+    define_method(:prot) { :prot }
+    public
+    define_method(:pub) { :pub }
+    def call_priv; priv; end
+    def call_prot; self.prot; end
+  }
+  obj = c.new
+  assert_equal :priv, obj.call_priv
+  assert_equal :prot, obj.call_prot
+  assert_equal :pub, obj.pub
+  assert_raise(NoMethodError) { obj.priv }
+  assert_raise(NoMethodError) { obj.prot }
+  assert_false c.method_defined?(:priv)
+  assert_true c.method_defined?(:prot)
+
+  # a block written in the body is still that body
+  c = Class.new {
+    def call_priv; priv; end
+    private
+    [1].each { define_method(:priv) { :priv } }
+  }
+  assert_equal :priv, c.new.call_priv
+  assert_raise(NoMethodError) { c.new.priv }
+
+  # and so is a `class_eval` block
+  c = Class.new
+  c.class_eval { private; define_method(:priv) { :priv } }
+  assert_raise(NoMethodError) { c.new.priv }
+
+  # a call on another class defines a public method
+  other = Class.new
+  Class.new {
+    private
+    other.define_method(:pub) { :pub }
+  }
+  assert_equal :pub, other.new.pub
+
+  # a call from inside a method is not in the body
+  c = Class.new {
+    private
+    def self.make; define_method(:from_cm) { :from_cm }; end
+    def make; self.class.define_method(:from_im) { :from_im }; end
+  }
+  c.make
+  c.new.__send__(:make)
+  assert_equal :from_cm, c.new.from_cm
+  assert_equal :from_im, c.new.from_im
+
+  # module_function scope: a private instance method and a public module one
+  mod = Module.new {
+    module_function
+    define_method(:mf) { :mf }
+  }
+  assert_equal :mf, mod.mf
+  klass = Class.new { include mod; def call_mf; mf; end }
+  assert_equal :mf, klass.new.call_mf
+  assert_raise(NoMethodError) { klass.new.mf }
+end
+
+assert('a `private` in the body of a `class << self` reaches the defs below it') do
+  c = Class.new {
+    class << self
+      def call_priv; priv; end
+      def call_prot; self.prot; end
+      def call_dm; dm; end
+      def call_attr; self.a = 1; a; end
+      private
+      def priv; :priv; end
+      define_method(:dm) { :dm }
+      attr_accessor :a
+      def self.on_sclass; :on_sclass; end
+      protected
+      def prot; :prot; end
+    end
+  }
+  assert_equal :priv, c.call_priv
+  assert_equal :prot, c.call_prot
+  assert_equal :dm, c.call_dm
+  assert_equal 1, c.call_attr
+  assert_raise(NoMethodError) { c.priv }
+  assert_raise(NoMethodError) { c.prot }
+  assert_raise(NoMethodError) { c.dm }
+  assert_raise(NoMethodError) { c.a }
+  assert_raise(NoMethodError) { c.a = 2 }
+  assert_false c.respond_to?(:priv)
+  assert_false c.respond_to?(:prot)
+  assert_true c.respond_to?(:priv, true)
+  assert_true c.respond_to?(:call_priv)
+  # a `def self.x` is public wherever it is written
+  assert_equal :on_sclass, (class << c; self; end).on_sclass
+
+  # so is a `def obj.x`, in a `private` section of a class body or of the
+  # object's own singleton class body
+  o = Object.new
+  c2 = Class.new {
+    private
+    def self.cm; :cm; end
+    def o.om; :om; end
+  }
+  class << o
+    private
+    def sing; :sing; end
+    def self.om2; :om2; end
+  end
+  assert_equal :cm, c2.cm
+  assert_equal :om, o.om
+  assert_equal :om2, (class << o; self; end).om2
+  assert_raise(NoMethodError) { o.sing }
+  assert_equal :sing, o.__send__(:sing)
+
+  # the singleton class body of a module, and the same body reached through
+  # `class_eval`
+  m = Module.new
+  class << m
+    private
+    def mp; :mp; end
+  end
+  assert_raise(NoMethodError) { m.mp }
+  c3 = Class.new
+  (class << c3; self; end).class_eval { private; def ce; :ce; end }
+  assert_raise(NoMethodError) { c3.ce }
+  assert_equal :ce, c3.__send__(:ce)
+
+  # a block written in the body is still that body
+  c4 = Class.new {
+    class << self
+      def call_blk; blk; end
+      private
+      [1].each { def blk; :blk; end }
+    end
+  }
+  assert_equal :blk, c4.call_blk
+  assert_raise(NoMethodError) { c4.blk }
+
+  # the body is a scope of its own: it starts public under a `private`
+  # written in the class body, and its `private` stops at its end
+  c5 = Class.new {
+    private
+    class << self
+      def inside; :inside; end
+      private
+      def inner; end
+    end
+    def self.after; :after; end
+    def outer; :outer; end
+  }
+  assert_equal :inside, c5.inside
+  assert_equal :after, c5.after
+  assert_raise(NoMethodError) { c5.new.outer }
+  assert_raise(NoMethodError) { c5.inner }
+
+  # a protected singleton method is reachable from a subclass's singleton
+  # method and from nowhere else
+  c6 = Class.new {
+    class << self
+      def cmp(other); other.prot; end
+      protected
+      def prot; :prot; end
+    end
+  }
+  sub = Class.new(c6)
+  assert_equal :prot, sub.cmp(c6)
+  assert_equal :prot, c6.cmp(sub)
+  assert_raise(NoMethodError) { c6.prot }
+  assert_raise(NoMethodError) { Class.new { def self.cmp(o); o.prot; end }.cmp(c6) }
 end
 
 # @!group prepend
@@ -1263,4 +1565,62 @@ assert('constant lookup: def self.name looks up from the class body') do
   assert_equal :mixin, s.in_sclass
   # `def self.name` inside `class << self` looks up from that singleton body
   assert_equal :singleton, s.nested_in_sclass
+end
+
+assert('Module#module_function - where a def in the body lands') do
+  # the copy on the singleton runs the same body, and the body was written
+  # in the module
+  module Test4ModfuncDefTarget
+    module_function
+    def go; def m; :from_modfunc; end; end
+  end
+  Test4ModfuncDefTarget.go
+  host = Class.new do
+    include Test4ModfuncDefTarget
+    def probe; m; end
+  end
+  assert_equal(:from_modfunc, host.new.probe)
+  assert_raise(NoMethodError) { Test4ModfuncDefTarget.m }
+end
+
+assert('constant lookup: a block given a class to run under keeps its own') do
+  # `class_eval` and its kin name where a `def` in the block goes, not where
+  # a constant in it is read from: the block goes on reading constants from
+  # the scope it was written in, and so does a method written in the block.
+  module Test4ConstScopeRecv
+    K = :recv
+  end
+  module Test4ConstScopeLex
+    K = :lex
+    def self.direct;  Test4ConstScopeRecv.class_eval { K }; end
+    def self.nested;  Test4ConstScopeRecv.class_eval { [1].map { K }[0] }; end
+    def self.install; Test4ConstScopeRecv.class_eval { def k; K; end }; end
+  end
+  assert_equal(:lex, Test4ConstScopeLex.direct)
+  assert_equal(:lex, Test4ConstScopeLex.nested)
+  Test4ConstScopeLex.install
+  host = Class.new do
+    include Test4ConstScopeRecv
+    def probe; k; end
+  end
+  assert_equal(:lex, host.new.probe)
+end
+
+assert('constant definition: a block given a class to run under keeps its own') do
+  # The same holds for a constant, class or module the block defines: it
+  # belongs to the scope the block was written in, from any depth. The
+  # frame of the block carries the given class for `def`, and a block made
+  # inside it used to define there.
+  recv = Module.new
+  recv.class_eval { [1].each { Test4ConstDefDirect = :a } }
+  recv.class_eval { [1].each { [1].each { Test4ConstDefNested = :b } } }
+  recv.class_eval { [1].each { class Test4ConstDefClass; end } }
+  recv.class_eval { [1].each { module Test4ConstDefModule; end } }
+  Class.new { [1].each { Test4ConstDefClassNew = :c } }
+  Object.new.instance_eval { [1].each { Test4ConstDefInstance = :d } }
+  [:Test4ConstDefDirect, :Test4ConstDefNested, :Test4ConstDefClass,
+   :Test4ConstDefModule, :Test4ConstDefClassNew, :Test4ConstDefInstance].each do |name|
+    assert_true Object.const_defined?(name, false), name.to_s
+    assert_false recv.const_defined?(name, false), name.to_s
+  end
 end

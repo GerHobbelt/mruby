@@ -88,3 +88,69 @@ assert "a binding answers for the method it was taken from" do
   assert_equal :binding_named_probe, b.eval("__method__")
   assert_equal :binding_named_probe, eval("__method__", b)
 end
+
+assert "Binding#eval on a binding taken in a method with a receiver" do
+  # The string runs in the scope the binding was taken from, and that scope
+  # carries no class of its own, so a `def` in it reaches the class the
+  # method holding the binding was written in.
+  class BindingDefTarget
+    def self.scope; binding; end
+  end
+  BindingDefTarget.scope.eval("def m; :m; end")
+
+  assert_equal :m, BindingDefTarget.new.m
+  assert_raise(NoMethodError) { BindingDefTarget.m }
+end
+
+assert 'Binding#eval on a binding taken under a given class' do
+  # `instance_eval` gives the block the singleton class to define in, and a
+  # binding taken there names that scope, so a `def` through the binding
+  # reaches the singleton rather than the class the block was written in.
+  obj = Object.new
+  obj.instance_eval { binding }.eval "def m; :m; end"
+  assert_equal :m, obj.m
+  assert_false Object.new.respond_to?(:m)
+end
+
+assert "a binding gives a string the scope its constants belong to" do
+  # The space a binding keeps its own locals in stands in for the frame the
+  # binding was taken from, so a string evaluated in it defines constants,
+  # classes and modules where that frame's code would have, and a block made
+  # in the string reads a superclass's constant before the top level's, the
+  # way one made in that frame does.
+  BindingScopeProbeTop = :top
+  class BindingScopeProbeBase
+    PROBE = :base
+    BindingScopeProbeTop = :base
+  end
+  class BindingScopeProbe < BindingScopeProbeBase
+    PROBE = :here
+    def self.scope; binding; end
+    def scope; binding; end
+  end
+  b = BindingScopeProbe.scope
+  assert_equal :here, b.eval("PROBE")
+  b.eval("FROM_STRING = 1")
+  assert_equal 1, BindingScopeProbe::FROM_STRING
+  assert_false Object.const_defined?(:FROM_STRING, false)
+  assert_false BindingScopeProbe.singleton_class.const_defined?(:FROM_STRING, false)
+  b.eval("class Inner; end; module InnerMod; end")
+  assert_true BindingScopeProbe.const_defined?(:Inner, false)
+  assert_true BindingScopeProbe.const_defined?(:InnerMod, false)
+  assert_false Object.const_defined?(:Inner, false)
+  assert_equal :base, b.eval("proc { BindingScopeProbeTop }").call
+  assert_equal :base, b.eval("[1].map { BindingScopeProbeTop }[0]")
+
+  # A block made in the string, and a binding taken in it, keep the scope.
+  b.eval("proc { FROM_BLOCK = 3 }").call
+  assert_equal 3, BindingScopeProbe::FROM_BLOCK
+  b.eval("binding").eval("FROM_INNER_BINDING = 4")
+  assert_equal 4, BindingScopeProbe::FROM_INNER_BINDING
+
+  # An instance method's binding and a string `class_eval`'s binding as well.
+  BindingScopeProbe.new.scope.eval("FROM_INSTANCE = 5")
+  assert_equal 5, BindingScopeProbe::FROM_INSTANCE
+  BindingScopeProbe.class_eval("binding").eval("FROM_CLASS_EVAL = 6")
+  assert_equal 6, BindingScopeProbe::FROM_CLASS_EVAL
+  assert_false Object.const_defined?(:FROM_CLASS_EVAL, false)
+end

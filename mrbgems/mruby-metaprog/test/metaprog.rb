@@ -358,6 +358,66 @@ assert 'Module#prepend #instance_methods(false)' do
   assert_equal([:m1], Class.new(Class.new{def m2;end}){ prepend Module.new; def m1; end }.instance_methods(false), bug6660)
 end
 
+assert('Module#public_method_defined?, #private_method_defined?, #protected_method_defined?') do
+  mod = Module.new do
+    def mpub; end
+    private def mpriv; end
+    protected def mprot; end
+  end
+  cls = Class.new do
+    include mod
+    def pub; end
+    private def priv; end
+    protected def prot; end
+  end
+  sub = Class.new(cls)
+
+  # each answers for exactly one visibility
+  assert_true  cls.public_method_defined?(:pub)
+  assert_false cls.public_method_defined?(:priv)
+  assert_false cls.public_method_defined?(:prot)
+  assert_false cls.private_method_defined?(:pub)
+  assert_true  cls.private_method_defined?(:priv)
+  assert_false cls.private_method_defined?(:prot)
+  assert_false cls.protected_method_defined?(:pub)
+  assert_false cls.protected_method_defined?(:priv)
+  assert_true  cls.protected_method_defined?(:prot)
+
+  # wherever the method is found
+  assert_true  sub.public_method_defined?(:mpub)
+  assert_true  sub.private_method_defined?(:mpriv)
+  assert_true  sub.protected_method_defined?(:mprot)
+  assert_true  cls.private_method_defined?("initialize")
+
+  # or only where the module defines it itself
+  assert_false sub.public_method_defined?(:pub, false)
+  assert_false sub.private_method_defined?(:priv, false)
+  assert_false sub.protected_method_defined?(:prot, false)
+  assert_true  cls.protected_method_defined?(:prot, false)
+
+  # a visibility changed in a subclass makes the method the subclass's own
+  hidden = Class.new(cls) { private :pub }
+  assert_true  hidden.private_method_defined?(:pub, false)
+  assert_false cls.private_method_defined?(:pub)
+
+  # a name with no method behind it, or with the method undefined
+  assert_false cls.public_method_defined?(:no_such_method)
+  assert_false cls.private_method_defined?(:no_such_method)
+  assert_false cls.protected_method_defined?(:no_such_method)
+  gone = Class.new(cls) { undef_method :pub }
+  assert_false gone.public_method_defined?(:pub)
+  assert_false gone.private_method_defined?(:pub)
+  assert_false gone.protected_method_defined?(:pub)
+  assert_false TestNotImplement.public_method_defined?(:gone)
+
+  # the name has to be a Symbol or a String, and inherit is the only other
+  # argument
+  assert_raise(TypeError) { cls.public_method_defined?(1) }
+  assert_raise(TypeError) { cls.private_method_defined?(nil) }
+  assert_raise(TypeError) { cls.protected_method_defined?([]) }
+  assert_raise(ArgumentError) { cls.public_method_defined?(:pub, false, false) }
+end
+
 assert('Module#remove_class_variable', '15.2.2.4.39') do
   class Test4RemoveClassVariable
     @@cv = 99
@@ -534,4 +594,123 @@ assert('Module#remove_method on a module prepended to Integer restores the built
   assert_equal [:prepended, 7, 2], diff
   a = 7
   assert_equal 5, a - 2
+end
+
+assert('Module.nesting from a method with a receiver', '15.2.2.2.2') do
+  # `def self.name` does not open a scope of its own: the nesting it answers
+  # with is the one around it, without the singleton class it was installed
+  # in. `class << self` does open one.
+  class Test4NestingInSdef
+    def self.plain; Module.nesting; end
+    class << self
+      def in_sclass; Module.nesting; end
+    end
+  end
+  assert_equal([Test4NestingInSdef], Test4NestingInSdef.plain)
+  assert_equal([Test4NestingInSdef.singleton_class, Test4NestingInSdef],
+               Test4NestingInSdef.in_sclass)
+end
+
+assert('Module#define_method - the visibility it takes from the scope') do
+  c = Class.new do
+    private
+    define_method(:priv) {}
+    protected
+    define_method(:prot) {}
+    public
+    define_method(:pub) {}
+    def self.make; define_method(:from_cm) {}; end
+  end
+  c.make
+  assert_equal [:priv], c.private_instance_methods(false)
+  assert_equal [:prot], c.protected_instance_methods(false)
+  assert_equal [:from_cm, :pub], c.public_instance_methods(false).sort
+
+  # the body of a `class << self` is a body too, and a `def self.x` there
+  # is public whatever it says
+  s = Class.new do
+    class << self
+      private
+      define_method(:sm) {}
+      def sd; end
+      def self.sx; end
+    end
+  end
+  assert_equal [], s.singleton_methods(false)
+  assert_equal [:sd, :sm], s.singleton_class.private_instance_methods(false).sort
+  assert_equal [:sx], s.singleton_class.singleton_methods(false)
+
+  # module_function scope: the instance method is private, the module one public
+  mod = Module.new do
+    module_function
+    define_method(:mf) {}
+  end
+  assert_equal [:mf], mod.private_instance_methods(false)
+  assert_equal [:mf], mod.singleton_methods(false)
+end
+
+assert('Module#attr_* - the visibility they take from the scope') do
+  c = Class.new do
+    private
+    attr_reader :r
+    attr_accessor :a
+    protected
+    attr_writer :w
+    public
+    attr_reader :p
+    def self.make; attr_reader :from_cm; end
+  end
+  c.make
+  assert_equal [:a, :a=, :r], c.private_instance_methods(false).sort
+  assert_equal [:w=], c.protected_instance_methods(false)
+  assert_equal [:from_cm, :p], c.public_instance_methods(false).sort
+
+  # the body of a `class << self` is a body too
+  s = Class.new do
+    class << self
+      private
+      attr_reader :sr
+    end
+  end
+  assert_equal [], s.singleton_methods(false)
+  assert_equal [:sr], s.singleton_class.private_instance_methods(false)
+
+  # module_function scope: private, with no module method copy
+  mod = Module.new do
+    module_function
+    attr_reader :mf
+  end
+  assert_equal [:mf], mod.private_instance_methods(false)
+  assert_equal [], mod.singleton_methods(false)
+end
+
+assert('Module#define_method - where a def in the block lands') do
+  # A `define_method` block keeps the scope it was written in, its cref
+  # along with its locals, so a `def` in it adds to that scope's class and
+  # not to the class the block was installed in.
+  class Test4DmDefTarget
+    def self.install; define_method(:go) { def m; :from_dm; end }; end
+  end
+  Test4DmDefTarget.install
+  Test4DmDefTarget.new.go
+  assert_equal(:from_dm, Test4DmDefTarget.new.m)
+
+  class Test4DmDefWritten
+    def self.body; ::Proc.new { def m; :from_written; end }; end
+  end
+  class Test4DmDefInstalled; end
+  Test4DmDefInstalled.send(:define_method, :go, Test4DmDefWritten.body)
+  Test4DmDefInstalled.new.go
+  assert_equal(:from_written, Test4DmDefWritten.new.m)
+  assert_raise(NoMethodError) { Test4DmDefInstalled.new.m }
+end
+
+assert('Module.nesting from a block given a class to run under') do
+  # `class_eval` names where a `def` in the block goes; the nesting the block
+  # answers with is still the one it was written in.
+  class Test4NestingRecv; end
+  module Test4NestingLex
+    def self.go; Test4NestingRecv.class_eval { Module.nesting }; end
+  end
+  assert_equal([Test4NestingLex], Test4NestingLex.go)
 end

@@ -987,19 +987,73 @@ find_visibility_scope(mrb_state *mrb, const struct RClass *c, int n, mrb_callinf
   *cp = NULL;
 }
 
+/* The visibility a method made by a call from Ruby takes, read from the
+   frame the C function was called from.  A call written in the body of the
+   class it defines on takes the visibility written there, as a `def` in
+   that body would; a call on another class, or from inside a method, makes
+   a public method.  The receiver has to be both the self and the class of
+   that frame, the way CRuby's `rb_vm_cref_in_context()` answers for
+   `define_method` and `rb_attr()`.  The body of a `class << self` is such
+   a body for its singleton class. */
+static int
+caller_scope_visibility(mrb_state *mrb, struct RClass *c, mrb_bool *modfunc)
+{
+  const struct mrb_context *ec = mrb->c;
+  mrb_callinfo *ci = ec->ci - 1;
+
+  *modfunc = FALSE;
+  if (ci < ec->cibase) return MRB_METHOD_PUBLIC_FL;
+  if (mrb_vm_ci_target_class(ci) != c) return MRB_METHOD_PUBLIC_FL;
+  mrb_value self = ci->stack[0];
+  if (!(mrb_class_p(self) || mrb_module_p(self) || mrb_sclass_p(self)) || mrb_class_ptr(self) != c) {
+    return MRB_METHOD_PUBLIC_FL;
+  }
+
+  struct REnv *e;
+  find_visibility_scope(mrb, c, 1, &ci, &e);
+  mrb_assert(ci || e);
+  *modfunc = e ? MRB_ENV_MODFUNC_P(e) : MRB_CI_MODFUNC_P(ci);
+  return (int)((e ? MRB_ENV_VISIBILITY(e) : MRB_CI_VISIBILITY(ci)) << 25);
+}
+
 /* Gives the current frame the visibility of the scope `p` was compiled
    against. `eval` on a string wants this: the string runs in that scope, so a
    `def` in it takes the visibility written there, while the frame goes on
    breaking the scope so that a `private` written inside the string stops at
    the end of it, the way CRuby's copy of the caller's cref does. A proc that
    captured no env was compiled against no Ruby scope and has none to lend. */
+/* The scope an eval string starts at.  find_visibility_env() answers the env
+   of the frame the string runs in, which is the class body itself where the
+   `eval` was written there.  Called from inside a method it is the method's
+   frame, whose visibility is the default: a `def` keeps a scope for what is
+   written in it but no env to write a visibility to, so the scope the string
+   starts at is the body the `def` was written in, one step further up.  The
+   env found is the body's own and is read now rather than copied at `def`,
+   which is what makes a `private` written after the `def` reach it, as
+   CRuby's cref does. */
+static struct REnv*
+find_eval_visibility_env(const struct RProc *p, const struct RClass *c)
+{
+  struct REnv *env = MRB_PROC_ENV(p);
+
+  for (const struct RProc *up = p->upper; up; up = up->upper) {
+    struct REnv *e = MRB_PROC_ENV(up);
+    if (e == NULL) continue;            /* a `def`, which keeps none */
+    if (e->c != c) break;               /* another class's scope */
+    env = e;
+    if (MRB_PROC_SCOPE_P(up)) break;    /* the body the `def` was written in */
+    if (MRB_ENV_VISIBILITY_BREAK_P(e)) break;
+  }
+  return env;
+}
+
 void
 mrb_vm_ci_inherit_visibility(mrb_state *mrb, const struct RProc *p)
 {
   mrb_callinfo *ci = mrb->c->ci;
 
   if (MRB_PROC_ENV(p) == NULL) return;
-  struct REnv *e = find_visibility_env(p, mrb_vm_ci_target_class(ci));
+  struct REnv *e = find_eval_visibility_env(p, mrb_vm_ci_target_class(ci));
   MRB_CI_SET_VISIBILITY(ci, MRB_ENV_VISIBILITY(e));
   if (MRB_ENV_MODFUNC_P(e)) {
     MRB_CI_SET_MODFUNC(ci);
@@ -1105,6 +1159,16 @@ eq_defined_mark(mrb_state *mrb, struct RClass *c)
   }
 }
 
+/* module_function scope: also define a public method on the singleton
+   class, so the module method (M.foo) mirrors the private instance one */
+static void
+define_modfunc_copy(mrb_state *mrb, struct RClass *c, mrb_sym mid, mrb_method_t m)
+{
+  MRB_SET_VISIBILITY_FLAGS(m.flags, MRB_METHOD_PUBLIC_FL);
+  prepare_singleton_class(mrb, (struct RBasic*)c);
+  mrb_define_method_raw(mrb, c->c, mid, m);
+}
+
 MRB_API void
 mrb_define_method_raw(mrb_state *mrb, struct RClass *c, mrb_sym mid, mrb_method_t m)
 {
@@ -1126,7 +1190,10 @@ mrb_define_method_raw(mrb_state *mrb, struct RClass *c, mrb_sym mid, mrb_method_
         p->flags |= MRB_PROC_SCOPE;
         p->c = NULL;
         mrb_field_write_barrier(mrb, (struct RBasic*)c, (struct RBasic*)p);
-        if (!MRB_PROC_ENV_P(p)) {
+        /* A proc made in a scope carries that scope's cref, which is what
+           a `def` in its body adds to.  Only one made outside any scope,
+           from C, has none to keep. */
+        if (!MRB_PROC_ENV_P(p) && p->e.target_class == NULL) {
           MRB_PROC_SET_TARGET_CLASS(p, c);
         }
       }
@@ -1148,18 +1215,17 @@ mrb_define_method_raw(mrb_state *mrb, struct RClass *c, mrb_sym mid, mrb_method_
     MRB_SET_VISIBILITY_FLAGS(flags, MRB_METHOD_PRIVATE_FL);
   }
   else if ((flags & MT_VMASK) == MT_VDEFAULT) {
-    /* singleton methods are always public */
-    if (c->tt == MRB_TT_SCLASS) {
-      MRB_SET_VISIBILITY_FLAGS(flags, MRB_METHOD_PUBLIC_FL);
-    }
-    else {
-      mrb_callinfo *ci;
-      struct REnv *e;
-      find_visibility_scope(mrb, c, 0, &ci, &e);
-      mrb_assert(ci || e);
-      MRB_SET_VISIBILITY_FLAGS(flags, (uint32_t)(e ? MRB_ENV_VISIBILITY(e) : MRB_CI_VISIBILITY(ci)) << 25);
-      modfunc = e ? MRB_ENV_MODFUNC_P(e) : MRB_CI_MODFUNC_P(ci);
-    }
+    /* The visibility written in the scope the `def` stands in.  The body of
+       a `class << self` is such a scope too: a `private` written there
+       reaches the `def`s below it, the way CRuby's cref for that body does.
+       Only a `def self.x` is public whatever the scope says, and the VM
+       passes that as an explicit visibility instead of the default. */
+    mrb_callinfo *ci;
+    struct REnv *e;
+    find_visibility_scope(mrb, c, 0, &ci, &e);
+    mrb_assert(ci || e);
+    MRB_SET_VISIBILITY_FLAGS(flags, (uint32_t)(e ? MRB_ENV_VISIBILITY(e) : MRB_CI_VISIBILITY(ci)) << 25);
+    modfunc = e ? MRB_ENV_MODFUNC_P(e) : MRB_CI_MODFUNC_P(ci);
   }
   mt_put(mrb, h, mid, flags, ptr);
   if (!mrb->bootstrapping) {
@@ -1168,12 +1234,7 @@ mrb_define_method_raw(mrb_state *mrb, struct RClass *c, mrb_sym mid, mrb_method_
     if (mid == MRB_OPSYM(eq)) eq_defined_mark(mrb, named);
   }
   if (modfunc) {
-    /* module_function scope: also define a public method on the singleton
-       class, so the module method (M.foo) mirrors the private instance one */
-    mrb_method_t sm = m;
-    MRB_SET_VISIBILITY_FLAGS(sm.flags, MRB_METHOD_PUBLIC_FL);
-    prepare_singleton_class(mrb, (struct RBasic*)c);
-    mrb_define_method_raw(mrb, c->c, mid, sm);
+    define_modfunc_copy(mrb, c, mid, m);
   }
 }
 
@@ -2559,6 +2620,31 @@ mrb_mod_initialize(mrb_state *mrb, mrb_value mod)
   return mod;
 }
 
+/* A visibility written in a class body has to outlive the body: a `def` there
+   keeps no visibility of its own, and an eval string run inside such a method
+   reads the body's.  The body keeps it on its frame until something needs it
+   later, so the frame is given an env to keep it in.  Only a visibility that
+   is not the default is worth an env: a body that writes `public` where
+   `public` already stands would pay for saying nothing. */
+static void
+vis_scope_persist(mrb_state *mrb, mrb_callinfo **cp, struct REnv **ep, uint32_t vis)
+{
+  if (*ep || vis == (MRB_METHOD_PUBLIC_FL >> 25)) return;
+  struct REnv *e = mrb_vm_ci_env_reify(mrb, mrb->c, *cp);
+  if (e == NULL) return;
+  /* The frame keeps the env, and so does the proc running in it: the walk a
+     `def` inside this body makes later reads procs rather than frames, and
+     the frame will be gone by then. */
+  struct RProc *proc = (struct RProc*)(*cp)->proc;
+  if (proc && !MRB_PROC_ENV_P(proc)) {
+    proc->e.env = e;
+    proc->flags |= MRB_PROC_ENVSET;
+    mrb_field_write_barrier(mrb, (struct RBasic*)proc, (struct RBasic*)e);
+  }
+  *ep = e;
+  *cp = NULL;
+}
+
 static void
 mrb_mod_visibility(mrb_state *mrb, mrb_value mod, int vis)
 {
@@ -2572,6 +2658,7 @@ mrb_mod_visibility(mrb_state *mrb, mrb_value mod, int vis)
     mrb_callinfo *ci;
     struct REnv *e;
     find_visibility_scope(mrb, NULL, 1, &ci, &e);
+    vis_scope_persist(mrb, &ci, &e, (uint32_t)(vis >> 25));
     if (e) {
       MRB_ENV_SET_VISIBILITY(e, vis >> 25);
       MRB_ENV_CLEAR_MODFUNC(e);  /* an explicit visibility ends module_function scope */
@@ -2598,6 +2685,11 @@ mrb_mod_visibility(mrb_state *mrb, mrb_value mod, int vis)
     struct RClass *t = c;
     MRB_CLASS_ORIGIN(t);
     mrb_mt_tbl *h = mt_writable(mrb, c, t);
+    if (argc == 1 && mrb_array_p(argv[0])) {
+      /* the names `attr_accessor` and its kin answer with */
+      argc = RARRAY_LEN(argv[0]);
+      argv = RARRAY_PTR(argv[0]);
+    }
     for (int i=0; i<argc; i++) {
       mrb_check_type(mrb, argv[i], MRB_TT_SYMBOL);
       mrb_sym mid = mrb_symbol(argv[i]);
@@ -3267,8 +3359,11 @@ prepare_writer_name(mrb_state *mrb, mrb_sym sym)
   return prepare_name_common(mrb, sym, NULL, "=");
 }
 
+/* Defines the accessors named and answers their names, reader before
+   writer for each name, so that `private attr_accessor :a` can pass them on
+   the way CRuby's answer can. */
 static mrb_value
-mod_attr_define(mrb_state *mrb, mrb_value mod, mrb_int aargc, mrb_value (*accessor)(mrb_state*, mrb_value), mrb_sym (*access_name)(mrb_state*, mrb_sym))
+mod_attr_define(mrb_state *mrb, mrb_value mod, mrb_bool reader, mrb_bool writer)
 {
   struct RClass *c = mrb_class_ptr(mod);
   const mrb_value *argv;
@@ -3276,22 +3371,30 @@ mod_attr_define(mrb_state *mrb, mrb_value mod, mrb_int aargc, mrb_value (*access
 
   mrb_get_args(mrb, "*", &argv, &argc);
 
+  /* An accessor made in a module_function scope is private and gets no
+     module method copy, as CRuby's `rb_attr()` makes it. */
+  mrb_bool modfunc;
+  int vis = caller_scope_visibility(mrb, c, &modfunc);
+
+  mrb_value names = mrb_ary_new_capa(mrb, argc * (reader + writer));
   int ai = mrb_gc_arena_save(mrb);
   for (int i=0; i<argc; i++) {
-    mrb_sym method = to_sym(mrb, argv[i]);
-    mrb_value name = prepare_ivar_name(mrb, method);
-    if (access_name) {
-      method = access_name(mrb, method);
+    mrb_sym sym = to_sym(mrb, argv[i]);
+    mrb_value ivar = prepare_ivar_name(mrb, sym);
+    for (int w = 0; w < 2; w++) {
+      if (!(w ? writer : reader)) continue;
+      mrb_sym mid = w ? prepare_writer_name(mrb, sym) : sym;
+      struct RProc *p = mrb_proc_new_cfunc_with_env(mrb, w ? mrb_attr_writer : mrb_attr_reader, 1, &ivar);
+      if (!w) p->flags |= MRB_PROC_NOARG;
+      mrb_method_t m;
+      MRB_METHOD_FROM_PROC(m, p);
+      MRB_METHOD_SET_VISIBILITY(m, vis);
+      mrb_define_method_raw(mrb, c, mid, m);
+      mrb_ary_push(mrb, names, mrb_symbol_value(mid));
     }
-
-    struct RProc *p = mrb_proc_new_cfunc_with_env(mrb, accessor, 1, &name);
-    p->flags |= aargc == 0 ? MRB_PROC_NOARG : 0;
-    mrb_method_t m;
-    MRB_METHOD_FROM_PROC(m, p);
-    mrb_define_method_raw(mrb, c, method, m);
     mrb_gc_arena_restore(mrb, ai);
   }
-  return mrb_nil_value();
+  return names;
 }
 
 mrb_value
@@ -3304,7 +3407,7 @@ mrb_attr_reader(mrb_state *mrb, mrb_value obj)
 static mrb_value
 mrb_mod_attr_reader(mrb_state *mrb, mrb_value mod)
 {
-  return mod_attr_define(mrb, mod, 0, mrb_attr_reader, NULL);
+  return mod_attr_define(mrb, mod, TRUE, FALSE);
 }
 
 mrb_value
@@ -3320,14 +3423,13 @@ mrb_attr_writer(mrb_state *mrb, mrb_value obj)
 static mrb_value
 mrb_mod_attr_writer(mrb_state *mrb, mrb_value mod)
 {
-  return mod_attr_define(mrb, mod, 1, mrb_attr_writer, prepare_writer_name);
+  return mod_attr_define(mrb, mod, FALSE, TRUE);
 }
 
 static mrb_value
 mrb_mod_attr_accessor(mrb_state *mrb, mrb_value mod)
 {
-  mrb_mod_attr_reader(mrb, mod);
-  return mrb_mod_attr_writer(mrb, mod);
+  return mod_attr_define(mrb, mod, TRUE, TRUE);
 }
 
 static mrb_value
@@ -4261,14 +4363,38 @@ mrb_mod_const_missing(mrb_state *mrb, mrb_value mod)
   return mrb_const_missing(mrb, mod, sym);
 }
 
+/* The visibility of the method `mod` answers `name` with, or -1 when there is
+   none to answer with.  `mrb_obj_respond_to` answers for any method it finds,
+   so the search is made here to weigh the visibility the listing reports on.
+   With `inherit` false the method has to be `mod`'s own: the walk starts at
+   the origin, past the modules prepended in front of it, and a method found
+   further up is not counted.  The arguments are read here so that the four
+   methods built on this (`method_defined?` and the three in mruby-metaprog)
+   read them the same way. */
+int
+mrb_mod_method_visibility(mrb_state *mrb, mrb_value mod)
+{
+  mrb_sym id;
+  mrb_bool inherit = TRUE;
+
+  mrb_get_args(mrb, "n|b", &id, &inherit);
+  struct RClass *c = mrb_class_ptr(mod);
+  if (!inherit) MRB_CLASS_ORIGIN(c);
+  struct RClass *found = c;
+  mrb_method_t m = mrb_method_search_vm(mrb, &found, id);
+  if (MRB_METHOD_UNDEF_P(m) || MRB_METHOD_NOTIMPL_P(m)) return -1;
+  if (!inherit && found != c) return -1;
+  return MRB_METHOD_VISIBILITY(m);
+}
+
 /* 15.2.2.4.34 */
 /*
  *  call-seq:
- *     mod.method_defined?(symbol)    -> true or false
+ *     mod.method_defined?(symbol, inherit=true)    -> true or false
  *
  *  Returns `true` if the named method is defined by
- *  _mod_ (or its included modules and, if _mod_ is a class,
- *  its ancestors). Public and protected methods are matched.
+ *  _mod_.  If _inherit_ is set, the lookup will also search _mod_'s
+ *  ancestors. Public and protected methods are matched.
  *
  *     module A
  *       def method1()  end
@@ -4281,25 +4407,20 @@ mrb_mod_const_missing(mrb_state *mrb, mrb_value mod)
  *       def method3()  end
  *     end
  *
- *     A.method_defined? :method1    #=> true
- *     C.method_defined? "method1"   #=> true
- *     C.method_defined? "method2"   #=> true
- *     C.method_defined? "method3"   #=> true
- *     C.method_defined? "method4"   #=> false
+ *     A.method_defined? :method1           #=> true
+ *     C.method_defined? "method1"          #=> true
+ *     C.method_defined? "method2"          #=> true
+ *     C.method_defined? "method2", true    #=> true
+ *     C.method_defined? "method2", false   #=> false
+ *     C.method_defined? "method3"          #=> true
+ *     C.method_defined? "method4"          #=> false
  */
 
 static mrb_value
 mrb_mod_method_defined(mrb_state *mrb, mrb_value mod)
 {
-  mrb_sym id;
-
-  mrb_get_args(mrb, "n", &id);
-  /* `mrb_obj_respond_to` answers for any method it finds, so the search is
-     made here to weigh the visibility the listing reports on. */
-  struct RClass *c = mrb_class_ptr(mod);
-  mrb_method_t m = mrb_method_search_vm(mrb, &c, id);
-  if (MRB_METHOD_UNDEF_P(m) || MRB_METHOD_NOTIMPL_P(m)) return mrb_false_value();
-  return mrb_bool_value(!(m.flags & MRB_METHOD_PRIVATE_FL));
+  int vis = mrb_mod_method_visibility(mrb, mod);
+  return mrb_bool_value(vis == MRB_METHOD_PUBLIC_FL || vis == MRB_METHOD_PROTECTED_FL);
 }
 
 void
@@ -4358,7 +4479,16 @@ define_method_m(mrb_state *mrb, struct RClass *c, int vis)
 mrb_value
 mrb_mod_define_method_m(mrb_state *mrb, struct RClass *c)
 {
-  return define_method_m(mrb, c, MRB_METHOD_PUBLIC_FL);
+  mrb_bool modfunc;
+  int vis = caller_scope_visibility(mrb, c, &modfunc);
+  mrb_value name = define_method_m(mrb, c, vis);
+  if (modfunc) {
+    /* the copy is made of what the name now resolves to, as the copy
+       `module_function :name` makes is */
+    mrb_sym mid = mrb_symbol(name);
+    define_modfunc_copy(mrb, c, mid, mrb_method_search(mrb, c, mid));
+  }
+  return name;
 }
 
 static mrb_value
@@ -4405,6 +4535,7 @@ mrb_mod_module_function(mrb_state *mrb, mrb_value mod)
     mrb_callinfo *ci;
     struct REnv *e;
     find_visibility_scope(mrb, NULL, 1, &ci, &e);
+    vis_scope_persist(mrb, &ci, &e, MRB_METHOD_PRIVATE_FL >> 25);
     if (e) {
       MRB_ENV_SET_VISIBILITY(e, MRB_METHOD_PRIVATE_FL >> 25);
       MRB_ENV_SET_MODFUNC(e);
@@ -4859,7 +4990,7 @@ static const mrb_mt_entry mod_rom_entries[] = {
   MRB_MT_ENTRY(mrb_mod_to_s,            MRB_SYM(inspect),          MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_do_nothing,          MRB_SYM(method_added),     MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_do_nothing,          MRB_SYM(method_removed),   MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
-  MRB_MT_ENTRY(mrb_mod_method_defined,  MRB_SYM_Q(method_defined), MRB_ARGS_REQ(1)),                   /* 15.2.2.4.34 */
+  MRB_MT_ENTRY(mrb_mod_method_defined,  MRB_SYM_Q(method_defined), MRB_ARGS_ARG(1,1)),                 /* 15.2.2.4.34 */
   MRB_MT_ENTRY(mrb_do_nothing,          MRB_SYM(method_undefined), MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_mod_module_eval,     MRB_SYM(module_eval),      MRB_ARGS_ANY()),                    /* 15.2.2.4.35 */
   MRB_MT_ENTRY(mrb_mod_module_function, MRB_SYM(module_function),  MRB_ARGS_ANY() | MRB_MT_PRIVATE),

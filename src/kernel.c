@@ -644,8 +644,10 @@ obj_respond_to_p(mrb_state *mrb, mrb_value self, mrb_sym id, mrb_bool priv)
       return TRUE;
     }
   }
+  /* An entry `undef_method` left behind is not a redefinition: it stops the
+     lookup without standing for one, so it is not asked, as in CRuby. */
   mrb_sym rtm_id = MRB_SYM_Q(respond_to_missing);
-  if (!mrb_func_basic_p(mrb, self, rtm_id, mrb_false)) {
+  if (!mrb_func_basic_p(mrb, self, rtm_id, mrb_false) && mrb_respond_to(mrb, self, rtm_id)) {
     mrb_value v = mrb_funcall_argv2(mrb, self, rtm_id, mrb_symbol_value(id), mrb_bool_value(priv));
     return mrb_bool(v);
   }
@@ -743,7 +745,7 @@ mrb_f_defined_method(mrb_state *mrb, mrb_value self)
   mrb_get_args(mrb, "n", &sym);
   mrb_sym rt_id = MRB_SYM_Q(respond_to);
   mrb_bool found;
-  if (mrb_func_basic_p(mrb, self, rt_id, obj_respond_to)) {
+  if (mrb_func_basic_p(mrb, self, rt_id, obj_respond_to) || !mrb_respond_to(mrb, self, rt_id)) {
     found = obj_respond_to_p(mrb, self, sym, TRUE);
   }
   else {
@@ -770,7 +772,7 @@ mrb_f_defined_const(mrb_state *mrb, mrb_value self)
   /* resolve in the caller's lexical scope (ci[-1]), not this helper's */
   mrb_callinfo *ci = &mrb->c->ci[-1];
   if (ci >= mrb->c->cibase && ci->proc &&
-      mrb_vm_const_defined_p(mrb, ci->proc, sym)) {
+      mrb_vm_const_defined_p(mrb, ci, sym)) {
     return mrb_str_new_lit_frozen(mrb, "constant");
   }
   return mrb_nil_value();
@@ -844,7 +846,7 @@ mrb_f_defined_const_path(mrb_state *mrb, mrb_value self)
   if (mrb_nil_p(start)) {
     mrb_callinfo *ci = &mrb->c->ci[-1];
     if (ci < mrb->c->cibase || ci->proc == NULL) return mrb_nil_value();
-    outer = mrb_vm_const_get_noraise(mrb, ci->proc, mrb_symbol(RARRAY_PTR(path)[0]));
+    outer = mrb_vm_const_get_noraise(mrb, ci, mrb_symbol(RARRAY_PTR(path)[0]));
     if (mrb_undef_p(outer)) return mrb_nil_value();
     i = 1;
   }
@@ -878,7 +880,7 @@ mrb_f_defined_method_on(mrb_state *mrb, mrb_value self)
   mrb_method_t m = mrb_method_search_vm(mrb, &c, sym);
   if (MRB_METHOD_UNDEF_P(m)) {
     mrb_sym rtm_id = MRB_SYM_Q(respond_to_missing);
-    if (!mrb_func_basic_p(mrb, recv, rtm_id, mrb_false)) {
+    if (!mrb_func_basic_p(mrb, recv, rtm_id, mrb_false) && mrb_respond_to(mrb, recv, rtm_id)) {
       mrb_value v = mrb_funcall_argv2(mrb, recv, rtm_id,
                                       mrb_symbol_value(sym), mrb_false_value());
       if (mrb_test(v)) return mrb_str_new_lit_frozen(mrb, "method");
@@ -897,6 +899,18 @@ mrb_f_defined_method_on(mrb_state *mrb, mrb_value self)
 }
 
 /* ---------------------------*/
+/*
+ * A hash pattern reads what #deconstruct_keys answered through __pat_values,
+ * which only Hash carries, so anything else lands here and gets the TypeError
+ * CRuby raises for it.
+ */
+static mrb_value
+obj_pat_values(mrb_state *mrb, mrb_value self)
+{
+  mrb_raise(mrb, E_TYPE_ERROR, "deconstruct_keys must return Hash");
+  return mrb_nil_value();       /* not reached */
+}
+
 static const mrb_mt_entry kernel_rom_entries[] = {
   MRB_MT_ENTRY(mrb_f_defined_const_path, MRB_SYM_Q(__defined_const_path), MRB_ARGS_REQ(2) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_f_defined_method, MRB_SYM_Q(__defined_method), MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
@@ -932,6 +946,7 @@ static const mrb_mt_entry kernel_rom_entries[] = {
   MRB_MT_ENTRY(obj_respond_to,                   MRB_SYM_Q(respond_to), MRB_ARGS_ARG(1,1)),  /* 15.3.1.3.43 */
   MRB_MT_ENTRY(mrb_any_to_s,                     MRB_SYM(to_s),                      MRB_ARGS_NONE()),  /* 15.3.1.3.46 */
   MRB_MT_ENTRY(mrb_obj_ceqq,                     MRB_SYM(__case_eqq),     MRB_ARGS_REQ(1)),  /* internal */
+  MRB_MT_ENTRY(obj_pat_values,                   MRB_SYM(__pat_values),   MRB_ARGS_REQ(1)),  /* internal */
   MRB_MT_ENTRY(mrb_false,                MRB_SYM_Q(respond_to_missing),      MRB_ARGS_ARG(1,1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_obj_method_recursive_p,       MRB_SYM_Q(__method_recursive), MRB_ARGS_ARG(1,1)),
 #ifndef HAVE_MRUBY_IO_GEM
