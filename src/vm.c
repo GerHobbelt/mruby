@@ -1631,6 +1631,21 @@ task_across_c_boundary(mrb_state *mrb)
    executing across a C call boundary (see task_across_c_boundary). A
    pending MRB_TASK_STOPPED is not deferred, since the task is going away.
 
+   A pending switch is likewise deferred while an exception is in flight
+   (mrb->exc set). The L_RAISE handler-found path repoints ci->pc at the
+   catch handler and falls into NEXT; honoring the switch there returns
+   early BEFORE OP_EXCEPT consumes the exception, so the scheduler's
+   execute_task_vm mistakes the already-handled exception for an
+   unhandled one, captures it as the task result and clears mrb->exc —
+   the resumed task then runs the rescue with no exception pending and
+   the begin block silently evaluates to nil. Observed in the field as a
+   C extension's mrb_raise being un-rescuable whenever it fires after a
+   long-blocking call (the timeslice always expires mid-call, so
+   task.switching is always pending at raise time). The same window
+   covers break/ensure unwinding, which carries RBreak in mrb->exc
+   across NEXT. Deferral is bounded: the handler's first instruction
+   consumes mrb->exc, so the switch happens one instruction later.
+
    mrb->jmp is restored to prev_jmp before returning, exactly as the
    normal return paths below do. mrb_vm_exec set mrb->jmp to its own
    stack-local c_jmp on entry; leaving it dangling after this early return
@@ -1649,6 +1664,7 @@ task_across_c_boundary(mrb_state *mrb)
    inside mrb_vm_exec (via NEXT / END_DISPATCH). */
 #define RETURN_IF_TASK_STOPPED(mrb) do { \
   if (((mrb)->task.switching && (mrb)->c != (mrb)->root_c && \
+       !(mrb)->exc && \
        !(mrb)->gc.iterating && !task_across_c_boundary(mrb)) || \
       (mrb)->c->status == MRB_TASK_STOPPED) { \
     (mrb)->jmp = prev_jmp; \
@@ -2468,13 +2484,42 @@ RETRY_TRY_BLOCK:
     }
 
     CASE(OP_GETIV, BB) {
-      regs[a] = mrb_iv_get(mrb, regs[0], irep->syms[b]);
+      mrb_value recv = regs[0];
+      /* shaped fast path: self is almost always a plain object here, and the
+         lookup neither allocates nor raises, so ci stays valid */
+      if (mrb_type(recv) == MRB_TT_OBJECT) {
+        struct RObject *o = mrb_obj_ptr(recv);
+        if (MRB_OBJ_SHAPED_P(o) && o->iv) {
+          mrb_shaped_iv *siv = (mrb_shaped_iv*)o->iv;
+          int idx = mrb_shape_lookup(mrb, siv->shape, irep->syms[b]);
+          regs[a] = (idx >= 0 && !mrb_undef_p(siv->values[idx]))
+                    ? siv->values[idx] : mrb_nil_value();
+          NEXT;
+        }
+      }
+      regs[a] = mrb_iv_get(mrb, recv, irep->syms[b]);
       ci = mrb->c->ci;
       NEXT;
     }
 
     CASE(OP_SETIV, BB) {
-      mrb_iv_set(mrb, regs[0], irep->syms[b], regs[a]);
+      mrb_value recv = regs[0];
+      /* shaped fast path: only overwrite an already-present slot on an
+         unfrozen object; shape transitions, frozen errors and non-objects
+         take the full path */
+      if (mrb_type(recv) == MRB_TT_OBJECT) {
+        struct RObject *o = mrb_obj_ptr(recv);
+        if (MRB_OBJ_SHAPED_P(o) && o->iv && !mrb_frozen_p(o)) {
+          mrb_shaped_iv *siv = (mrb_shaped_iv*)o->iv;
+          int idx = mrb_shape_lookup(mrb, siv->shape, irep->syms[b]);
+          if (idx >= 0 && !mrb_undef_p(siv->values[idx])) {
+            siv->values[idx] = regs[a];
+            mrb_field_write_barrier_value(mrb, (struct RBasic*)o, regs[a]);
+            NEXT;
+          }
+        }
+      }
+      mrb_iv_set(mrb, recv, irep->syms[b], regs[a]);
       ci = mrb->c->ci;
       NEXT;
     }
@@ -2845,6 +2890,32 @@ RETRY_TRY_BLOCK:
         /* handle alias */
         MRB_PROC_RESOLVE_ALIAS(ci, p);
         CI_PROC_SET(ci, p);
+        if (MRB_PROC_CFUNC_P(p) && MRB_PROC_ENV_P(p) && !ci->blk && ci->nk == 0) {
+          /* attr accessor fast path: access the ivar in place and pop the
+             frame instead of doing a full cfunc call. Only for cases that
+             cannot raise: reads never do; writes are limited to unfrozen
+             plain objects. Arity/frozen errors fall to the normal call. */
+          mrb_func_t f = MRB_PROC_CFUNC(p);
+          mrb_value name;
+          if (f == mrb_attr_reader && ci->n == 0 &&
+              mrb_symbol_p(name = MRB_PROC_ENV(p)->stack[0])) {
+            mrb_value va = mrb_iv_get(mrb, recv, mrb_symbol(name));
+            mrb->c->ci--;       /* fresh frame: no env, no blk */
+            ci = mrb->c->ci;
+            regs[a] = va;
+            NEXT;
+          }
+          if (f == mrb_attr_writer && ci->n == 1 &&
+              mrb_type(recv) == MRB_TT_OBJECT && !mrb_obj_ptr(recv)->frozen &&
+              mrb_symbol_p(name = MRB_PROC_ENV(p)->stack[0])) {
+            mrb_value va = regs[1];
+            mrb_obj_iv_set_force(mrb, mrb_obj_ptr(recv), mrb_symbol(name), va);
+            mrb->c->ci--;       /* fresh frame: no env, no blk */
+            ci = mrb->c->ci;
+            regs[a] = va;
+            NEXT;
+          }
+        }
         if (!MRB_PROC_CFUNC_P(p)) {
           /* setup environment for calling method */
           irep = p->body.irep;
@@ -3049,7 +3120,11 @@ RETRY_TRY_BLOCK:
     L_RETURN_FALSE:
       v = mrb_false_value();
     L_RETURN:
-      mrb_gc_protect(mrb, v);
+      /* cipop below may allocate (env unshare), and the returning frame's
+         slots are no longer scanned after the pop, so keep a heap return
+         value in the arena; immediates need no protection and skipping the
+         call matters on integer-heavy return paths */
+      if (!mrb_immediate_p(v)) mrb_gc_protect(mrb, v);
       return_ci = ci;
       CHECKPOINT_RESTORE(RBREAK_TAG_BREAK) {
         if (TRUE) {
@@ -3063,7 +3138,7 @@ RETRY_TRY_BLOCK:
           ci = mrb->c->ci;
           v = ci->stack[a];
         }
-        mrb_gc_protect(mrb, v);
+        if (!mrb_immediate_p(v)) mrb_gc_protect(mrb, v);
       }
       CHECKPOINT_MAIN(RBREAK_TAG_BREAK) {
         for (;;) {
@@ -3415,12 +3490,24 @@ RETRY_TRY_BLOCK:
     }
 
     CASE(OP_ARYCAT, B) {
-      mrb_value splat = mrb_ary_splat(mrb, regs[a+1]);
-      ci = mrb->c->ci;
+      mrb_value v = regs[a+1];
       if (mrb_nil_p(regs[a])) {
-        regs[a] = splat;
+        /* becomes the argument accumulator, which OP_ARYPUSH/ARYCAT then
+           append to, so it must be a fresh array independent of v */
+        regs[a] = mrb_ary_splat(mrb, v);
+        ci = mrb->c->ci;
+      }
+      else if (mrb_array_p(v)) {
+        /* concat only reads v, so splat here would just dup v and copy it
+           twice; concatenate straight from v (ary_concat handles v aliasing
+           regs[a]) */
+        mrb_ensure_array_type(mrb, regs[a]);
+        mrb_ary_concat(mrb, regs[a], v);
       }
       else {
+        /* non-array: to_a already yields a fresh array, no extra dup needed */
+        mrb_value splat = mrb_ary_splat(mrb, v);
+        ci = mrb->c->ci;
         mrb_ensure_array_type(mrb, regs[a]);
         mrb_ary_concat(mrb, regs[a], splat);
       }

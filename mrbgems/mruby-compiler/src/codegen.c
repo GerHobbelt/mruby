@@ -1100,7 +1100,7 @@ search_upvar(mrc_codegen_scope *s, mrc_sym id, int *idx)
     pm_constant_t *constant = pm_constant_pool_id_to_constant(&s->c->p->constant_pool, id);
     mrc_sym intern = mrb_intern(s->c->mrb, (const char *)constant->start, constant->length);
     while (u && !MRC_PROC_CFUNC_P(u)) {
-      const struct mrc_irep *ir = u->body.irep;
+      const struct mrc_irep *ir = (const struct mrc_irep *)u->body.irep;
       uint_fast16_t n = ir->nlocals;
       int i;
       const mrc_sym *v = ir->lv;
@@ -2365,7 +2365,7 @@ mrc_mruby_numbered_parameter_upvar(mrc_codegen_scope *s, mrc_sym id, int *lv, in
   const struct RProc *u = s->c->upper;
   *lv = 0;
   while (u && !MRC_PROC_CFUNC_P(u)) {
-    const struct mrc_irep *ir = u->body.irep;
+    const struct mrc_irep *ir = (const struct mrc_irep *)u->body.irep;
     uint_fast16_t n = ir->nlocals;
     const mrc_sym *v = ir->lv;
     int number = constant->start[1] - '0';
@@ -3462,9 +3462,31 @@ lambda_body(mrc_codegen_scope *s, mrc_node *tree, mrc_node *body, pm_constant_id
     if (!tree || nint(tree) != PM_NUMBERED_PARAMETERS_NODE) {
       /* empty block or `it`: insert null_mark as a placeholder for slot 1 */
       mrc_constant_id_list_append(s, lv, null_mark);
+      for (i = 0; i < locals->size; i++) {
+        mrc_constant_id_list_append(s, lv, locals->ids[i]);
+      }
     }
-    for (i = 0; i < locals->size; i++) {
-      mrc_constant_id_list_append(s, lv, locals->ids[i]);
+    else {
+      /* Numbered parameters must own the first na slots so the arguments are
+         stored into them, but Prism lists block locals in order of first
+         appearance -- `{ tmp = _1 }` yields [tmp, _1]. Lay out _1.._na first
+         (interning returns the ids the parser already created) and the
+         remaining locals after them. */
+      static const char *const num_names[9] = {"_1","_2","_3","_4","_5","_6","_7","_8","_9"};
+      for (int k = 0; k < na; k++) {
+        pm_constant_id_t nid = pm_constant_pool_insert_constant(&s->c->p->constant_pool,
+                                 (const uint8_t*)num_names[k], 2);
+        mrc_constant_id_list_append(s, lv, nid);
+      }
+      for (i = 0; i < locals->size; i++) {
+        int k;
+        for (k = 0; k < na; k++) {
+          if (lv->ids[k] == locals->ids[i]) break;
+        }
+        if (k == na) {
+          mrc_constant_id_list_append(s, lv, locals->ids[i]);
+        }
+      }
     }
     ma = mma = oa = ra = pa = ppa = ka = kd = ba = 0;
   }
@@ -5778,12 +5800,18 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
     case PM_NEXT_NODE:
     {
       CAST(next);
-      if (!s->loop) {
+      /* next targets the enclosing loop or block, not the exception
+         frames of surrounding begin/rescue, just like break and redo */
+      struct loopinfo *lp = s->loop;
+      while (lp && (lp->type == LOOP_BEGIN || lp->type == LOOP_RESCUE)) {
+        lp = lp->prev;
+      }
+      if (!lp) {
         raise_error(s, "unexpected next");
       }
-      else if (s->loop->type == LOOP_NORMAL) {
+      else if (lp->type == LOOP_NORMAL) {
         codegen(s, (mrc_node *)cast->arguments, NOVAL);
-        genjmp(s, OP_JMPUW, s->loop->pc0);
+        genjmp(s, OP_JMPUW, lp->pc0);
       }
       else {
         if ((mrc_node *)cast->arguments) {
@@ -5889,9 +5917,12 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
 
       /* ensure */
       if (cast->ensure_clause && cast->ensure_clause->statements) {
-        /* When rescue is present with val=1, cursp is 1 higher than the no-rescue case.
-         * Normalize before gen_ensure so that the exception register lands consistently. */
-        if (cast->rescue_clause && val) pop();
+        /* When rescue is present, cursp is 1 higher than the no-rescue case
+         * regardless of val. Normalize before gen_ensure so that the node
+         * stays register-balanced; otherwise a NOVAL begin/rescue/ensure
+         * (e.g. as a loop body) leaks one register and `break value` lands
+         * in a different register than the loop exit reads. */
+        if (cast->rescue_clause) pop();
         gen_ensure(s, (mrc_node *)cast->ensure_clause, ensure_catch_entry, ensure_begin);
       }
       else {

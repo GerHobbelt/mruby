@@ -208,6 +208,8 @@ mrb_static_assert(MRB_GC_RED <= GC_COLOR_MASK);
 
 mrb_noreturn void mrb_raise_nomemory(mrb_state *mrb);
 
+static void incremental_gc_finish(mrb_state *mrb, mrb_gc *gc);
+
 MRB_API void*
 mrb_realloc_simple(mrb_state *mrb, void *p,  size_t len)
 {
@@ -219,17 +221,45 @@ mrb_realloc_simple(mrb_state *mrb, void *p,  size_t len)
   }
 #endif
   p2 = mrb_basic_alloc_func(p, len);
-  if (!p2 && len > 0 && mrb->gc.heaps && mrb->gc.state != MRB_GC_STATE_SWEEP) {
-    mrb_full_gc(mrb);
+  if (!p2 && len > 0 && mrb->gc.heaps && !mrb->gc.collecting) {
+    /* collecting == FALSE means no mark/sweep is running on the stack, so
+       this failure is a mutator allocation, not one from inside the GC
+       engine (e.g. an RData dfree during sweep). Recovery runs only here; a
+       reentrant failure falls through to raise NoMemoryError as before.
+       gc_drive() sets collecting. */
+    if (mrb->gc.state == MRB_GC_STATE_SWEEP) {
+      /* Mid-sweep: starting a new mark cycle here is unsafe, but finishing
+         the in-progress sweep is safe and is exactly what reclaims memory.
+         Without this an allocation failure while parked in SWEEP raised
+         NoMemoryError even though free slots were about to be produced. */
+      if (!mrb->gc.disabled && !mrb->gc.iterating) {
+        incremental_gc_finish(mrb, &mrb->gc);
+      }
+    }
+    else {
+      mrb_full_gc(mrb);
+    }
     p2 = mrb_basic_alloc_func(p, len);
   }
 
   if (p2 && len > 0) {
     mrb->gc.malloc_increase += len;
-    if (mrb->gc.malloc_threshold > 0 &&
+    if (p == NULL &&
+        mrb->gc.malloc_threshold > 0 &&
         mrb->gc.malloc_increase >= mrb->gc.malloc_threshold &&
         mrb->gc.state == MRB_GC_STATE_ROOT &&
         !mrb->gc.disabled && !mrb->gc.iterating) {
+      /* Only a fresh allocation (p == NULL) may drive the collector here. A
+         realloc (p != NULL) has just freed the caller's old block, but the
+         caller has not yet stored the returned pointer back into the object it
+         belongs to -- e.g. ht_adjust_ea() does `ea = ea_resize(...)` and only
+         then `ht_set_ea(h, ea)`, and ary_expand_capa() likewise. Running an
+         incremental mark in that window would mark the still-reachable
+         container (Hash/Array/String/...) while it holds the dangling old
+         pointer, a use-after-free. A fresh allocation frees nothing the caller
+         references, so it is a safe point to step GC. Byte pressure from
+         reallocs is not lost: malloc_increase keeps accumulating above and
+         fires at the next fresh allocation. */
       mrb->gc.malloc_increase = 0;
       mrb_incremental_gc(mrb);
     }
@@ -580,7 +610,44 @@ mrb_obj_alloc_core(mrb_state *mrb, enum mrb_vtype ttype, struct RClass *cls)
   }
   gc_arena_keep(mrb, gc);
   if (gc->free_heaps == NULL) {
-    add_heap(mrb, gc);
+    /* Free slots ran out: try to reclaim before growing. A full
+       collection finishes the (possibly half-run) incremental cycle
+       and sweeps its garbage, usually refilling the freelists without
+       adding a page. Growing immediately instead ratchets the page
+       count up to the workload's transient high-water mark and it
+       never comes back down — pages are only freed when COMPLETELY
+       empty, so fragmentation keeps them pinned. On fixed-arena
+       targets the pages eventually consume the whole arena even
+       though most of their slots are free.
+
+       Only attempt the collection when the accounting shows real
+       slack (live well below capacity): if the heap is genuinely
+       full of live objects — e.g. a growing working set — collecting
+       before every page-add just burns time, so grow directly as
+       before. Walking the page list here is fine: growth events are
+       rare and the walk is a few pointer hops per page.
+       (mrb_full_gc() is a no-op while the GC is disabled or
+       iterating; we grow as before in that case, too.) */
+    size_t capacity = 0;
+    for (mrb_heap_page *page = gc->heaps; page; page = page->next) {
+      capacity += MRB_HEAP_PAGE_SIZE;
+    }
+    /* gc->live is inflated by dead-but-unswept objects at this point,
+       so it cannot distinguish "full of garbage" (reclaim!) from
+       "full of live data" (grow!). live_after_mark from the last
+       completed cycle is the garbage-free estimate of the true live
+       set: sweep decrements it as objects are freed. */
+    /* The !collecting guard mirrors mrb_realloc_simple(): allocation
+       can re-enter here from inside a running mark/sweep (an RData
+       dfree callback that allocates during the sweep phase), and
+       starting a nested collection there would corrupt the GC's
+       in-progress state. */
+    if (!gc->collecting && gc->live_after_mark + MRB_HEAP_PAGE_SIZE/2 < capacity) {
+      mrb_full_gc(mrb);
+    }
+    if (gc->free_heaps == NULL) {
+      add_heap(mrb, gc);
+    }
   }
 
   RVALUE *p = gc->free_heaps->freelist;
@@ -1326,29 +1393,95 @@ incremental_gc(mrb_state *mrb, mrb_gc *gc, size_t limit)
   }
 }
 
+/* The bare engine loop. With run_to_root, drives a whole cycle to
+   MRB_GC_STATE_ROOT; otherwise advances one step bounded by `limit`.
+   Returns the work done. */
+static size_t
+run_incremental(mrb_state *mrb, mrb_gc *gc, size_t limit, mrb_bool run_to_root)
+{
+  size_t result = 0;
+
+  if (run_to_root) {
+    do {
+      result += incremental_gc(mrb, gc, limit);
+    } while (gc->state != MRB_GC_STATE_ROOT);
+  }
+  else {
+    while (result < limit) {
+      result += incremental_gc(mrb, gc, limit);
+      if (gc->state == MRB_GC_STATE_ROOT)
+        break;
+    }
+  }
+  return result;
+}
+
+/* Drive the incremental collector with the reentrancy guard held.
+ *
+ * gc->collecting marks that a mark/sweep is running on the C stack. While it
+ * is set, the emergency GC in mrb_realloc_simple is suppressed, so an
+ * allocation failure raised from *inside* sweep (e.g. an RData dfree that
+ * allocates) cannot recursively re-drive the same sweep -- which would
+ * corrupt the page-list walk and could overflow the stack.
+ *
+ * Every path that can sweep funnels through this helper (incremental_gc is
+ * only ever called from here), so all callers -- mrb_incremental_gc,
+ * mrb_full_gc, clear_all_old, change_gen_gc_mode and the emergency path --
+ * are covered without each having to manage the flag.
+ *
+ * When an outer jmp buffer exists, wrap the run in MRB_TRY/MRB_CATCH so the
+ * flag is restored on both normal return and a longjmp out of a dfree (so it
+ * can never leak and permanently wedge emergency GC), then rethrow. When
+ * there is no outer handler (mrb->jmp == NULL, e.g. GC invoked from embedder
+ * C code), do NOT install a temporary handler: a raise then follows mruby's
+ * normal uncaught path (report and abort) instead of longjmp'ing to a NULL
+ * buffer -- and since that aborts the process, the unrestored flag is moot.
+ */
+static size_t
+gc_drive(mrb_state *mrb, mrb_gc *gc, size_t limit, mrb_bool run_to_root)
+{
+  mrb_bool was_collecting = gc->collecting;
+  size_t result = 0;
+
+  gc->collecting = TRUE;
+
+  if (mrb->jmp) {
+    struct mrb_jmpbuf *prev_jmp = mrb->jmp;
+    struct mrb_jmpbuf c_jmp;
+
+    MRB_TRY(&c_jmp) {
+      mrb->jmp = &c_jmp;
+      result = run_incremental(mrb, gc, limit, run_to_root);
+      mrb->jmp = prev_jmp;
+      gc->collecting = was_collecting;
+    } MRB_CATCH(&c_jmp) {
+      gc->collecting = was_collecting;
+      mrb->jmp = prev_jmp;
+      MRB_THROW(prev_jmp);
+    } MRB_END_EXC(&c_jmp);
+  }
+  else {
+    result = run_incremental(mrb, gc, limit, run_to_root);
+    gc->collecting = was_collecting;
+  }
+
+  return result;
+}
+
 static void
 incremental_gc_finish(mrb_state *mrb, mrb_gc *gc)
 {
-  do {
-    incremental_gc(mrb, gc, SIZE_MAX);
-  } while (gc->state != MRB_GC_STATE_ROOT);
+  gc_drive(mrb, gc, SIZE_MAX, TRUE);
 }
 
 static void
 incremental_gc_step(mrb_state *mrb, mrb_gc *gc)
 {
-  size_t limit = 0, result = 0;
-  limit = (GC_STEP_SIZE/100) * gc->step_ratio;
+  size_t limit = (GC_STEP_SIZE/100) * gc->step_ratio;
   if (gc->step_limit > 0 && limit > gc->step_limit) {
     limit = gc->step_limit;
   }
-  while (result < limit) {
-    result += incremental_gc(mrb, gc, limit);
-    if (gc->state == MRB_GC_STATE_ROOT)
-      break;
-  }
-
-  gc->gc_debt -= (mrb_int)result;
+  gc->gc_debt -= (mrb_int)gc_drive(mrb, gc, limit, FALSE);
 }
 
 static void

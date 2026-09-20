@@ -208,3 +208,84 @@ assert("Task#value returns exception object for unhandled task errors") do
   assert_kind_of RuntimeError, result
   assert_equal "boom", result.message
 end
+
+assert("Task#terminate on self triggers context switch to next task") do
+  order = []
+
+  Task.new(priority: 50) do
+    order << :a_start
+    Task.current.terminate  # self-terminate - must switch away
+    order << :a_zombie      # should never execute
+  end
+
+  Task.new(priority: 100) do
+    order << :b_runs
+  end
+
+  Task.run
+
+  assert_equal [:a_start, :b_runs], order
+  assert_false order.include?(:a_zombie)
+end
+
+assert("sleep() no-arg suspends the calling task, not another") do
+  order = []
+
+  # high-priority task (runs first) - calls sleep() to suspend itself
+  high = Task.new(priority: 50) do
+    order << :high_start
+    sleep                 # should suspend THIS task, not low
+    order << :high_resume
+  end
+
+  # low-priority task - should keep running after high suspends
+  low = Task.new(priority: 200) do
+    order << :low_runs
+    high.resume           # wake high back up
+  end
+
+  Task.run
+
+  assert_equal [:high_start, :low_runs, :high_resume], order
+end
+
+assert("exception raised from C after blocking past the timeslice is rescuable") do
+  # TaskTest.block_then_raise busy-blocks longer than a timeslice before
+  # raising, so task.switching is pending when the exception dispatches.
+  # A pending switch must not preempt the catch-handler dispatch: honoring
+  # it between catch_handler_find and OP_EXCEPT swallowed the exception
+  # into the task result, and the rescue below saw nothing.
+  result = nil
+
+  Task.new do
+    result =
+      begin
+        TaskTest.block_then_raise(50)
+        :not_raised
+      rescue RuntimeError => e
+        "caught #{e.message}"
+      end
+  end
+
+  Task.run
+
+  assert_equal "caught raised after blocking", result
+end
+
+assert("exception raised from C after blocking is not leaked into Task#value") do
+  child = nil
+
+  Task.new do
+    child = Task.new do
+      begin
+        TaskTest.block_then_raise(50)
+      rescue RuntimeError
+        :rescued
+      end
+    end
+  end
+
+  Task.run
+
+  assert_equal :rescued, child.value
+end

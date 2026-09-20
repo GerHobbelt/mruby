@@ -292,6 +292,27 @@ assert("Regexp - a curly brace that is not a quantifier is a literal") do
   assert_raise(RegexpError) { Regexp.new("{2}") }
 end
 
+assert("Regexp - patterns that used to hang the compiler now raise (A1)") do
+  # These once looped forever in the compiler at 100% CPU instead of raising.
+  # Regexp.new is used so the pattern reaches the regexp compiler directly,
+  # bypassing the literal validation the parser performs on /.../ literals.
+
+  # (?X) with an unsupported X: inline options (?i)/(?i:...), the absent
+  # operator (?~...), and conditionals (?(...)) are not implemented.
+  assert_raise(RegexpError) { Regexp.new("(?i:a)") }
+  assert_raise(RegexpError) { Regexp.new("(?i)a") }
+  assert_raise(RegexpError) { Regexp.new("(?~foo)") }
+  assert_raise(RegexpError) { Regexp.new("(?(<x>)a|b)") }
+  assert_raise(RegexpError) { Regexp.new("(?") }
+  assert_raise(RegexpError) { Regexp.new("(?<") }
+
+  # A quantifier metacharacter with no atom to repeat.
+  assert_raise(RegexpError) { Regexp.new("a***") }
+  assert_raise(RegexpError) { Regexp.new("*") }
+  assert_raise(RegexpError) { Regexp.new("+") }
+  assert_raise(RegexpError) { Regexp.new("?abc") }
+end
+
 assert("MatchData#captures") do
   re = Regexp.new("(a)(b)(c)")
   md = re.match("abc")
@@ -886,4 +907,20 @@ assert("Regexp - \\h and \\H hex-digit shorthands") do
   assert_equal ["3f"], "3fX".scan(/[\h]+/)
   assert_equal ["XY"], "3fXY".scan(/[\H]+/)
   assert_equal ["deadBEEF"], "deadBEEFzz".scan(/\h+/)
+end
+
+assert("Regexp - invalid UTF-8 byte near pattern end") do
+  # a truncated multi-byte leader in a character class must not read
+  # past the end of the pattern buffer
+  re = Regexp.new("[   \xff ]")
+  assert_kind_of Regexp, re
+  assert_equal 0, (re =~ "\xff")
+  assert_nil (re =~ "x")
+end
+
+assert("Regexp - truncated UTF-8 at subject end") do
+  # a lone multi-byte leader at the end of the subject must not read
+  # past the end of the string buffer when matched against a class
+  assert_nil ("ab\xf0" =~ /[cd]/)
+  assert_equal 0, ("ab\xf0" =~ /[^cd]+$/)
 end

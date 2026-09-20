@@ -74,6 +74,27 @@ void
 mrb_task_mark_all(mrb_state *mrb)
 {
   int qi;
+
+  /* GC can run before mruby-task's gem init (allocations during
+     earlier gem inits trigger it, deterministically so under GC
+     stress). At that point the queues are necessarily empty AND the
+     HAL exclusion may not exist yet (the Windows HAL initializes its
+     CRITICAL_SECTION in mrb_hal_task_init) — return before touching
+     either. Tasks can only be queued after the HAL is initialized,
+     so non-empty queues imply the exclusion is safe to take. */
+  if (mrb->task.queues[0] == NULL && mrb->task.queues[1] == NULL &&
+      mrb->task.queues[2] == NULL && mrb->task.queues[3] == NULL) {
+    return;
+  }
+
+  /* The tick IRQ relinks tasks between queues (sleep wakeups, timeslice
+     rotation). A relink that lands mid-traversal makes this walk skip
+     still-queued tasks; a skipped task's object is swept while its
+     mrb_task stays linked, and the freed chunk's reuse turns the queue
+     links into garbage (observed on RP2350 as ASCII string bytes where
+     next pointers should be). Exclude the scheduler IRQ for the whole
+     walk — same family as the gc.iterating guard in vm.c. */
+  mrb_task_excl_enter(mrb);
   for (qi = 0; qi < 4; qi++) {
     mrb_task *t = mrb->task.queues[qi];
     while (t) {
@@ -129,6 +150,7 @@ mrb_task_mark_all(mrb_state *mrb)
       t = t->next;
     }
   }
+  mrb_task_excl_exit(mrb);
 }
 
 /*
@@ -209,13 +231,13 @@ task_cleanup_if_stopped(mrb_state *mrb, mrb_task *t)
 {
   if (t->status == MRB_TASK_STATUS_DORMANT || t->c.status == MRB_TASK_STOPPED) {
     /* Task is terminated but still in queue - remove it */
-    mrb_task_disable_irq();
+    mrb_task_excl_enter(mrb);
     mrb_task_q_delete(mrb, t);
     if (t->status != MRB_TASK_STATUS_DORMANT) {
       t->status = MRB_TASK_STATUS_DORMANT;
       mrb_task_q_insert(mrb, t);
     }
-    mrb_task_enable_irq();
+    mrb_task_excl_exit(mrb);
     return TRUE;
   }
   return FALSE;
@@ -248,7 +270,29 @@ task_init_context(mrb_state *mrb, mrb_task *t, const struct RProc *proc)
   if (proc->body.irep->nregs > slen) {
     slen += proc->body.irep->nregs;
   }
-  c->stbase = (mrb_value*)mrb_malloc(mrb, slen * sizeof(mrb_value));
+
+  /* Allocate both buffers atomically: mrb_malloc() raises on OOM via
+   * longjmp, which would leave a half-built context (ci == NULL) on a
+   * task that is still queued — the scheduler then dereferences it.
+   * Allocate with the non-raising variant, and on failure retire the
+   * task coherently BEFORE raising NoMemoryError. */
+  mrb_value *stbase = (mrb_value*)mrb_malloc_simple(mrb, slen * sizeof(mrb_value));
+  mrb_callinfo *cibase = (mrb_callinfo*)mrb_malloc_simple(mrb, TASK_CI_INIT_SIZE * sizeof(mrb_callinfo));
+  if (stbase == NULL || cibase == NULL) {
+    mrb_free(mrb, stbase);
+    mrb_free(mrb, cibase);
+    /* Mark only the CONTEXT as stopped. t->status must keep its
+     * current value: q_get_queue() derives a task's queue from
+     * t->status, so flipping it to DORMANT while the task is still
+     * linked in another queue would make every later q_delete search
+     * the wrong list (task_cleanup_if_stopped would then spin on an
+     * unremovable queue head). The scheduler's existing safety nets
+     * see c->status == MRB_TASK_STOPPED, unlink the task from its
+     * true queue, and transition it to DORMANT coherently. */
+    c->status = MRB_TASK_STOPPED;
+    mrb_exc_raise(mrb, mrb_obj_value(mrb->nomem_err));
+  }
+  c->stbase = stbase;
   c->stend = c->stbase + slen;
 
   /* Initialize stack values to nil */
@@ -264,9 +308,9 @@ task_init_context(mrb_state *mrb, mrb_task *t, const struct RProc *proc)
   /* Set receiver to top self */
   c->stbase[0] = mrb_top_self(mrb);
 
-  /* Initialize callinfo stack */
+  /* Initialize callinfo stack (allocated above) */
   static const mrb_callinfo ci_zero = { 0 };
-  c->cibase = (mrb_callinfo*)mrb_malloc(mrb, TASK_CI_INIT_SIZE * sizeof(mrb_callinfo));
+  c->cibase = cibase;
   c->ciend = c->cibase + TASK_CI_INIT_SIZE;
   c->ci = c->cibase;
   c->cibase[0] = ci_zero;
@@ -289,7 +333,7 @@ task_init_context(mrb_state *mrb, mrb_task *t, const struct RProc *proc)
 static void
 wake_up_join_waiters(mrb_state *mrb, mrb_task *completed_task)
 {
-  mrb_task_disable_irq();
+  mrb_task_excl_enter(mrb);
   mrb_task *curr = q_waiting_;
   while (curr != NULL) {
     mrb_task *next = curr->next;
@@ -310,18 +354,18 @@ wake_up_join_waiters(mrb_state *mrb, mrb_task *completed_task)
     }
     curr = next;
   }
-  mrb_task_enable_irq();
+  mrb_task_excl_exit(mrb);
 }
 
 /* Change task state with IRQ protection and queue management */
 static void
 task_change_state(mrb_state *mrb, mrb_task *t, uint8_t new_status)
 {
-  mrb_task_disable_irq();
+  mrb_task_excl_enter(mrb);
   mrb_task_q_delete(mrb, t);
   t->status = new_status;
   mrb_task_q_insert(mrb, t);
-  mrb_task_enable_irq();
+  mrb_task_excl_exit(mrb);
 }
 
 typedef struct execute_task_vm_args {
@@ -353,6 +397,21 @@ execute_task(mrb_state *mrb, mrb_task *t)
   mrb_callinfo *prev_ci;
   uint8_t prev_cci;
 
+  /* A task can lose its context without leaving the queues: OOM during
+   * task_init_context unwinds via longjmp before the context is built
+   * (ci == NULL). Retire such a task instead of dereferencing the hole
+   * — checked BEFORE the context switch so the scheduler's own context
+   * stays usable. */
+  if (t->c.ci == NULL || t->c.ci->proc == NULL) {
+    mrb_task_excl_enter(mrb);
+    mrb_task_q_delete(mrb, t);
+    t->status = MRB_TASK_STATUS_DORMANT;
+    t->c.status = MRB_TASK_STOPPED;
+    mrb_task_q_insert(mrb, t);
+    mrb_task_excl_exit(mrb);
+    return;
+  }
+
   /* Set task as running */
   t->timeslice = MRB_TIMESLICE_TICK_COUNT;
   t->status = MRB_TASK_STATUS_RUNNING;
@@ -371,11 +430,6 @@ execute_task(mrb_state *mrb, mrb_task *t)
   const struct RProc *proc = t->c.ci->proc;
   const mrb_code *pc = t->c.ci->pc;
 
-  /* With C function boundary checks, proc should never be NULL on resume */
-  if (!proc) {
-    mrb_raise(mrb, E_RUNTIME_ERROR, "task context corrupted: no proc on resume");
-  }
-
   /* Set vmexec flag to prevent fiber_terminate from being called */
   t->c.vmexec = TRUE;
 
@@ -384,7 +438,14 @@ execute_task(mrb_state *mrb, mrb_task *t)
      mrb_vm_exec() in task mode, so the scheduler protect frame stays intact. */
   execute_task_vm_args args = { t, proc, pc };
   mrb_bool error = FALSE;
+  /* mrb_protect_error() roots its result in the GC arena (+1 entry,
+   * never popped by the caller loop): one slot per execution slice
+   * accumulates forever and pins every slice's result object. The
+   * result is already reachable — and marked — through t->result
+   * (mrb_task_mark_all), so the arena root is redundant here. */
+  int ai = mrb_gc_arena_save(mrb);
   t->result = mrb_protect_error(mrb, execute_task_vm, &args, &error);
+  mrb_gc_arena_restore(mrb, ai);
   mrb->task.exception_as_result = FALSE;
 
   /* Clear vmexec flag */
@@ -414,11 +475,11 @@ execute_task(mrb_state *mrb, mrb_task *t)
   /* Handle task termination */
   if (t->c.status == MRB_TASK_STOPPED) {
     switching_ = FALSE;
-    mrb_task_disable_irq();
+    mrb_task_excl_enter(mrb);
     mrb_task_q_delete(mrb, t);
     t->status = MRB_TASK_STATUS_DORMANT;
     mrb_task_q_insert(mrb, t);
-    mrb_task_enable_irq();
+    mrb_task_excl_exit(mrb);
 
     /* Wake up tasks waiting on join */
     wake_up_join_waiters(mrb, t);
@@ -514,9 +575,9 @@ task_run_body(mrb_state *mrb, void *ud)
 
     /* No task ready - check if all tasks are done */
     if (!t) {
-      mrb_task_disable_irq();
+      mrb_task_excl_enter(mrb);
       mrb_bool exiting = !q_ready_ && !q_waiting_ && !q_suspended_;
-      mrb_task_enable_irq();
+      mrb_task_excl_exit(mrb);
       if (exiting) {
         /* All tasks are dormant - scheduler done */
         break;
@@ -633,7 +694,7 @@ sleep_us_impl(mrb_state *mrb, uint32_t usec)
   /* In task context - get current running task */
   t = MRB2TASK(mrb);
 
-  mrb_task_disable_irq();
+  mrb_task_excl_enter(mrb);
 
   /* Remove from ready queue */
   mrb_task_q_delete(mrb, t);
@@ -659,7 +720,7 @@ sleep_us_impl(mrb_state *mrb, uint32_t usec)
   }
   mrb_task_q_insert(mrb, t);
 
-  mrb_task_enable_irq();
+  mrb_task_excl_exit(mrb);
 
   /* Trigger context switch */
   switching_ = TRUE;
@@ -679,15 +740,23 @@ mrb_f_sleep(mrb_state *mrb, mrb_value self)
 
   if (n == 0) {
     /* No argument - suspend indefinitely */
-    mrb_task *t = q_ready_;
-    if (t) {
-      mrb_task_disable_irq();
-      mrb_task_q_delete(mrb, t);
-      t->status = MRB_TASK_STATUS_SUSPENDED;
-      mrb_task_q_insert(mrb, t);
-      mrb_task_enable_irq();
-      switching_ = TRUE;
+    if (mrb->c == mrb->root_c) {
+      /* Root context has no task to suspend */
+      return mrb_nil_value();
     }
+    mrb_callinfo *ci;
+    for (ci = mrb->c->ci; ci >= mrb->c->cibase; ci--) {
+      if (ci->cci > 0) {
+        mrb_raise(mrb, E_RUNTIME_ERROR, "can't sleep across C function boundary");
+      }
+    }
+    mrb_task *t = MRB2TASK(mrb);
+    mrb_task_excl_enter(mrb);
+    mrb_task_q_delete(mrb, t);
+    t->status = MRB_TASK_STATUS_SUSPENDED;
+    mrb_task_q_insert(mrb, t);
+    mrb_task_excl_exit(mrb);
+    switching_ = TRUE;
     return mrb_nil_value();
   }
 
@@ -750,9 +819,9 @@ task_create_common(mrb_state *mrb, const struct RProc *proc,
   mrb_gc_register(mrb, task_obj);
   task_init_context(mrb, t, proc);
 
-  mrb_task_disable_irq();
+  mrb_task_excl_enter(mrb);
   mrb_task_q_insert(mrb, t);
-  mrb_task_enable_irq();
+  mrb_task_excl_exit(mrb);
 
   if (q_ready_ && q_ready_->status == MRB_TASK_STATUS_RUNNING) {
     if (t->priority < q_ready_->priority) {
@@ -933,7 +1002,7 @@ mrb_task_s_stat(mrb_state *mrb, mrb_value self)
 {
   mrb_value data = mrb_hash_new(mrb);
 
-  mrb_task_disable_irq();
+  mrb_task_excl_enter(mrb);
 
   /* Add global scheduler state */
   mrb_hash_set(mrb, data, mrb_symbol_value(MRB_SYM(tick)), mrb_fixnum_value(tick_));
@@ -945,7 +1014,7 @@ mrb_task_s_stat(mrb_state *mrb, mrb_value self)
   mrb_hash_set(mrb, data, mrb_symbol_value(MRB_SYM(waiting)), mrb_stat_sub(mrb, q_waiting_));
   mrb_hash_set(mrb, data, mrb_symbol_value(MRB_SYM(suspended)), mrb_stat_sub(mrb, q_suspended_));
 
-  mrb_task_enable_irq();
+  mrb_task_excl_exit(mrb);
 
   return data;
 }
@@ -1104,7 +1173,7 @@ mrb_task_set_priority(mrb_state *mrb, mrb_value self)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "priority must be 0-255");
   }
 
-  mrb_task_disable_irq();
+  mrb_task_excl_enter(mrb);
   t->priority = (uint8_t)priority;
 
   /* Re-sort in queue if task is ready */
@@ -1112,7 +1181,7 @@ mrb_task_set_priority(mrb_state *mrb, mrb_value self)
     mrb_task_q_delete(mrb, t);
     mrb_task_q_insert(mrb, t);
   }
-  mrb_task_enable_irq();
+  mrb_task_excl_exit(mrb);
 
   return mrb_fixnum_value(priority);
 }
@@ -1184,13 +1253,13 @@ mrb_task_join(mrb_state *mrb, mrb_value self)
   }
 
   /* Wait for task to complete */
-  mrb_task_disable_irq();
+  mrb_task_excl_enter(mrb);
   mrb_task_q_delete(mrb, current);
   current->status = MRB_TASK_STATUS_WAITING;
   current->reason = MRB_TASK_REASON_JOIN;
   current->wait.join = t;
   mrb_task_q_insert(mrb, current);
-  mrb_task_enable_irq();
+  mrb_task_excl_exit(mrb);
 
   /* Trigger context switch */
   switching_ = TRUE;
@@ -1245,10 +1314,10 @@ mrb_execute_proc_synchronously(mrb_state *mrb, mrb_value proc_val, mrb_int argc,
   t->self = task_obj;
 
   /* 3. Move task from DORMANT to READY */
-  mrb_task_disable_irq();
+  mrb_task_excl_enter(mrb);
   t->status = MRB_TASK_STATUS_READY;
   mrb_task_q_insert(mrb, t);
-  mrb_task_enable_irq();
+  mrb_task_excl_exit(mrb);
 
   /* 4. Execute the task in a dedicated loop (no context switching) */
   t->status = MRB_TASK_STATUS_RUNNING;
@@ -1270,9 +1339,9 @@ mrb_execute_proc_synchronously(mrb_state *mrb, mrb_value proc_val, mrb_int argc,
   }
 
   /* 6. Free the temporary task's resources */
-  mrb_task_disable_irq();
+  mrb_task_excl_enter(mrb);
   mrb_task_q_delete(mrb, t);
-  mrb_task_enable_irq();
+  mrb_task_excl_exit(mrb);
 
   /* Prevent double-free: clear Data object's type before freeing task */
   DATA_TYPE(task_obj) = NULL;
@@ -1419,12 +1488,12 @@ resume_task_internal(mrb_state *mrb, mrb_task *t)
        t->wait.queue.wakeup_tick != UINT32_MAX)) {
     uint32_t task_wakeup = t->reason == MRB_TASK_REASON_SLEEP ?
                            t->wait.wakeup_tick : t->wait.queue.wakeup_tick;
-    mrb_task_disable_irq();
+    mrb_task_excl_enter(mrb);
     if (wakeup_tick_ == UINT32_MAX ||
         (int32_t)(task_wakeup - wakeup_tick_) < 0) {
       wakeup_tick_ = task_wakeup;
     }
-    mrb_task_enable_irq();
+    mrb_task_excl_exit(mrb);
   }
 }
 
@@ -1450,17 +1519,19 @@ terminate_task_internal(mrb_state *mrb, mrb_task *t)
 {
   if (t->status == MRB_TASK_STATUS_DORMANT) return;
 
-  mrb_task_disable_irq();
+  mrb_bool was_running = (t->status == MRB_TASK_STATUS_RUNNING);
+
+  mrb_task_excl_enter(mrb);
   mrb_task_q_delete(mrb, t);
   t->status = MRB_TASK_STATUS_DORMANT;
   t->c.status = MRB_TASK_STOPPED;
   mrb_task_q_insert(mrb, t);
-  mrb_task_enable_irq();
+  mrb_task_excl_exit(mrb);
 
   wake_up_join_waiters(mrb, t);
 
   /* If terminating self, trigger context switch */
-  if (t == q_ready_) {
+  if (was_running) {
     switching_ = TRUE;
   }
 }
@@ -1594,6 +1665,7 @@ mrb_mruby_task_gem_init(mrb_state *mrb)
   /* Initialize main task to NULL and scheduler_lock to 0 */
   mrb->task.main_task = NULL;
   mrb->task.scheduler_lock = 0;
+  mrb->task.irq_nesting = 0;
   mrb->task.loop_running = FALSE;
   mrb->task.exception_as_result = FALSE;
 
