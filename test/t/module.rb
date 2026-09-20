@@ -799,6 +799,74 @@ assert('method visibility') do
   assert_equal :test, v.test_private { :test }
 end
 
+assert('protected method with an explicit receiver') do
+  class ProtRecvTest
+    def call_other(o)
+      o.val
+    end
+    protected
+    def val
+      42
+    end
+  end
+  class ProtRecvSubTest < ProtRecvTest; end
+  class ProtRecvOtherTest
+    def call_other(o)
+      o.val
+    end
+  end
+  module ProtRecvModTest
+    def call_other(o)
+      o.mval
+    end
+    protected
+    def mval
+      :mod
+    end
+  end
+  class ProtRecvIncTest
+    include ProtRecvModTest
+  end
+
+  # permitted: the caller's `self` belongs to the defining class
+  assert_equal 42, ProtRecvTest.new.call_other(ProtRecvTest.new)
+  assert_equal 42, ProtRecvTest.new.call_other(ProtRecvSubTest.new)
+  assert_equal 42, ProtRecvSubTest.new.call_other(ProtRecvTest.new)
+  assert_equal :mod, ProtRecvIncTest.new.call_other(ProtRecvIncTest.new)
+
+  # rejected: the caller's `self` is unrelated to the defining class
+  assert_raise_with_message_pattern(NoMethodError, "protected method 'val' called for ProtRecvTest") do
+    ProtRecvTest.new.val
+  end
+  assert_raise_with_message_pattern(NoMethodError, "protected method 'val' called for ProtRecvTest") do
+    ProtRecvOtherTest.new.call_other(ProtRecvTest.new)
+  end
+  assert_equal 42, ProtRecvTest.new.__send__(:val)
+end
+
+assert('method_missing is dispatched regardless of its visibility') do
+  class PrivMissingTest
+    private
+    def method_missing(name, *args)
+      [name, args]
+    end
+  end
+
+  assert_equal [:foo, [1, 2]], PrivMissingTest.new.foo(1, 2)
+  assert_equal [:bar, []], PrivMissingTest.new.bar
+
+  class ProtMissingTest
+    protected
+    def method_missing(name, *args)
+      [name, args]
+    end
+  end
+  assert_equal [:baz, [3]], ProtMissingTest.new.baz(3)
+
+  # an explicit call to `method_missing` itself is still checked
+  assert_raise(NoMethodError) { PrivMissingTest.new.method_missing(:x) }
+end
+
 assert('method visibility with meta programming') do
   assert_equal "GOOD!" do
     f = nil
@@ -864,6 +932,28 @@ assert('Module#module_function') do
   assert_equal nil do
     M.modfunc
   end
+
+  # the instance-side copy turns private, like the no-argument form
+  mod = Module.new do
+    def foo; 42; end
+    module_function :foo
+    module_function def bar; 43; end
+  end
+  assert_equal 42, mod.foo
+  assert_equal 43, mod.bar
+
+  klass = Class.new do
+    include mod
+    def call_foo; foo; end
+    def call_bar; bar; end
+  end
+  obj = klass.new
+  assert_equal 42, obj.call_foo
+  assert_equal 43, obj.call_bar
+  assert_raise(NoMethodError) { obj.foo }
+  assert_raise(NoMethodError) { obj.bar }
+
+  assert_raise(NameError) { Module.new { module_function :no_such_method } }
 end
 
 assert('Module#module_function with no arguments (toggle mode)') do

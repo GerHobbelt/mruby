@@ -20,6 +20,9 @@ jobs:
           - {os: ubuntu-24.04, cc: clang, cxx: clang++}
           - {os: ubuntu-22.04, cc: gcc, cxx: g++}
           - {os: ubuntu-22.04, cc: clang, cxx: clang++}
+          # The only runner where `char` is unsigned; the macOS runners are
+          # ARM64 too but Apple's ABI keeps `char` signed.
+          - {os: ubuntu-24.04-arm, cc: gcc, cxx: g++}
           - {os: macos-26, cc: clang, cxx: clang++}
           - {os: macos-15, cc: clang, cxx: clang++}
           - {os: windows-2025, cc: gcc, cxx: g++, altname: "mingw-gcc"}
@@ -31,7 +34,7 @@ jobs:
       LD: ${{ matrix.cc }}
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Ruby version
@@ -46,7 +49,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Ruby version
@@ -74,7 +77,7 @@ jobs:
       MRUBY_CONFIG: ci/msvc
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Ruby version

@@ -134,22 +134,22 @@ static inline void
 envadjust(mrb_state *mrb, mrb_value *oldbase, mrb_value *newbase)
 {
   mrb_callinfo *ci = mrb->c->cibase;
-  /*
-   * Byte-level calculation to avoid truncation when allocator alignment is
-   * smaller than sizeof(mrb_value).
-   * eg: MRB_NO_BOXING + MRB_INT64 with MRB_32BIT => sizeof(mrb_value)=16
-   *     And when memory allocator's alignment is 8 bytes
-   * Pointer subtraction on mrb_value* would truncate (8/16 -> 0).
-   * So, we use char* for pointer calculation to get the correct offset in bytes,
-   * then apply that offset to mrb_value* pointers.
-   */
-  ptrdiff_t off = (char *)newbase - (char *)oldbase;
 
-  if (off == 0) return;
+  if (newbase == oldbase) return;
+
   while (ci <= mrb->c->ci) {
     struct REnv *e = mrb_vm_ci_env(ci);
 
-    mrb_value *new_stack = (mrb_value *)((char *)ci->stack + off);
+    /*
+     * Byte-level calculation to avoid truncation when allocator alignment is
+     * smaller than sizeof(mrb_value).
+     * eg: MRB_NO_BOXING + MRB_INT64 with MRB_32BIT => sizeof(mrb_value)=16
+     *     And when memory allocator's alignment is 8 bytes
+     * Pointer subtraction on mrb_value* would truncate (8/16 -> 0).
+     * So, we use char* for pointer calculation to get the correct offset in
+     * bytes, then apply that offset to mrb_value* pointers.
+     */
+    mrb_value *new_stack = (mrb_value *)((char *)newbase + ((char *)ci->stack - (char *)oldbase));
 
     if (e) {
       mrb_assert(e->cxt == mrb->c && MRB_ENV_ONSTACK_P(e));
@@ -1061,7 +1061,8 @@ send_method(mrb_state *mrb, mrb_value self, mrb_bool pub)
       }
       vis_error(mrb, name, mrb_ary_new_from_values(mrb, n, regs+1), self, priv);
     }
-    else if ((m.flags & MRB_METHOD_PROTECTED_FL) && mrb_obj_is_kind_of(mrb, self, ci->u.target_class)) {
+    else if (m.flags & MRB_METHOD_PROTECTED_FL) {
+      /* `public_send` rejects protected methods unconditionally */
       priv = FALSE;
       goto vis_err;
     }
@@ -2870,17 +2871,23 @@ RETRY_TRY_BLOCK:
       }
       else {
         ci->mid = mid;
-      }
-      if (insn == OP_SEND || insn == OP_SEND0 || insn == OP_SENDB) {
-        mrb_bool priv = TRUE;
-        if (m.flags & MRB_METHOD_PRIVATE_FL) {
-        vis_err:;
-          mrb_value args = (ci->n == 15) ? regs[1] : mrb_ary_new_from_values(mrb, ci->n, regs+1);
-          vis_error(mrb, mid, args, recv, priv);
-        }
-        else if ((m.flags & MRB_METHOD_PROTECTED_FL) && mrb_obj_is_kind_of(mrb, recv, ci->u.target_class)) {
-          priv = FALSE;
-          goto vis_err;
+        /* visibility is checked only when the method is actually found;
+           the `method_missing` fallback dispatches regardless of its own
+           visibility, as in CRuby */
+        if (insn == OP_SEND || insn == OP_SEND0 || insn == OP_SENDB) {
+          mrb_bool priv = TRUE;
+          if (m.flags & MRB_METHOD_PRIVATE_FL) {
+          vis_err:;
+            mrb_value args = (ci->n == 15) ? regs[1] : mrb_ary_new_from_values(mrb, ci->n, regs+1);
+            vis_error(mrb, mid, args, recv, priv);
+          }
+          /* protected methods are callable when the caller's `self` belongs
+             to the class (or module) where the method is defined */
+          else if ((m.flags & MRB_METHOD_PROTECTED_FL) &&
+                   !mrb_obj_is_kind_of(mrb, ci[-1].stack[0], ci->u.target_class)) {
+            priv = FALSE;
+            goto vis_err;
+          }
         }
       }
       ci->cci = CINFO_NONE;
