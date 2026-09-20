@@ -463,7 +463,7 @@ symdup(mrb_state *mrb, int fd, mrb_bool *failed)
     return fd;
 
   new_fd = mrb_hal_io_dup(mrb, fd);
-  if (new_fd > 0) *failed = FALSE;
+  if (new_fd >= 0) *failed = FALSE;  /* 0 is a descriptor, not a failure */
   return new_fd;
 }
 
@@ -1023,7 +1023,11 @@ io_puts_ary(mrb_state *mrb, int fd, mrb_value ary, int depth)
     return;
   }
 
-  for (mrb_int i = 0; i < len; i++) {
+  /* An element's #to_s can replace `ary` with a shorter array, which moves the
+     buffer as well as the length, so the next index has to be checked against
+     what RARRAY_PTR() now points at. The saved length stays as the upper
+     bound: an element that grows the array does not extend the traversal. */
+  for (mrb_int i = 0; i < len && i < RARRAY_LEN(ary); i++) {
     mrb_value elem = RARRAY_PTR(ary)[i];
     if (mrb_array_p(elem)) {
       io_puts_ary(mrb, fd, elem, depth + 1);

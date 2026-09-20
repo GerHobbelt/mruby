@@ -624,6 +624,23 @@ assert('splat object in case statement') do
   assert_equal 1, a
 end
 
+assert('splat in case statement with a pattern that replaces the array') do
+  # #=== runs while the splatted array is being walked, and replacing it with a
+  # shorter one moves the buffer out from under the traversal.
+  pat = Class.new do
+    def initialize(a); @a = a; end
+    def ===(o); @a.replace(Array.new(64, 0)); false; end
+  end
+  a = []
+  400.times { a << pat.new(a) }
+  r = case 1
+      when *a then :matched
+      else :none
+      end
+  assert_equal :none, r
+  assert_equal 64, a.size
+end
+
 assert('splat in case statement') do
   values = [3,5,1,7,8]
   testa = [1,2,7]
@@ -1247,6 +1264,47 @@ assert('pattern matching - find patterns') do
     assert_equal 3, x
     assert_equal [4, 5], post
   end
+end
+
+assert('pattern matching - a key that moves the subject') do
+  # A key's #== and #eql? run while the pattern helpers are walking the key
+  # array and the subject hash, and both were held as raw storage across the
+  # call. Rehashing the subject is refused by the Hash implementation's own
+  # check; replacing the key array is allowed, so the walk has to keep up.
+  moving = Class.new do
+    attr_accessor :owner, :arr, :armed, :found
+    def initialize(id); @id = id; @armed = false; @found = false; end
+    def hash; @id; end
+    def ==(_)
+      if @armed
+        @armed = false
+        @arr.replace(Array.new(64) { |j| self.class.new(j + 100) }) if @arr
+        2_000.times { |i| @owner[i + 10_000] = i } if @owner
+      end
+      @found
+    end
+    alias eql? ==
+  end
+
+  # `in {a: 1}` reaches __pat_values, which walks the key array. The lookup
+  # keys are separate objects from the stored ones, so the hash has to ask
+  # #eql? rather than settle it by identity.
+  h1 = {}
+  30.times { |i| h1[moving.new(i + 1)] = i }
+  keys = Array.new(30) { |i| moving.new(i + 1) }
+  keys.each { |k| k.arr = keys; k.found = true }
+  keys[0].armed = true
+  # The replacement keys are not in the hash, so the lookup fails; what
+  # matters is that the walk follows the array it was given rather than the
+  # buffer it started with.
+  assert_false h1.__pat_values(keys)
+
+  # `**rest` reaches __except, which walks the subject hash as well
+  h2 = {a: 1}
+  ks = Array.new(30) { |i| k = moving.new(i + 1); h2[k] = k; k }
+  ks.each { |k| k.owner = h2 }
+  ks[0].armed = true
+  assert_raise(RuntimeError) { h2.__except([:a]) }
 end
 
 assert('pattern matching - hash patterns') do

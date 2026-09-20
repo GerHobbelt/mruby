@@ -464,8 +464,8 @@ search_nonascii(const char *p, const char *e)
 
 #define utf8_islead(c) ((unsigned char)((c)&0xc0) != 0x80)
 
-extern const char mrb_utf8len_table[];
-const char mrb_utf8len_table[] = {
+/* the byte length a lead byte claims, read only through mrb_utf8len() */
+static const char mrb_utf8len_table[] = {
   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
   0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 3, 3, 4, 0
 };
@@ -484,6 +484,26 @@ mrb_utf8len(const char* p, const char* e)
     if (utf8_islead(p[2])) return 1;
   case 2:
     if (utf8_islead(p[1])) return 1;
+  }
+  /* Reject overlong sequences, UTF-16 surrogates, and code points above
+     U+10FFFF (RFC 3629, Unicode D93b). */
+  switch ((unsigned char)p[0]) {
+  case 0xC0: case 0xC1:                       /* overlong (< U+0080) */
+    return 1;
+  case 0xE0:                                  /* overlong (< U+0800) */
+    if ((unsigned char)p[1] < 0xA0) return 1;
+    break;
+  case 0xED:                                  /* surrogate (U+D800..U+DFFF) */
+    if ((unsigned char)p[1] > 0x9F) return 1;
+    break;
+  case 0xF0:                                  /* overlong (< U+10000) */
+    if ((unsigned char)p[1] < 0x90) return 1;
+    break;
+  case 0xF4:                                  /* above U+10FFFF */
+    if ((unsigned char)p[1] > 0x8F) return 1;
+    break;
+  case 0xF5: case 0xF6: case 0xF7:            /* above U+10FFFF */
+    return 1;
   }
   return len;
 }
@@ -505,8 +525,12 @@ static inline uint32_t popcount(bitint x)
 }
 #endif
 
-mrb_int
-mrb_utf8_strlen(const char *str, mrb_int byte_len)
+/* Counts characters, and when `validp` is given also reports whether every
+   sequence decoded as one character. The walk stops at the first broken
+   sequence, so the returned count is a character count only while `*validp`
+   stays TRUE. */
+static mrb_int
+utf8_strlen_check(const char *str, mrb_int byte_len, mrb_bool *validp)
 {
   const char *p = str;
   const char *e = str + byte_len;
@@ -518,24 +542,41 @@ mrb_utf8_strlen(const char *str, mrb_int byte_len)
     len += np - p;
     if (np == e) break;
     p = np;
-    while (NOASCII(*p)) {
-      p += mrb_utf8len(p, e);
+    while (p < e && NOASCII(*p)) {
+      mrb_int clen = mrb_utf8len(p, e);
+
+      /* mrb_utf8len() answers 1 for a byte that leads no valid sequence. The
+         byte here is known to be non-ASCII, so a length of 1 means the string
+         carries a byte that stands for no character. */
+      if (validp && clen == 1) {
+        *validp = FALSE;
+        return len;
+      }
+      p += clen;
       len++;
     }
   }
   return len;
 }
 
-static mrb_int
-utf8_strlen(mrb_value str)
+mrb_int
+mrb_utf8_strlen(const char *str, mrb_int byte_len)
 {
+  return utf8_strlen_check(str, byte_len, NULL);
+}
+
+/* count the characters of a string */
+mrb_int
+mrb_str_char_len(mrb_state *mrb, mrb_value str)
+{
+  (void)mrb;
   struct RString *s = mrb_str_ptr(str);
   mrb_int byte_len = RSTR_LEN(s);
 
   /* A byte-indexed string has one position per byte, which is what
-     chars2bytes() and bytes2chars() already answer for it. Asked here only
-     about the single-byte flag, the same string was measured as UTF-8 and
-     reported a length its own indexing did not agree with.
+     mrb_str_char_to_byte() and mrb_str_byte_to_char() already answer for it.
+     Asked here only about the single-byte flag, the same string was measured
+     as UTF-8 and reported a length its own indexing did not agree with.
 
      The flag below is deliberately not set on the way out: it says the bytes
      hold nothing multi-byte, while this returns early because of how the
@@ -556,12 +597,32 @@ utf8_strlen(mrb_value str)
   }
 }
 
-#define RSTRING_CHAR_LEN(s) utf8_strlen(s)
+/* whether a string's bytes read as the encoding it is taken to have */
+mrb_bool
+mrb_str_valid_encoding_p(mrb_state *mrb, mrb_value str)
+{
+  (void)mrb;
+  struct RString *s = mrb_str_ptr(str);
+  /* A byte-indexed string makes no such claim, so it is valid whatever its
+     bytes are. MRB_STR_SINGLE_BYTE is deliberately not read here: it says one
+     byte per character, which a string of stray bytes satisfies too, so only
+     the walk below decides. */
+  if (RSTR_BINARY_P(s)) return TRUE;
+
+  mrb_int byte_len = RSTR_LEN(s);
+  mrb_bool valid = TRUE;
+  mrb_int utf8_len = utf8_strlen_check(RSTR_PTR(s), byte_len, &valid);
+
+  if (!valid) return FALSE;
+  if (byte_len == utf8_len) RSTR_SET_SINGLE_BYTE_FLAG(s);
+  return TRUE;
+}
 
 /* map character index to byte offset index */
-static mrb_int
-chars2bytes(mrb_value str, mrb_int off, mrb_int idx)
+mrb_int
+mrb_str_char_to_byte(mrb_state *mrb, mrb_value str, mrb_int off, mrb_int idx)
 {
+  (void)mrb;
   struct RString *s = mrb_str_ptr(str);
   if (RSTR_SINGLE_BYTE_P(s) || RSTR_BINARY_P(s)) {
     return idx;
@@ -598,10 +659,12 @@ chars2bytes(mrb_value str, mrb_int off, mrb_int idx)
 }
 
 /* map byte offset to character index */
-static mrb_int
-bytes2chars(mrb_value str, mrb_int bi)
+mrb_int
+mrb_str_byte_to_char(mrb_state *mrb, mrb_value str, mrb_int bi)
 {
+  (void)mrb;
   struct RString *s = mrb_str_ptr(str);
+  if (bi < 0 || RSTR_LEN(s) < bi) return -1;
   if (RSTR_SINGLE_BYTE_P(s) || RSTR_BINARY_P(s)) {
     return bi;
   }
@@ -611,7 +674,6 @@ bytes2chars(mrb_value str, mrb_int bi)
   const char *pivot = p + bi;
   mrb_int i = 0;
 
-  if (e < pivot) return -1;
   while (p < pivot) {
     if ((*p & 0x80) == 0) {
       const char *np = search_nonascii(p, pivot);
@@ -627,26 +689,23 @@ bytes2chars(mrb_value str, mrb_int bi)
   return i;
 }
 
+/* The byte the character covering `p` starts at, or `p` itself when `p` is
+   already a character boundary. A continuation byte belongs to the character
+   that reaches it; one that no lead byte reaches belongs to none and stands as
+   a character of its own. Whether a lead byte reaches is mrb_utf8len()'s
+   answer, so the boundaries found here are the ones the character count is
+   taken over. Reading back three bytes covers it, since nothing longer than
+   four bytes spells a character. */
 static const char*
-char_adjust(const char *ptr, const char *end)
+str_char_head(const char *beg, const char *p, const char *end)
 {
-  ptrdiff_t len = end - ptr;
-  if (len < 1 || utf8_islead(ptr[0])) return ptr;
-  if (len > 1 && utf8_islead(ptr[1])) return ptr+1;
-  if (len > 2 && utf8_islead(ptr[2])) return ptr+2;
-  if (len > 3 && utf8_islead(ptr[3])) return ptr+3;
-  return ptr;
-}
-
-static const char*
-char_backtrack(const char *ptr, const char *end)
-{
-  ptrdiff_t len = end - ptr;
-  if (len < 1 || utf8_islead(end[-1])) return end-1;
-  if (len > 1 && utf8_islead(end[-2])) return end-2;
-  if (len > 2 && utf8_islead(end[-3])) return end-3;
-  if (len > 3 && utf8_islead(end[-4])) return end-4;
-  return end - 1;
+  if (p >= end || utf8_islead(p[0])) return p;
+  for (mrb_int back = 1; back <= 3 && back <= p - beg; back++) {
+    const char *lead = p - back;
+    if (!utf8_islead(lead[0])) continue;  /* another continuation byte */
+    return mrb_utf8len(lead, end) > back ? lead : p;
+  }
+  return p;
 }
 
 static mrb_int
@@ -656,24 +715,53 @@ str_index_str_by_char(mrb_state *mrb, mrb_value str, mrb_value sub, mrb_int pos)
   mrb_int len = RSTRING_LEN(sub);
 
   if (pos > 0) {
-    pos = chars2bytes(str, 0, pos);
+    pos = mrb_str_char_to_byte(mrb, str, 0, pos);
   }
 
   pos = mrb_str_index(mrb, str, ptr, len, pos);
 
   if (pos > 0) {
-    pos = bytes2chars(str, pos);
+    pos = mrb_str_byte_to_char(mrb, str, pos);
   }
   return pos;
 }
 
 #else
-#define RSTRING_CHAR_LEN(s) RSTRING_LEN(s)
-#define chars2bytes(s, off, ci) (ci)
-#define bytes2chars(s, bi) (bi)
-#define char_adjust(ptr, end) (ptr)
-#define char_backtrack(ptr, end) ((end) - 1)
+/* a byte is a character here, so the count is the byte length and both
+   conversions are identity */
+mrb_int
+mrb_str_char_len(mrb_state *mrb, mrb_value str)
+{
+  (void)mrb;
+  return RSTRING_LEN(str);
+}
+
+mrb_int
+mrb_str_char_to_byte(mrb_state *mrb, mrb_value str, mrb_int off, mrb_int idx)
+{
+  (void)mrb;
+  (void)str;
+  (void)off;
+  return idx;
+}
+
+mrb_int
+mrb_str_byte_to_char(mrb_state *mrb, mrb_value str, mrb_int bi)
+{
+  (void)mrb;
+  if (bi < 0 || RSTRING_LEN(str) < bi) return -1;
+  return bi;
+}
 #define str_index_str_by_char(mrb, str, sub, pos) str_index_str((mrb), (str), (sub), (pos))
+
+/* a string is bytes here, with no encoding to disagree with */
+mrb_bool
+mrb_str_valid_encoding_p(mrb_state *mrb, mrb_value str)
+{
+  (void)mrb;
+  (void)str;
+  return TRUE;
+}
 #endif
 
 /* memsearch_swar (SWAR stands for SIMD within a register)                 */
@@ -826,8 +914,8 @@ mrb_str_byte_subseq(mrb_state *mrb, mrb_value str, mrb_int beg, mrb_int len)
 static inline mrb_value
 str_subseq(mrb_state *mrb, mrb_value str, mrb_int beg, mrb_int len)
 {
-  beg = chars2bytes(str, 0, beg);
-  len = chars2bytes(str, beg, len);
+  beg = mrb_str_char_to_byte(mrb, str, 0, beg);
+  len = mrb_str_char_to_byte(mrb, str, beg, len);
   return mrb_str_byte_subseq(mrb, str, beg, len);
 }
 #else
@@ -853,7 +941,7 @@ mrb_str_beg_len(mrb_int str_len, mrb_int *begp, mrb_int *lenp)
 static mrb_value
 str_substr(mrb_state *mrb, mrb_value str, mrb_int beg, mrb_int len)
 {
-  return mrb_str_beg_len(RSTRING_CHAR_LEN(str), &beg, &len) ?
+  return mrb_str_beg_len(mrb_str_char_len(mrb, str), &beg, &len) ?
     str_subseq(mrb, str, beg, len) : mrb_nil_value();
 }
 
@@ -926,8 +1014,41 @@ str_replace(mrb_state *mrb, struct RString *s1, struct RString *s2)
   return mrb_obj_value(s1);
 }
 
+/* Search backward for `sub` one byte at a time, the mirror of the forward
+   scan in str_index(). This is what a byte-indexed string answers with. */
 static mrb_int
-str_rindex(mrb_state *mrb, mrb_value str, mrb_value sub, mrb_int pos)
+str_byterindex(mrb_value str, mrb_value sub, mrb_int pos)
+{
+  const char *sbeg, *t;
+  struct RString *ps = mrb_str_ptr(str);
+  mrb_int len = RSTRING_LEN(sub);
+  mrb_int slen = RSTR_LEN(ps);
+
+  /* substring longer than string */
+  if (slen < len) return -1;
+  if (slen - pos < len) {
+    pos = slen - len;
+  }
+  if (len == 0) return pos;
+
+  sbeg = RSTR_PTR(ps);
+  t = RSTRING_PTR(sub);
+  /* count down an index rather than a pointer: stepping a pointer past the
+     first byte to end the search would leave the buffer */
+  for (mrb_int i = pos; 0 <= i; i--) {
+    if (memcmp(sbeg+i, t, len) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+#ifdef MRB_UTF8_STRING
+/* Search backward for `sub` over character boundaries, so a match starting
+   inside a multi-byte character is stepped over rather than reported. This
+   is what a character-indexed string answers with. */
+static mrb_int
+str_char_rindex(mrb_value str, mrb_value sub, mrb_int pos)
 {
   const char *s, *sbeg, *send, *t;
   struct RString *ps = mrb_str_ptr(str);
@@ -944,12 +1065,17 @@ str_rindex(mrb_state *mrb, mrb_value str, mrb_value sub, mrb_int pos)
   s = sbeg + pos;
   t = RSTRING_PTR(sub);
   if (len) {
-    s = char_adjust(s, send);
-    while (sbeg <= s) {
+    /* a match may start only at a character boundary, and `pos` need not be
+       one: the clamp above answers the last byte `sub` fits at */
+    s = str_char_head(sbeg, s, send);
+    for (;;) {
       if ((mrb_int)(send - s) >= len && memcmp(s, t, len) == 0) {
         return (mrb_int)(s - sbeg);
       }
-      s = char_backtrack(sbeg, s);
+      /* the character before `s`, which there is none of once the search has
+         reached the first one */
+      if (s == sbeg) break;
+      s = str_char_head(sbeg, s-1, send);
     }
     return -1;
   }
@@ -957,6 +1083,7 @@ str_rindex(mrb_state *mrb, mrb_value str, mrb_value sub, mrb_int pos)
     return pos;
   }
 }
+#endif
 
 #ifdef _WIN32
 #include <stdlib.h>
@@ -1185,7 +1312,7 @@ mrb_str_plus_m(mrb_state *mrb, mrb_value self)
 static mrb_value
 mrb_str_size(mrb_state *mrb, mrb_value self)
 {
-  mrb_int len = RSTRING_CHAR_LEN(self);
+  mrb_int len = mrb_str_char_len(mrb, self);
   return mrb_int_value(mrb, len);
 }
 
@@ -1426,7 +1553,7 @@ str_convert_range(mrb_state *mrb, mrb_value str, mrb_value idx, mrb_value alen, 
         return STR_BYTE_RANGE_CORRECTED;
 
       case MRB_TT_RANGE:
-        *len = RSTRING_CHAR_LEN(str);
+        *len = mrb_str_char_len(mrb, str);
         switch (mrb_range_beg_len(mrb, idx, beg, len, *len, TRUE)) {
           case MRB_RANGE_OK:
             return STR_CHAR_RANGE_CORRECTED;
@@ -1670,13 +1797,13 @@ mrb_str_aset(mrb_state *mrb, mrb_value str, mrb_value idx, mrb_value alen, mrb_v
       if (len < 0) {
         mrb_raisef(mrb, E_INDEX_ERROR, "negative length %v", alen);
       }
-      charlen = RSTRING_CHAR_LEN(str);
+      charlen = mrb_str_char_len(mrb, str);
       if (beg < 0) { beg += charlen; }
       if (beg < 0 || beg > charlen) { str_out_of_index(mrb, idx); }
       /* fall through */
     case STR_CHAR_RANGE_CORRECTED:
-      beg = chars2bytes(str, 0, beg);
-      len = chars2bytes(str, beg, len);
+      beg = mrb_str_char_to_byte(mrb, str, 0, beg);
+      len = mrb_str_char_to_byte(mrb, str, beg, len);
       /* fall through */
     case STR_BYTE_RANGE_CORRECTED:
       if (mrb_int_add_overflow(beg, len, &len)) {
@@ -2186,7 +2313,7 @@ mrb_str_index_m(mrb_state *mrb, mrb_value str)
     pos = 0;
   }
   else if (pos < 0) {
-    mrb_int clen = RSTRING_CHAR_LEN(str);
+    mrb_int clen = mrb_str_char_len(mrb, str);
     pos += clen;
     if (pos < 0) {
       return mrb_nil_value();
@@ -2366,7 +2493,7 @@ mrb_str_reverse_bang(mrb_state *mrb, mrb_value str)
   char *p, *e;
 
 #ifdef MRB_UTF8_STRING
-  mrb_int utf8_len = RSTRING_CHAR_LEN(str);
+  mrb_int utf8_len = mrb_str_char_len(mrb, str);
   mrb_int len = RSTR_LEN(s);
 
   if (utf8_len < 2) return str;
@@ -2445,7 +2572,7 @@ mrb_str_byterindex_m(mrb_state *mrb, mrb_value str)
     }
     if (pos > len) pos = len;
   }
-  pos = str_rindex(mrb, str, sub, pos);
+  pos = str_byterindex(str, sub, pos);
   if (pos < 0) {
     return mrb_nil_value();
   }
@@ -2471,7 +2598,8 @@ mrb_str_byterindex_m(mrb_state *mrb, mrb_value str)
 static mrb_value
 mrb_str_rindex_m(mrb_state *mrb, mrb_value str)
 {
-  if (RSTR_SINGLE_BYTE_P(mrb_str_ptr(str))) {
+  struct RString *s = mrb_str_ptr(str);
+  if (RSTR_SINGLE_BYTE_P(s) || RSTR_BINARY_P(s)) {
     return mrb_str_byterindex_m(mrb, str);
   }
 
@@ -2482,20 +2610,24 @@ mrb_str_rindex_m(mrb_state *mrb, mrb_value str)
     pos = RSTRING_LEN(str);
   }
   else if (pos >= 0) {
-    pos = chars2bytes(str, 0, pos);
+    pos = mrb_str_char_to_byte(mrb, str, 0, pos);
   }
   else {
     const char *p = RSTRING_PTR(str);
-    const char *e = RSTRING_END(str);
-    while (pos++ < 0 && p < e) {
-      e = char_backtrack(p, e);
+    const char *send = RSTRING_END(str);
+    const char *e = send;
+    /* a negative `pos` counts characters back from the end, and landing on the
+       first character is the last step that stays in the string */
+    while (pos < 0) {
+      if (e == p) return mrb_nil_value();
+      e = str_char_head(p, e-1, send);
+      pos++;
     }
-    if (p == e) return mrb_nil_value();
     pos = (mrb_int)(e - p);
   }
-  pos = str_rindex(mrb, str, sub, pos);
+  pos = str_char_rindex(str, sub, pos);
   if (pos >= 0) {
-    pos = bytes2chars(str, pos);
+    pos = mrb_str_byte_to_char(mrb, str, pos);
     if (pos < 0) return mrb_nil_value();
     return mrb_int_value(mrb, pos);
   }
@@ -2615,7 +2747,7 @@ mrb_str_split_m(mrb_state *mrb, mrb_value str)
         if (end < 0) break;
       }
       else {
-        end = chars2bytes(str, idx, 1);
+        end = mrb_str_char_to_byte(mrb, str, idx, 1);
       }
       mrb_ary_push(mrb, result, mrb_str_byte_subseq(mrb, str, idx, end));
       mrb_gc_arena_restore(mrb, ai);

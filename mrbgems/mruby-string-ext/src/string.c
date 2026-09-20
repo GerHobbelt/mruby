@@ -966,38 +966,26 @@ str_succ(mrb_state *mrb, mrb_value self)
 }
 
 #ifdef MRB_UTF8_STRING
-extern const char mrb_utf8len_table[];
-
+/* Decodes the UTF-8 character starting at p, storing its byte length through
+   lenp when that is not NULL. mrb_utf8len() answers 1 for every sequence it
+   rejects, so a lead byte measured as one byte is invalid. */
 MRB_INLINE mrb_int
-utf8code(mrb_state* mrb, const unsigned char* p, const unsigned char *e)
+utf8code(mrb_state* mrb, const unsigned char* p, const unsigned char *e, mrb_int *lenp)
 {
-  if (p[0] < 0x80) return p[0];
-
-  mrb_int len = mrb_utf8len_table[p[0]>>3];
-  mrb_int cp = -1;
-  if (p+len <= e && len > 1 && (p[1] & 0xc0) == 0x80) {
-    if (len == 2)
-      cp = ((p[0] & 0x1f) << 6) + (p[1] & 0x3f);
-    else if ((p[2] & 0xc0) == 0x80) {
-      if (len == 3)
-        cp = ((p[0] & 0x0f) << 12) + ((p[1] & 0x3f) << 6) + (p[2] & 0x3f);
-      else if (len == 4 && (p[3] & 0xc0) == 0x80) {
-        cp = ((p[0] & 0x07) << 18) + ((p[1] & 0x3f) << 12)
-              + ((p[2] & 0x3f) << 6) + (p[3] & 0x3f);
-      }
+  mrb_int len = mrb_utf8len((const char*)p, (const char*)e);
+  if (lenp) *lenp = len;
+  if (len == 1) {
+    if (p[0] >= 0x80) {
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid UTF-8 byte sequence");
     }
+    return p[0];
   }
-  /* Reject overlong sequences, UTF-16 surrogates, and code points above
-     U+10FFFF (RFC 3629, Unicode D93b). */
-  if (cp >= 0 &&
-      ((len == 2 && cp >= 0x80) ||
-       (len == 3 && cp >= 0x800 && (cp < 0xD800 || 0xDFFF < cp)) ||
-       (len == 4 && cp >= 0x10000 && cp <= 0x10FFFF))) {
-    return cp;
+
+  mrb_int cp = p[0] & (0xff >> (len + 1));
+  for (mrb_int i = 1; i < len; i++) {
+    cp = (cp << 6) | (p[i] & 0x3f);
   }
-  mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid UTF-8 byte sequence");
-  /* not reached */
-  return -1;
+  return cp;
 }
 
 static mrb_value
@@ -1015,7 +1003,7 @@ str_ord(mrb_state* mrb, mrb_value str)
     c = p[0];
   }
   else {
-    c = utf8code(mrb, p, e);
+    c = utf8code(mrb, p, e, NULL);
   }
   return mrb_fixnum_value(c);
 }
@@ -1027,28 +1015,42 @@ str_ord(mrb_state* mrb, mrb_value str)
 static mrb_int
 str_scrub_char_len(const unsigned char *p, const unsigned char *e)
 {
-  if (p[0] < 0x80) return 1;
-  mrb_int len = mrb_utf8len_table[p[0]>>3];
-  if (len < 2 || len > e - p) return -1;
-  for (mrb_int i = 1; i < len; i++) {
-    if ((p[i] & 0xc0) != 0x80) return -1;
-  }
-  mrb_int cp;
-  if (len == 2) {
-    cp = ((p[0] & 0x1f) << 6) | (p[1] & 0x3f);
-    if (cp < 0x80) return -1;
-  }
-  else if (len == 3) {
-    cp = ((p[0] & 0x0f) << 12) | ((p[1] & 0x3f) << 6) | (p[2] & 0x3f);
-    if (cp < 0x800) return -1;
-    if (cp >= 0xD800 && cp <= 0xDFFF) return -1;
-  }
-  else { /* len == 4 */
-    cp = ((p[0] & 0x07) << 18) | ((p[1] & 0x3f) << 12)
-       | ((p[2] & 0x3f) <<  6) |  (p[3] & 0x3f);
-    if (cp < 0x10000 || cp > 0x10FFFF) return -1;
-  }
+  mrb_int len = mrb_utf8len((const char*)p, (const char*)e);
+  if (len == 1 && p[0] >= 0x80) return -1;
   return len;
+}
+
+/* The byte length of the maximal subpart at p, which is the longest prefix
+   that could still have grown into a well-formed sequence. Unicode 3.9 gives
+   one U+FFFD to each of those rather than one to a whole run of bad bytes, so
+   "\xE0\x80\xAF" is three replacements and a truncated "\xE3\x81" is one.
+   Only called where the sequence at p is known to be ill-formed. */
+static mrb_int
+str_scrub_subpart_len(const unsigned char *p, const unsigned char *e)
+{
+  unsigned char c = p[0], lo = 0x80, hi = 0xBF;
+  mrb_int want;
+
+  /* a byte that leads nothing stands alone, continuation bytes included */
+  if (c < 0xC2 || 0xF4 < c) return 1;
+  if (c < 0xE0)      want = 2;
+  else if (c < 0xF0) want = 3;
+  else               want = 4;
+  /* the second byte is the one whose range depends on the lead */
+  switch (c) {
+  case 0xE0: lo = 0xA0; break;
+  case 0xED: hi = 0x9F; break;
+  case 0xF0: lo = 0x90; break;
+  case 0xF4: hi = 0x8F; break;
+  }
+
+  mrb_int n = 1;
+  while (n < want && p + n < e) {
+    unsigned char b = p[n];
+    if (n == 1 ? (b < lo || hi < b) : (b < 0x80 || 0xBF < b)) break;
+    n++;
+  }
+  return n;
 }
 
 static void
@@ -1105,8 +1107,7 @@ str_scrub_core(mrb_state *mrb, mrb_value self)
       }
       mrb_str_cat(mrb, result, (const char*)valid_start, q - valid_start);
       mrb_str_cat(mrb, result, replace, replace_len);
-      q++;
-      while (q < e && str_scrub_char_len(q, e) < 0) q++;
+      q += str_scrub_subpart_len(q, e);
       valid_start = q;
     }
     else {
@@ -1144,8 +1145,7 @@ str_scrub_chunks(mrb_state *mrb, mrb_value self)
     if (len < 0) {
       mrb_ary_push(mrb, ary, mrb_str_new(mrb, (const char*)valid_start, q - valid_start));
       const unsigned char *invalid_start = q;
-      q++;
-      while (q < e && str_scrub_char_len(q, e) < 0) q++;
+      q += str_scrub_subpart_len(q, e);
       mrb_ary_push(mrb, ary, mrb_str_new(mrb, (const char*)invalid_start, q - invalid_start));
       valid_start = q;
     }
@@ -1175,9 +1175,10 @@ str_codepoints(mrb_state *mrb, mrb_value str)
   }
   else {
     while (p < e) {
-      mrb_int c = utf8code(mrb, p, e);
+      mrb_int len;
+      mrb_int c = utf8code(mrb, p, e, &len);
       mrb_ary_push(mrb, result, mrb_int_value(mrb, c));
-      p += mrb_utf8len_table[p[0]>>3];
+      p += len;
     }
   }
   return result;
@@ -1741,87 +1742,33 @@ str_strip_bang(mrb_state *mrb, mrb_value self)
   return self;
 }
 
-/* Internal helper to count UTF-8 characters in a string using mruby's standard function */
-static mrb_int
-str_char_count(mrb_value str)
-{
-#ifdef MRB_UTF8_STRING
-  struct RString *s = mrb_str_ptr(str);
-
-  if (RSTR_SINGLE_BYTE_P(s) || RSTR_BINARY_P(s)) {
-    /* ASCII/Binary: each byte is a character */
-    return RSTR_LEN(s);
-  }
-
-  /* UTF-8: use mruby's standard UTF-8 character counting function */
-  return mrb_utf8_strlen(RSTR_PTR(s), RSTR_LEN(s));
-#else
-  /* Non-UTF8 build: treat as single bytes */
-  return RSTRING_LEN(str);
-#endif
-}
-
 /* Internal fast path for String#chars - returns array of individual characters */
 static mrb_value
 str_chars_ary(mrb_state *mrb, mrb_value self)
 {
   struct RString *s = mrb_str_ptr(self);
-  const unsigned char *p = (unsigned char*)RSTR_PTR(s);
-  const unsigned char *e = p + RSTR_LEN(s);
+  const char *p = RSTR_PTR(s);
+  const char *e = p + RSTR_LEN(s);
+  /* the count comes first: it is the exact capacity, and it settles the
+     single-byte flag the walk reads */
+  mrb_value result = mrb_ary_new_capa(mrb, mrb_str_char_len(mrb, self));
 
-  /* Estimate character count for array pre-allocation */
-  mrb_int estimated_chars = RSTR_LEN(s);
-  if (!RSTR_SINGLE_BYTE_P(s) && !RSTR_BINARY_P(s)) {
-    estimated_chars = estimated_chars / 2; /* rough estimate for UTF-8 */
-  }
-  mrb_value result = mrb_ary_new_capa(mrb, estimated_chars);
-
-  if (RSTR_SINGLE_BYTE_P(s) || RSTR_BINARY_P(s)) {
-    /* ASCII/Binary: each byte is a character */
-    while (p < e) {
-      mrb_value char_str = mrb_str_new(mrb, (char*)p, 1);
-      mrb_ary_push(mrb, result, char_str);
-      p++;
-    }
-  }
-  else {
 #ifdef MRB_UTF8_STRING
-    /* UTF-8: handle multi-byte characters */
+  if (!RSTR_SINGLE_BYTE_P(s) && !RSTR_BINARY_P(s)) {
     while (p < e) {
-      mrb_int char_len = mrb_utf8len_table[p[0] >> 3];
-      if (char_len == 0 || char_len > 4 || p + char_len > e) {
-        /* Invalid UTF-8, treat as single byte */
-        char_len = 1;
-      }
-      else {
-        /* Validate UTF-8 sequence */
-        mrb_bool valid = TRUE;
-        if (char_len > 1) {
-          for (mrb_int i = 1; i < char_len; i++) {
-            if ((p[i] & 0xC0) != 0x80) {
-              valid = FALSE;
-              break;
-            }
-          }
-        }
-        if (!valid) {
-          char_len = 1;
-        }
-      }
-      mrb_value char_str = mrb_str_new(mrb, (char*)p, char_len);
-      mrb_ary_push(mrb, result, char_str);
+      mrb_int char_len = mrb_utf8len(p, e);
+      mrb_ary_push(mrb, result, mrb_str_new(mrb, p, char_len));
       p += char_len;
     }
-#else
-    /* Non-UTF8 build: treat as single bytes */
-    while (p < e) {
-      mrb_value char_str = mrb_str_new(mrb, (char*)p, 1);
-      mrb_ary_push(mrb, result, char_str);
-      p++;
-    }
-#endif
+    return result;
   }
+#endif
 
+  /* one character per byte */
+  while (p < e) {
+    mrb_ary_push(mrb, result, mrb_str_new(mrb, p, 1));
+    p++;
+  }
   return result;
 }
 
@@ -1845,13 +1792,13 @@ str_ljust_core(mrb_state *mrb, mrb_value self)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "zero width padding");
   }
 
-  mrb_int char_len = str_char_count(self);
+  mrb_int char_len = mrb_str_char_len(mrb, self);
   if (width <= char_len) {
     return mrb_str_dup(mrb, self);
   }
 
   mrb_int padsize = width - char_len;
-  mrb_int pad_char_len = str_char_count(padstr);
+  mrb_int pad_char_len = mrb_str_char_len(mrb, padstr);
   if (pad_char_len == 0) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "zero width padding");
   }
@@ -1895,13 +1842,13 @@ str_rjust_core(mrb_state *mrb, mrb_value self)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "zero width padding");
   }
 
-  mrb_int char_len = str_char_count(self);
+  mrb_int char_len = mrb_str_char_len(mrb, self);
   if (width <= char_len) {
     return mrb_str_dup(mrb, self);
   }
 
   mrb_int padsize = width - char_len;
-  mrb_int pad_char_len = str_char_count(padstr);
+  mrb_int pad_char_len = mrb_str_char_len(mrb, padstr);
   if (pad_char_len == 0) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "zero width padding");
   }
@@ -1945,7 +1892,7 @@ str_center_core(mrb_state *mrb, mrb_value self)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "zero width padding");
   }
 
-  mrb_int char_len = str_char_count(self);
+  mrb_int char_len = mrb_str_char_len(mrb, self);
   if (width <= char_len) {
     return mrb_str_dup(mrb, self);
   }
@@ -1954,7 +1901,7 @@ str_center_core(mrb_state *mrb, mrb_value self)
   mrb_int left_pad = total_pad / 2;
   mrb_int right_pad = total_pad - left_pad;
 
-  mrb_int pad_char_len = str_char_count(padstr);
+  mrb_int pad_char_len = mrb_str_char_len(mrb, padstr);
   if (pad_char_len == 0) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "zero width padding");
   }
@@ -1993,67 +1940,6 @@ str_center_core(mrb_state *mrb, mrb_value self)
   return mrb_str_cat_str(mrb, result, right_padding);
 }
 
-#ifdef MRB_UTF8_STRING
-/*
- * Given a character index, find the byte offset in a UTF-8 string.
- * Returns -1 if the character index is out of bounds.
- */
-static mrb_int
-str_char_to_byte_offset(mrb_value str, mrb_int char_index)
-{
-  struct RString *s = mrb_str_ptr(str);
-  const char *p = RSTR_PTR(s);
-  mrb_int byte_len = RSTR_LEN(s);
-
-  if (RSTR_SINGLE_BYTE_P(s) || RSTR_BINARY_P(s)) {
-    return char_index;
-  }
-
-  if (char_index < 0) return -1;
-
-  mrb_int byte_offset = 0;
-  mrb_int current_char_index = 0;
-  while (byte_offset < byte_len && current_char_index < char_index) {
-    mrb_int char_len = mrb_utf8len(p + byte_offset, p + byte_len - byte_offset);
-    if (char_len == 0) break;
-    byte_offset += char_len;
-    current_char_index++;
-  }
-
-  if (current_char_index < char_index) return -1;
-  return byte_offset;
-}
-
-/*
- * Given a starting character index and a character length, find the byte length.
- */
-static mrb_int
-str_chars_to_byte_len(mrb_value str, mrb_int char_start, mrb_int char_len)
-{
-  struct RString *s = mrb_str_ptr(str);
-  const char *p = RSTR_PTR(s);
-  mrb_int str_byte_len = RSTR_LEN(s);
-
-  if (RSTR_SINGLE_BYTE_P(s) || RSTR_BINARY_P(s)) {
-    return char_len;
-  }
-
-  mrb_int start_byte_offset = str_char_to_byte_offset(str, char_start);
-  if (start_byte_offset == -1) return 0;
-
-  mrb_int byte_offset = start_byte_offset;
-  mrb_int current_char_len = 0;
-  while (byte_offset < str_byte_len && current_char_len < char_len) {
-    mrb_int cl = mrb_utf8len(p + byte_offset, p + str_byte_len - byte_offset);
-    if (cl == 0) break;
-    byte_offset += cl;
-    current_char_len++;
-  }
-
-  return byte_offset - start_byte_offset;
-}
-#endif
-
 static mrb_value
 mrb_str_slice_bang(mrb_state *mrb, mrb_value self)
 {
@@ -2065,11 +1951,7 @@ mrb_str_slice_bang(mrb_state *mrb, mrb_value self)
   struct RString *str = mrb_str_ptr(self);
   const char *ptr = RSTRING_PTR(self);
 
-#ifdef MRB_UTF8_STRING
-  mrb_int str_len = str_char_count(self);
-#else
-  mrb_int str_len = RSTRING_LEN(self);
-#endif
+  mrb_int str_len = mrb_str_char_len(mrb, self);
 
   mrb_int beg, len;
 
@@ -2077,13 +1959,12 @@ mrb_str_slice_bang(mrb_state *mrb, mrb_value self)
     if (mrb_string_p(arg1)) {
       mrb_int pos = mrb_str_index(mrb, self, RSTRING_PTR(arg1), RSTRING_LEN(arg1), 0);
       if (pos == -1) return mrb_nil_value();
-#ifdef MRB_UTF8_STRING
-      beg = str_char_count(mrb_str_substr(mrb, self, 0, pos));
-      len = str_char_count(arg1);
-#else
-      beg = pos;
-      len = RSTRING_LEN(arg1);
-#endif
+      /* The search runs over bytes, so a match may start inside a character;
+         mrb_str_byte_to_char() answers -1 there, and a match no character
+         index reaches is no match. */
+      beg = mrb_str_byte_to_char(mrb, self, pos);
+      if (beg < 0) return mrb_nil_value();
+      len = mrb_str_char_len(mrb, arg1);
     }
     else if (mrb_range_p(arg1)) {
       if (mrb_range_beg_len(mrb, arg1, &beg, &len, str_len, TRUE) != MRB_RANGE_OK) {
@@ -2111,13 +1992,8 @@ mrb_str_slice_bang(mrb_state *mrb, mrb_value self)
   }
   if (len < 0) len = 0;
 
-#ifdef MRB_UTF8_STRING
-  mrb_int byte_beg = str_char_to_byte_offset(self, beg);
-  mrb_int byte_len = str_chars_to_byte_len(self, beg, len);
-#else
-  mrb_int byte_beg = beg;
-  mrb_int byte_len = len;
-#endif
+  mrb_int byte_beg = mrb_str_char_to_byte(mrb, self, 0, beg);
+  mrb_int byte_len = mrb_str_char_to_byte(mrb, self, byte_beg, len);
 
   if (byte_beg < 0 || byte_beg > RSTRING_LEN(self) || byte_beg + byte_len > RSTRING_LEN(self)) {
     return mrb_nil_value();

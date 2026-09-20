@@ -426,6 +426,52 @@ assert('String#slice!') do
   assert_raise(ArgumentError) { "foo".slice! }
 end
 
+assert('String#slice! with multibyte characters') do
+  a = "あいうえお"
+  assert_equal "えお", a.slice!(3, 2)
+  assert_equal "あいう", a
+
+  a = "あいう"
+  assert_equal "いう", a.slice!(1..2)
+  assert_equal "あ", a
+
+  a = "あいう"
+  assert_equal "う", a.slice!(-1)
+  assert_equal "あい", a
+
+  a = "aあいb"
+  assert_equal "あい", a.slice!(1, 2)
+  assert_equal "ab", a
+
+  a = "あい"
+  assert_equal "あい", a.slice!(0, 2)
+  assert_equal "", a
+
+  a = "あい"
+  assert_equal "", a.slice!(2, 1)
+  assert_equal "あい", a
+end if UTF8STRING
+
+assert('String#slice! with a multibyte match') do
+  a = "あいう"
+  assert_equal "い", a.slice!("い")
+  assert_equal "あう", a
+
+  a = "あいう"
+  assert_equal "う", a.slice!("う")
+  assert_equal "あい", a
+
+  a = "あいう"
+  assert_nil a.slice!("え")
+  assert_equal "あいう", a
+
+  # the search runs over bytes, so a match starting inside a character is
+  # not a match
+  a = "あ"
+  assert_nil a.slice!("\x81\x82")
+  assert_equal "あ", a
+end if UTF8STRING
+
 assert('String#succ') do
   assert_equal "", "".succ
   assert_equal "1", "0".succ
@@ -812,6 +858,22 @@ assert('String#chars(UTF-8)') do
   assert_equal "こんにちは世界!", s
 end if UTF8STRING
 
+assert('String#chars splits a malformed sequence by byte') do
+  # A byte standing for no character is one position of its own, which is
+  # what #length counts it as.
+  assert_equal ["\xC0", "\x80"], "\xC0\x80".chars                          # overlong "/"
+  assert_equal ["\xED", "\xA0", "\x80"], "\xED\xA0\x80".chars              # surrogate U+D800
+  assert_equal ["\xF4", "\x90", "\x80", "\x80"], "\xF4\x90\x80\x80".chars  # > U+10FFFF
+  assert_equal ["\xE3", "\x81"], "\xE3\x81".chars                          # truncated
+  assert_equal ["a", "\x80", "b"], "a\x80b".chars                          # stray continuation
+  assert_equal ["あ", "\xFE", "い"], "あ\xFEい".chars                      # sequence leads nothing
+
+  ["\xC0\x80", "\xED\xA0\x80", "\xF4\x90\x80\x80", "\xE3\x81", "a\x80b",
+   "あ\xFEい", "あいu", "hello"].each do |str|
+    assert_equal str.length, str.chars.size
+  end
+end if UTF8STRING
+
 assert('String#each_char') do
   chars = []
   "hello!".each_char do |x|
@@ -850,6 +912,28 @@ assert('String#chop! on a binary string removes one byte') do
   end
 end
 
+assert('String#rindex on a binary string counts bytes') do
+  # `rindex` reads a byte-indexed string as UTF-8 unless the single-byte flag
+  # is already set, so it stepped over the bytes inside a multi-byte sequence
+  # and moved a negative position by characters. `index` counts bytes there,
+  # and the two have to meet.
+  if UTF8STRING
+    s = "aあb".b # "\x61\xe3\x81\x82\x62"
+    assert_equal 2, s.rindex("\x81".b)
+    assert_equal s.index("\x81".b), s.rindex("\x81".b)
+    assert_equal 1, s.rindex("\xe3".b)
+    assert_equal 4, s.rindex("b".b)
+    assert_equal 2, s.rindex("\x81".b, -2)
+    assert_equal 2, s.rindex("\x81".b, -3)
+    assert_nil s.rindex("\x81".b, 1)
+    assert_equal 4, s.rindex("b".b, -1)
+    # the same answers once #length has set the single-byte flag
+    assert_equal 5, s.length
+    assert_equal 2, s.rindex("\x81".b)
+    assert_equal 2, s.rindex("\x81".b, -2)
+  end
+end
+
 assert('String#codepoints') do
   expect = [104, 101, 108, 108, 111, 33]
   assert_equal expect, "hello!".codepoints
@@ -868,6 +952,26 @@ assert('String#codepoints(UTF-8)') do
     cp << x
   end
   assert_equal expect, cp
+end if UTF8STRING
+
+assert('String#codepoints rejects malformed sequences') do
+  assert_raise(ArgumentError) { "\x80".codepoints }             # stray continuation
+  assert_raise(ArgumentError) { "\xE3\x81".codepoints }         # truncated
+  assert_raise(ArgumentError) { "\xC0\xAF".codepoints }         # overlong "/"
+  assert_raise(ArgumentError) { "\xED\xA0\x80".codepoints }     # surrogate U+D800
+  assert_raise(ArgumentError) { "\xF4\x90\x80\x80".codepoints } # > U+10FFFF
+  assert_raise(ArgumentError) { "\xF8\x88\x80\x80\x80".codepoints }
+  # the walk keeps its place: characters after a 4-byte one still decode
+  assert_equal [128169, 97], "\u{1F4A9}a".codepoints
+  assert_raise(ArgumentError) { "\u{1F4A9}\xC0\xAF".codepoints }
+end if UTF8STRING
+
+assert('String#ord rejects malformed sequences') do
+  assert_raise(ArgumentError) { "\x80".ord }
+  assert_raise(ArgumentError) { "\xE3\x81".ord }
+  assert_raise(ArgumentError) { "\xC0\xAF".ord }
+  assert_raise(ArgumentError) { "\xED\xA0\x80".ord }
+  assert_raise(ArgumentError) { "\xF4\x90\x80\x80".ord }
 end if UTF8STRING
 
 assert('String#each_codepoint') do
@@ -922,7 +1026,8 @@ assert('String#scrub default replacement (U+FFFD)') do
   skip unless "あ".length == 1
   assert_equal "\u{FFFD}",       "\xE3\x81".scrub
   assert_equal "abc\u{FFFD}def", "abc\x80def".scrub
-  assert_equal "\u{FFFD}",       "\x80\x81\x82".scrub   # run collapsed
+  # Unicode 3.9 gives one U+FFFD to each maximal subpart, not one to a run
+  assert_equal "\u{FFFD}\u{FFFD}\u{FFFD}", "\x80\x81\x82".scrub
   assert_equal "",               "".scrub
   assert_equal "hello",          "hello".scrub          # already valid
   assert_equal "あい",   "あい".scrub   # already valid multibyte
@@ -930,10 +1035,29 @@ end
 
 assert('String#scrub rejects malformed sequences') do
   skip unless "あ".length == 1
-  # overlong, UTF-16 surrogate, codepoint above U+10FFFF
-  assert_equal "\u{FFFD}", "\xC0\xAF".scrub             # overlong "/"
-  assert_equal "\u{FFFD}", "\xED\xA0\x80".scrub         # surrogate U+D800
-  assert_equal "\u{FFFD}", "\xF4\x90\x80\x80".scrub     # > U+10FFFF
+  # overlong, UTF-16 surrogate, codepoint above U+10FFFF. Each byte that
+  # cannot continue what came before starts a subpart of its own, so the
+  # count follows the bytes rather than the run.
+  assert_equal "\u{FFFD}" * 2, "\xC0\xAF".scrub             # overlong "/"
+  assert_equal "\u{FFFD}" * 3, "\xED\xA0\x80".scrub         # surrogate U+D800
+  assert_equal "\u{FFFD}" * 4, "\xF4\x90\x80\x80".scrub     # > U+10FFFF
+end
+
+assert('String#scrub replaces each maximal subpart') do
+  skip unless "\u3042".length == 1
+  # A prefix that could still have grown into a character is one subpart:
+  # E3 81 needs a third byte, F0 9F 98 a fourth.
+  assert_equal "\u{FFFD}", "\xE3\x81".scrub
+  assert_equal "\u{FFFD}", "\xF0\x9F\x98".scrub
+  # E0 admits A0-BF as its second byte, so 80 ends the subpart at E0
+  assert_equal "\u{FFFD}" * 3, "\xE0\x80\xAF".scrub
+  # the example from Unicode 3.9: E1 80 | E2 | F0 91 92 | F1 BF BF BF
+  assert_equal "\u{FFFD}" * 3 + "\u{7FFFF}",
+               "\xE1\x80\xE2\xF0\x91\x92\xF1\xBF\xBF\xBF".scrub
+  # the block form is handed the same subparts
+  got = []
+  "\xE0\x80\xAF".scrub { |bad| got << bad.bytes; "?" }
+  assert_equal [[0xE0], [0x80], [0xAF]], got
 end
 
 assert('String#scrub with replacement string') do

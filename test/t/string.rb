@@ -535,6 +535,31 @@ assert('String#length', '15.2.10.5.26') do
   assert_equal 3, 'abc'.length
 end
 
+assert('String#length(UTF-8)', '15.2.10.5.26') do
+  assert_equal 3, 'あいう'.length
+
+  # A substring too long to embed shares the parent's buffer, so the byte
+  # after its last one belongs to the parent instead of terminating it.
+  s = ('あ' * 40)[0, 20]
+  assert_equal 60, s.bytesize
+  assert_equal 20, s.length
+  assert_nil s[20]
+  assert_equal 20, ('あ' * 40)[10, 20].length
+  assert_equal 10, ("\u{1F600}" * 20)[0, 10].length
+
+  # These answered correctly all along: a substring short enough to embed is
+  # copied and terminated, one reaching the parent's end stops at the parent's
+  # terminator, and a run of non-ASCII bytes ends on an ASCII one.
+  assert_equal 2, ('あ' * 40)[0, 2].length
+  assert_equal 20, ('あ' * 40)[20, 20].length
+  assert_equal 20, ('aあ' * 30)[0, 20].length
+
+  # Cut in the middle of a character, the loose bytes count one each,
+  # whether the string ends in the parent's buffer or in its own.
+  assert_equal 21, ('あ' * 40).byteslice(0, 59).length
+  assert_equal 2, "\xe3\x81".length
+end if UTF8STRING
+
 # 'String#match', '15.2.10.5.27' will be tested in mrbgems.
 
 assert('String#replace', '15.2.10.5.28') do
@@ -624,6 +649,57 @@ assert('String#rindex(UTF-8)', '15.2.10.5.31') do
   assert_equal  3, broken.rindex("☁", 10)
 end if UTF8STRING
 
+assert('String#rindex reaches the first character from a negative position') do
+  # A negative `pos` counts characters back from the end, so minus the length
+  # names the first character rather than a step past it.
+  assert_equal 0, "あいう".rindex("あ", -3)
+  assert_nil "あいう".rindex("あ", -4)
+  assert_equal 3, "あいうあ".rindex("あ", -1)
+  assert_equal 0, "あいうあ".rindex("あ", -4)
+  assert_nil "あいうあ".rindex("あ", -5)
+end if UTF8STRING
+
+assert('String#rindex steps by the characters String#length counts') do
+  # A byte that no lead byte reaches spells no character with its neighbours,
+  # so it is one position of its own, which is what #length counts it as.
+  str = "あ\x80x"
+  assert_equal 3, str.length
+  assert_equal 0, str.rindex("あ", -2)
+  assert_equal 1, str.rindex("\x80")
+  assert_equal str.index("\x80"), str.rindex("\x80")
+
+  # Searching backward from `pos` may not answer a position after it.
+  assert_nil str.rindex("x", 1)
+  assert_equal 2, str.rindex("x", 2)
+
+  # A sequence RFC 3629 forbids spells no character either, and its bytes
+  # stand alone the same way.
+  assert_equal 3, "\xC0\x80a".length
+  assert_equal 0, "\xC0\x80a".rindex("\xC0")
+  assert_equal 1, "\xC0\x80a".rindex("\x80")
+  assert_equal 3, "\xED\xA0\x80".length
+  assert_equal 2, "\xED\xA0\x80".rindex("\x80")
+end if UTF8STRING
+
+assert('String#byterindex searches bytes') do
+  # `byterindex` answers byte positions, so it walks bytes the way
+  # `byteindex` does. Walking characters instead, it passed over every byte
+  # inside a multi-byte sequence and reported nothing there.
+  str = "aあb" # "\x61\xe3\x81\x82\x62"
+  assert_equal 1, str.byterindex("\xe3")
+  assert_equal 2, str.byterindex("\x81")
+  assert_equal 3, str.byterindex("\x82")
+  assert_equal str.byteindex("\x81"), str.byterindex("\x81")
+  assert_equal 4, str.byterindex("b")
+  assert_equal 2, str.byterindex("\x81", 2)
+  assert_nil str.byterindex("\x81", 1)
+
+  assert_equal 3, 'abcabc'.byterindex('a')
+  assert_equal 0, 'abcabc'.byterindex('a', 1)
+  assert_equal 6, 'abcabc'.byterindex('')
+  assert_nil 'abc'.byterindex('d')
+end
+
 # assert('String#scan', '15.2.10.5.32') do
 #   # Not implemented yet
 # end
@@ -637,6 +713,20 @@ assert('String#size(UTF-8)', '15.2.10.5.33') do
   assert_equal 8, str.size
   assert_not_equal str.bytesize, str.size
   assert_equal 2, str[1, 2].size
+end if UTF8STRING
+
+assert('String#size(UTF-8) counts invalid sequences per byte') do
+  # RFC 3629: overlong forms, UTF-16 surrogates, and code points above
+  # U+10FFFF are not characters, so each of their bytes counts on its own
+  assert_equal 2, "\xC0\x80".size          # overlong NUL
+  assert_equal 3, "\xE0\x9F\xBF".size      # overlong (< U+0800)
+  assert_equal 3, "\xED\xA0\x80".size      # surrogate U+D800
+  assert_equal 4, "\xF0\x8F\xBF\xBF".size  # overlong (< U+10000)
+  assert_equal 4, "\xF4\x90\x80\x80".size  # above U+10FFFF
+  assert_equal 4, "\xF5\x80\x80\x80".size  # above U+10FFFF
+  assert_equal 1, "\u{D7FF}".size          # last code point before surrogates
+  assert_equal 1, "\u{E000}".size          # first code point after surrogates
+  assert_equal 1, "\u{10FFFF}".size        # largest valid code point
 end if UTF8STRING
 
 assert('String#slice', '15.2.10.5.34') do

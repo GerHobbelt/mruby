@@ -10,8 +10,57 @@ assert('String#valid_encoding?') do
     assert_false "\xfe".valid_encoding?
     assert_false "あ\xfe".valid_encoding?
     assert_true "あ\xfe".b.valid_encoding?
+
+    # Measuring a string of stray bytes marks it as one byte per character,
+    # which is true of it and says nothing about whether it is valid.
+    s = "a\x80"
+    assert_equal 2, s.size
+    assert_false s.valid_encoding?
+
+    # RFC 3629 restrictions
+    assert_false "\xC0\x80".valid_encoding?          # overlong NUL
+    assert_false "\xC1\xBF".valid_encoding?          # overlong (< U+0080)
+    assert_false "\xE0\x9F\xBF".valid_encoding?      # overlong (< U+0800)
+    assert_false "\xED\xA0\x80".valid_encoding?      # surrogate U+D800
+    assert_false "\xED\xBF\xBF".valid_encoding?      # surrogate U+DFFF
+    assert_false "\xF0\x8F\xBF\xBF".valid_encoding?  # overlong (< U+10000)
+    assert_false "\xF4\x90\x80\x80".valid_encoding?  # above U+10FFFF
+    assert_false "\xF5\x80\x80\x80".valid_encoding?  # above U+10FFFF
+    assert_true "\u{D7FF}".valid_encoding?           # last code point before surrogates
+    assert_true "\u{E000}".valid_encoding?           # first code point after surrogates
+    assert_true "\u{10FFFF}".valid_encoding?         # largest valid code point
+
+    # The same sequences, measured before they are asked about: counting each
+    # byte on its own is what marks the string one byte per character.
+    ["\xC0\x80", "\xED\xA0\x80", "\xF5\x80\x80\x80"].each do |t|
+      t.size
+      assert_false t.valid_encoding?
+    end
   else
     assert_true "\xfe".valid_encoding?
+  end
+end
+
+assert('String#valid_encoding? after a run of ASCII') do
+  # The walk skips ASCII a word at a time and decodes only where a byte leaves
+  # that range, so a broken byte has to be caught after such a run as well as
+  # at the head of the string.
+  if UTF8STRING
+    assert_true ("a" * 40).valid_encoding?
+    assert_true ("a" * 40 + "あ").valid_encoding?
+    assert_false ("a" * 40 + "\xfe").valid_encoding?
+    assert_false ("a" * 40 + "\xe3\x81").valid_encoding?  # 3-byte sequence cut short
+    assert_true ("a" * 40 + "\xe3\x81").b.valid_encoding?
+  end
+end
+
+assert('String#valid_encoding? of a shared substring') do
+  # A substring too long to embed shares the parent's buffer, so the walk has
+  # to stop where the substring ends rather than where the parent's bytes do.
+  if UTF8STRING
+    parent = "あ" * 40 + "\xfe"
+    assert_true parent.byteslice(0, 120).valid_encoding?
+    assert_false parent.byteslice(0, 121).valid_encoding?
   end
 end
 
