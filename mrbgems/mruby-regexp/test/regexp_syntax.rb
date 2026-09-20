@@ -1010,9 +1010,10 @@ assert("Regexp - patterns that used to hang the compiler now raise (A1)") do
   # Regexp.new is used so the pattern reaches the regexp compiler directly,
   # bypassing the literal validation the parser performs on /.../ literals.
 
-  # (?X) with an unsupported X: conditionals (?(...)) are not implemented
-  # (inline options (?i)/(?i:...) and the absent repeater (?~...) now are).
-  assert_raise(RegexpError) { Regexp.new("(?(<x>)a|b)") }
+  # A `(?` prefix the pattern ends inside. (?X) with an X that names no
+  # group option is refused the same way; every X CRuby reads is now read
+  # here too, inline options, the absent repeater and conditionals among
+  # them.
   assert_raise(RegexpError) { Regexp.new("(?") }
   assert_raise(RegexpError) { Regexp.new("(?<") }
 
@@ -1071,7 +1072,7 @@ assert("Regexp - inline options (?i) / (?i:...)") do
 
   # m enables dot-matches-newline for its scope.
   assert_equal 0, (/(?m:a.b)/ =~ "a\nb")
-  assert_nil (/a.b/ =~ "a\nb")
+  assert_nil /a.b/ =~ "a\nb"
 
   # x (extended) is scoped inline like the other two: the toggle form
   # reaches the end of the enclosing group, the scoped form its own body.
@@ -1768,6 +1769,134 @@ assert("Regexp - an absent repeater the parser refuses") do
   assert_raise(RegexpError) { Regexp.new("(?~") }
   # not a fixed-length construct, so not allowed in a lookbehind
   assert_raise(RegexpError) { Regexp.new("(?<=(?~a))b") }
+end
+
+assert("Regexp - conditional (?(cond)yes|no)") do
+  need_backtracking_stack
+  # `yes` runs where the group the condition names has matched and `no`
+  # where it has not, and the choice is made afresh each time the search
+  # comes back through it: with the `a` taken the pattern asks for `b`,
+  # and once the search gives the `a` back it asks for `c`.
+  assert_equal 0, /(a)?(?(1)b|c)/ =~ "ab"
+  assert_equal 0, /(a)?(?(1)b|c)/ =~ "c"
+  assert_equal 1, /(a)?(?(1)b|c)/ =~ "ac"
+  assert_nil /(a)?(?(1)b|c)/ =~ "b"
+  assert_equal ["a"], /(a)?(?(1)b|c)/.match("ab").captures
+  assert_equal [nil], /(a)?(?(1)b|c)/.match("ac").captures
+  # A body left out is empty: with no `no` an unmatched group asks for
+  # nothing, and `(?(1)|c)` asks for nothing where the group matched.
+  assert_equal "", /(a)?(?(1)b)/.match("b")[0]
+  assert_equal "ab", /(a)?(?(1)b)/.match("ab")[0]
+  assert_equal "a", /(a)?(?(1)|c)/.match("ab")[0]
+  assert_equal "c", /(a)?(?(1)|c)/.match("c")[0]
+  assert_equal "a", /(a)?(?(1))/.match("a")[0]
+
+  # The condition names a group in the spellings a backreference takes.
+  assert_equal "ab", /(?<x>a)?(?(<x>)b|c)/.match("ab")[0]
+  assert_equal "c", /(?<x>a)?(?('x')b|c)/.match("c")[0]
+  assert_equal "ab", /(a)?(?(<1>)b|c)/.match("ab")[0]
+  assert_equal "ab", /(a)?(?(<-1>)b|c)/.match("ab")[0]
+  assert_equal "ab", /(a)?(?(01)b|c)/.match("ab")[0]
+  # Two groups under one name: the condition reads the first, as \k does.
+  assert_nil /(?<x>a)?(?<x>b)(?(<x>)c|d)/ =~ "bc"
+  assert_equal "bd", /(?<x>a)?(?<x>b)(?(<x>)c|d)/.match("bd")[0]
+  # The number may name a group written later, as `\1(a)` may; that group
+  # has not matched by the time the condition is asked.
+  assert_nil /(?(1)b|c)(a)/ =~ "ba"
+  assert_equal "ca", /(?(1)b|c)(a)/.match("ca")[0]
+
+  # A group has matched once its pair is closed. Inside itself it has
+  # not, and a repetition that took the group in an earlier iteration
+  # still holds it, so `(?:(x)|y)+` against "xyd" is asked for `c` at the
+  # start and finds its match at the `y`, where the group is untouched.
+  assert_nil /(a(?(1)b|c))/ =~ "ab"
+  assert_equal "ac", /(a(?(1)b|c))/.match("ac")[0]
+  assert_equal "yxc", /(?:(x)|y)+(?(1)c|d)/.match("yxc")[0]
+  assert_equal "yd", /(?:(x)|y)+(?(1)c|d)/.match("xyd")[0]
+  assert_equal 1, /(?:(x)|y)+(?(1)c|d)/ =~ "xyd"
+  # A called group is open while the call runs, as it is for \k.
+  assert_equal "xzxz", /(?<r>x(?(<r>)y|z))\g<r>/.match("xzxz")[0]
+  assert_nil /(?<r>x(?(<r>)y|z))\g<r>/ =~ "xzxy"
+
+  # Quantified, it repeats as any atom does, and either body may be a
+  # sequence holding anything a sequence may, a conditional included.
+  assert_equal "abb", /(a)?(?(1)b|c)*/.match("abb")[0]
+  assert_equal "ccc", /(a)?(?(1)b|c)+/.match("ccc")[0]
+  assert_equal "abb", /(a)?(?(1)b|c){2}/.match("abb")[0]
+  assert_equal "a", /(a)?(?(1)b|c)??/.match("ab")[0]
+  assert_equal "abbx", /(a)?(?(1)b|c)*+x/.match("abbx")[0]
+  assert_equal "ac", /(a)?(?(1)(b|c)|d)/.match("ac")[0]
+  # A group that fills the body is the body, `yes` here with no `no`.
+  # CRuby reads `(?(1)(?:b|c))` as `(?(1)b|c)`, Onigmo's non-capturing group
+  # leaving no node of its own; see README.
+  assert_equal "ac", /(a)?(?(1)(?:b|c))/.match("ac")[0]
+  assert_equal "", /(a)?(?(1)(?:b|c))/.match("c")[0]
+  assert_equal "ad", /(a)?(?(1)(?:b|c|d))/.match("ad")[0]
+  assert_equal "ax", /(a)?(b)?(?(1)(?(2)w|x)|(?(2)y|z))/.match("ax")[0]
+  assert_equal "z", /(a)?(b)?(?(1)(?(2)w|x)|(?(2)y|z))/.match("z")[0]
+  assert_equal "abb", /(a)?(?(1)(b)|c)\2/.match("abb")[0]
+  assert_equal "a", /(a)?(?=(?(1)b|c))/.match("ab")[0]
+  assert_equal "ab", /(a)?(?>(?(1)b|c))/.match("ab")[0]
+
+  # It reads back through to_s, and free-spacing applies to the bodies.
+  assert_equal "ab", Regexp.new(/(a)?(?(1)b|c)/.to_s).match("ab")[0]
+  assert_equal "ab", Regexp.new("(a)? (?(1) b | c )", Regexp::EXTENDED).match("ab")[0]
+  # /i folds the bodies, as it folds anything else.
+  assert_equal "aB", Regexp.new("(a)?(?(1)b|c)", Regexp::IGNORECASE).match("aB")[0]
+end
+
+assert("Regexp - a conditional the parser refuses") do
+  # The condition is a group number, or a name in its delimiters. Anything
+  # else standing there is `invalid conditional pattern`, the signed forms
+  # among them since their sign has no delimiter to stand in, and so is a
+  # third body.
+  ["(a)?(?(x)b|c)", "(a)?(?(-1)b|c)", "(a)?(?(+1)b|c)", "(a)?(?()b|c)",
+   "(a)?(?( 1)b|c)", "(a)?(?(1)b|c|d)", "(a)?(?(1)b||c)",
+   "(a)?(?(1)b|c|)"].each do |src|
+    assert_raise_with_message(RegexpError,
+                              "invalid conditional pattern: /#{src}/", src) do
+      Regexp.new(src)
+    end
+  end
+  # Free-spacing reaches the bodies and not the condition.
+  assert_raise_with_message(RegexpError,
+                            "invalid conditional pattern: /(a)?(?( 1 )b|c)/x") do
+    Regexp.new("(a)?(?( 1 )b|c)", Regexp::EXTENDED)
+  end
+
+  # A number is checked against the groups the whole pattern has, as a
+  # backreference's is; group 0 is never closed while the pattern runs.
+  { "(a)?(?(2)b|c)" => "invalid backref number/name",
+    "(?(1)b|c)" => "invalid backref number/name",
+    "(a)?(?(<-2>)b|c)" => "invalid backref number/name",
+    "(a)?(?(0)b|c)" => "invalid group name <0>",
+    "(a)?(?(00)b|c)" => "invalid group name <00>",
+    "(a)?(?(999999999999)b|c)" => "too big number",
+    "(a)?(?(<y>)b|c)" => "undefined name <y> reference",
+    "(?(<n>)b|c)(?<n>x)" => "undefined name <n> reference",
+    "(?<x>a)?(?(1)b|c)" => "numbered backref/call is not allowed. (use name)",
+    "(?<x>a)?(?(<x-1>)b|c)" => "backreference with nest level is not supported",
+    "(?(<>)b|c)" => "group name is empty",
+    "(a)?(?(1" => "invalid group name <1>",
+    "(a)?(?(1x)b|c)" => "invalid group name <1x>",
+    "(a)?(?(<x)b|c)" => "invalid group name <x)b|c)>",
+    "(a)?(?(1)" => "end pattern with unmatched parenthesis",
+    "(a)?(?(1)b|c" => "end pattern with unmatched parenthesis",
+    "(?(" => "undefined group option",
+    "(?<x>a)?(?(<x>b|c)" => "undefined group option" }.each do |src, msg|
+    assert_raise_with_message(RegexpError, "#{msg}: /#{src}/", src) do
+      Regexp.new(src)
+    end
+  end
+  # A named pattern refuses the numbered spellings in their delimiters too,
+  # where CRuby reads them; see README.
+  assert_raise(RegexpError) { Regexp.new("(?<x>a)?(?(<1>)b|c)") }
+  assert_raise(RegexpError) { Regexp.new("(?<x>a)?(?(<-1>)b|c)") }
+  # not a fixed-length construct, so not allowed in a lookbehind
+  assert_raise_with_message(RegexpError,
+                            "invalid pattern in look-behind: /(a)?(?<=(?(1)b|c))x/") do
+    Regexp.new("(a)?(?<=(?(1)b|c))x")
+  end
 end
 
 assert("Regexp - a lookbehind body of no fixed width says which it was") do
@@ -3009,9 +3138,9 @@ end
 
 assert("Regexp - \\h and \\H hex-digit shorthands") do
   assert_equal 0, (/\h/ =~ "f")
-  assert_nil (/\h/ =~ "g")
+  assert_nil /\h/ =~ "g"
   assert_equal 0, (/\H/ =~ "g")
-  assert_nil (/\H/ =~ "a")
+  assert_nil /\H/ =~ "a"
   assert_equal ["3f"], "3fX".scan(/[\h]+/)
   assert_equal ["XY"], "3fXY".scan(/[\H]+/)
   assert_equal ["deadBEEF"], "deadBEEFzz".scan(/\h+/)
@@ -3064,18 +3193,41 @@ assert("Regexp - a character property escape is refused, not read as letters") d
   assert_equal "a", "1a"[/[[:alpha:]]/]
 end
 
-assert("Regexp - a character class intersection is refused, not read as members") do
-  # `&&` narrows a class to what both sides hold, which this engine does not
-  # do. Read as members it did the opposite: [a&&b] held a, & and b where it
-  # names nothing at all, so a class written to narrow one widened it instead.
-  assert_raise_with_message(RegexpError,
-                            "character class intersection is not supported: /[a&&b]/") do
-    Regexp.new("[a&&b]")
+assert("Regexp - `&&` narrows a character class to what both sides hold") do
+  # A class is the intersection of the operands `&&` separates, each of them
+  # the union of what is written in it.
+  assert_equal "b", "ab"[/[a-c&&b-d]/]
+  assert_nil /[a-c&&b-d]/ =~ "a"
+  assert_nil /[a-c&&b-d]/ =~ "d"
+  assert_equal "a", "a"[/[a-w&&[^c-g]z]/]
+  assert_nil /[a-w&&[^c-g]z]/ =~ "d"
+  assert_nil /[a-w&&[^c-g]z]/ =~ "z"
+
+  # An operand holding nothing leaves the class holding nothing, and an
+  # operand with nothing written in it is one.
+  ["[a&&]", "[&&a]", "[&&]", "[&&&]", "[a&&b]", "[a&&b&&c]", "[\\w&&\\s]"].each do |src|
+    re = Regexp.new(src)
+    assert_nil re =~ "a", src
+    assert_nil re =~ "&", src
   end
-  ["[a&&]", "[&&a]", "[&&]", "[a&&b&&c]", "[[:alpha:]&&[:digit:]]",
-   "[\\w&&\\d]", "[^a&&b]", "[a-c&&b]"].each do |src|
-    assert_raise(RegexpError, src) { Regexp.new(src) }
-  end
+
+  # The whole class is negated after the operands have met, so [^a&&a] is
+  # every character but `a`, and [^a&&b] is every character at all.
+  assert_equal "b", "ab"[/[^a&&a]/]
+  assert_equal "a", "a"[/[^a&&b]/]
+
+  # A ']' opens the class only where the class opens, so it is a member in the
+  # first operand and the end of the class in any other: [a&&]a] is the empty
+  # class followed by the two characters `a]`. Written out rather than as a
+  # literal, since a literal opening with `[]` is a syntax error in both.
+  assert_equal "a", "a]"[Regexp.new("[]a&&a]")]
+  assert_nil Regexp.new("[a&&]a]") =~ "a"
+  assert_equal "a", "a"[/[a&&\]a]/]
+
+  # A '-' the operand ends at is a member, as one before the ']' is.
+  assert_equal "-", "-"[/[a-&&-]/]
+  assert_nil /[a-&&b]/ =~ "a"
+  assert_nil /[a-&&b]/ =~ "-"
 
   # A lone `&` is a member, here as in CRuby
   assert_equal "&", "x&y"[/[&]/]
@@ -3086,6 +3238,34 @@ assert("Regexp - a character class intersection is refused, not read as members"
   # pair it makes with the next `&` is not an intersection
   assert_equal "&", "&"[/[\&]/]
   assert_equal "&", "x&y"[/[\&&]/]
+  assert_equal "&", "x&y"[/[a\&&b&]/]
+end
+
+assert("Regexp - a nested class carries its own intersection into the union") do
+  # `&&` in a nest takes the intersection of what is written there and of
+  # nothing around it, so [x[a&&b]] holds `x` and what `a` and `b` share.
+  assert_equal "x", "x"[/[x[b&&c]]/]
+  assert_nil /[x[b&&c]]/ =~ "b"
+  assert_equal "b", "b"[/[x[b&&b]]/]
+  assert_equal "b", "ab"[/[[a-c&&b]d]/]
+  assert_nil /[[a-c&&b]d]/ =~ "a"
+  assert_equal "d", "d"[/[[a-c&&b]d]/]
+
+  # and a negated nest holding one is the complement of that intersection
+  assert_equal "a", "a"[/[[^a&&b]]/]
+  assert_nil /[[^a&&a]]/ =~ "a"
+  assert_equal "b", "ab"[/[[^a&&a]]/]
+end
+
+assert("Regexp - an intersection meets an ASCII-only set as the set it holds") do
+  # \w and [:ascii:] are sets ASCII defines, and what an intersection leaves
+  # of one is not: the letters left in [b-z&&\w] are cased like any others
+  # under /i, where [\w] itself holds both cases already.
+  assert_equal "S", "S"[/[b-z&&\w]/i]
+  assert_equal "s", "s"[/[b-z&&\w]/i]
+  assert_nil /[b-z&&\w]/i =~ "a"
+  assert_nil /[b-z&&\w]/i =~ "A"
+  assert_equal "Q", "Q"[/[[:ascii:]&&b-z]/i]
 end
 
 assert("Regexp - the escapes this engine does not carry are refused") do
@@ -3115,16 +3295,10 @@ assert("Regexp - \\k<name> is the group reference this engine does carry") do
   assert_equal "aa", "aa"[/(?<n>a)\k<n>/]
 end
 
-assert("Regexp - a '[' inside a class opens something, and is refused when it cannot") do
+assert("Regexp - a '[' inside a class opens something") do
   # A '[' inside a class never stands for itself in CRuby: it opens a POSIX
   # bracket, a collating element, an equivalence class, or a class nested in
-  # this one. Only the bracket is read here. Taken as a member the rest
-  # compiled to a different pattern than the one written: [[a][b]] is the
-  # union of two classes in CRuby and was `[` or `a`, then b, then `]` here.
-  assert_raise_with_message(RegexpError,
-                            "nested character class is not supported: /[[a][b]]/") do
-    Regexp.new("[[a][b]]")
-  end
+  # this one. The bracket and the nested class are read here.
   assert_raise_with_message(RegexpError,
                             "POSIX collating element is not supported: /[[.a.]]/") do
     Regexp.new("[[.a.]]")
@@ -3137,9 +3311,6 @@ assert("Regexp - a '[' inside a class opens something, and is refused when it ca
                             "premature end of char-class: /[[:alpha]/") do
     Regexp.new("[[:alpha]")
   end
-  ["[[]", "[a[]", "[[ab]c]", "[[^a]b]"].each do |src|
-    assert_raise(RegexpError, src) { Regexp.new(src) }
-  end
 
   # The bracket that is read, in every position it is written in
   assert_equal "a", "1a"[/[[:alpha:]]/]
@@ -3149,8 +3320,101 @@ assert("Regexp - a '[' inside a class opens something, and is refused when it ca
   # and the escaped bracket, which is how to hold one, in CRuby too
   assert_equal "[", "x[y"[/[\[]/]
 
-  # a '[' with nothing after it leaves the class unterminated
-  assert_raise(RegexpError) { Regexp.new("[a[") }
+  # A class that does not close, whichever level leaves it open. A '[' written
+  # last opens one of its own, so it takes the ']' that would have closed the
+  # class around it.
+  ["[[]", "[a[]", "[a[", "[a[b]", "[[a]"].each do |src|
+    assert_raise(RegexpError, src) { Regexp.new(src) }
+  end
+end
+
+assert("Regexp - a nested character class is the union it is written as") do
+  # [[a]b] is one class holding what the two hold between them, as it is in
+  # CRuby. Read as members instead, the pattern was `[` or `a`, then b, then
+  # `]`, which is a different pattern with the same letters in it.
+  assert_equal 0, (/[[a]b]/ =~ "a")
+  assert_equal 0, (/[[a]b]/ =~ "b")
+  assert_nil /[[a]b]/ =~ "]"
+  assert_nil /[[a]b]/ =~ "["
+
+  # in every position, at every depth, and with the union negated as a whole
+  assert_equal "b", "db"[/[x[a-c]]/]
+  assert_equal "c", "dc"[/[a[b]c]/]
+  assert_equal "b", "cb"[/[[a][b]]/]
+  assert_equal "a", "ba"[/[[[[a]]]]/]
+  assert_equal "c", "abc"[/[^[a]b]/]
+
+  # A POSIX bracket keeps its meaning at either level.
+  assert_equal "b", "1b"[/[[:alpha:][b]]/]
+  assert_equal "1", "-1"[/[[a][:digit:]]/]
+
+  # The word class is held apart from the fold at either level too, so [[\w]]
+  # is the ASCII word characters and no more; see the /i tests for what a
+  # letter written out reaches.
+  assert_equal "_", "-_"[/[[\w]]/]
+  assert_nil "-"[/[[\w]]/]
+  assert_equal "a", "a"[/[\W[a]]/]
+  assert_equal "-", "-"[/[\W[a]]/]
+  assert_nil "b"[/[\W[a]]/]
+end
+
+assert("Regexp - a negated nested class holds everything it leaves out") do
+  # A set can only join a union once it is written out as members, so the
+  # complement is taken at compile time. [[^a]b] then holds every character
+  # but `a`, and `b` twice over.
+  assert_equal 0, (/[[^a]b]/ =~ "b")
+  assert_equal 0, (/[[^a]b]/ =~ "x")
+  assert_nil /[[^a]b]/ =~ "a"
+
+  # what the complement of a shorthand, of a range and of the word class comes
+  # to, each with a member of its own beside it
+  assert_equal "5", "15"[/[[^\d]5]/]
+  assert_nil /[[^\d]5]/ =~ "1"
+  assert_equal "Q", "aQ"[/[[^a-z]Q]/]
+  assert_nil /[[^a-z]Q]/ =~ "a"
+  assert_equal "-", "a-"[/[[^\w]]/]
+  assert_nil /[[^\w]]/ =~ "a"
+
+  # A complement of a complement is the set again.
+  assert_equal 0, (/[[^[^a]]]/ =~ "a")
+  assert_nil /[[^[^a]]]/ =~ "b"
+
+  # Nothing above ASCII is left in the class the '^' opened, so its complement
+  # holds every byte that is not ASCII.
+  assert_equal "\xC3\xA9", "a\xC3\xA9"[/[[^a-z]]+/]
+end
+
+assert("Regexp - a '-' after a nested class is a member") do
+  # A nested class names a set, and CRuby opens no range on one: [[a]-z] holds
+  # `a`, `-` and `z` and not the span from `-` to `z`. The '-' after a POSIX
+  # bracket or a shorthand is the error reject_set_as_range_start() reports,
+  # which is CRuby's line there as well.
+  assert_equal "-", "b-"[/[[a]-z]/]
+  assert_equal "z", "bz"[/[[a]-z]/]
+  assert_nil /[[a]-z]/ =~ "b"
+  assert_equal "-", "x-"[/[[a]-[b]]/]
+  assert_equal "-", "x-"[/[[a]-]/]
+  assert_equal "-", "x-"[/[-[a]]/]
+  assert_raise(RegexpError) { Regexp.new("[[:alpha:]-z]") }
+
+  # A nested class in the other place, closing a range, is refused. CRuby
+  # answers [a-[b]] with neither the range nor an error: the class holds `b`
+  # alone, with the `a` and the `-` gone.
+  assert_raise_with_message(RegexpError,
+                            "char-class value at end of range: /[a-[b]]/") do
+    Regexp.new("[a-[b]]")
+  end
+end
+
+assert("Regexp - free-spacing mode reads a nested class as members") do
+  # The comment pass has to step over a class as one span, and a class nests:
+  # with a flag rather than a count the ']' of [[a]b#c] would end the class
+  # for the pass and leave `#c]` a comment, where the parser has the three as
+  # members. CRuby reads them as members too.
+  re = Regexp.new("[[a]b#c]", Regexp::EXTENDED)
+  assert_equal 0, (re =~ "#")
+  assert_equal 0, (re =~ "c")
+  assert_equal 0, (re =~ "b")
 end
 
 assert("Regexp - a control escape names the same character however it is written") do

@@ -108,3 +108,38 @@ assert("Regexp - /i literals share one class per codepoint") do
   assert_true re.match?((cyr + lat + grk).upcase)
   assert_raise(RegexpError) { Regexp.new(cyr + lat + grk + arm, Regexp::IGNORECASE) }
 end
+
+assert("Regexp - /i closes the union a nested class makes, not its parts") do
+  # The complement of a negated nest joins the union unfolded, and /i closes
+  # the union once at the end. [[^é]a] under /i therefore holds É, and closing
+  # a class that holds É brings in é as well, so the class accepts the
+  # character it was written to reject. CRuby reads it the same way.
+  re = Regexp.new("[[^é]a]", Regexp::IGNORECASE)
+  assert_true re.match?("é")
+  assert_true re.match?("É")
+  assert_true re.match?("a")
+  # The same closure over ASCII: [[^a-z]Q] holds every capital, and their
+  # lower case letters come back with them.
+  ascii = Regexp.new("[[^a-z]Q]", Regexp::IGNORECASE)
+  assert_true ascii.match?("a")
+  assert_true ascii.match?("A")
+end
+
+assert("Regexp - /i closes an intersection, not the operands it was taken of") do
+  # The operands meet as they were written and the class closes once after,
+  # which is CRuby's reading too: [a&&A] holds nothing to close, where closing
+  # each side first would have left both letters in it.
+  assert_false Regexp.new("[a&&A]", Regexp::IGNORECASE).match?("a")
+  assert_false Regexp.new("[a&&A]", Regexp::IGNORECASE).match?("A")
+  assert_true Regexp.new("[a&&a]", Regexp::IGNORECASE).match?("A")
+  assert_true Regexp.new("[A-Z&&[^B]]", Regexp::IGNORECASE).match?("a")
+  assert_false Regexp.new("[A-Z&&[^B]]", Regexp::IGNORECASE).match?("b")
+
+  # An ASCII-only set holds the closure inside ASCII wherever it stands, so
+  # the letters left in [b-z&&\w] reach no further than the ASCII capitals
+  # where [b-z&&[^a]] reaches U+017F through its `s`.
+  wordish = Regexp.new("[b-z&&\\w]", Regexp::IGNORECASE)
+  assert_true wordish.match?("S")
+  assert_false wordish.match?("ſ")
+  assert_true Regexp.new("[b-z&&[^a]]", Regexp::IGNORECASE).match?("ſ")
+end

@@ -198,7 +198,7 @@ class_match(const re_charclass *cc, uint32_t cp, mrb_bool raw)
     if (cp >= cc->ranges[2*i] && cp <= cc->ranges[2*i + 1]) return TRUE;
   }
 #ifdef RE_UNICODE_CTYPE
-  if (cc->ctype_yes | cc->ctype_no) return mrb_re_class_ctype_match(cc, cp);
+  if (RE_CLASS_HAS_CTYPE(cc)) return mrb_re_class_ctype_match(cc, cp);
 #endif
   return cc->utf8_any;
 }
@@ -1428,6 +1428,27 @@ bt_match(bt_state *m, const char *sp, uint32_t pc)
           sp += blen;
         }
         pc++;
+      }
+      break;
+
+    case RE_COND:
+      {
+        /* The group has matched when its pair is closed, which is the test
+           RE_BACKREF makes before it reads one: an open group holds a start
+           and no end (see RE_SAVE), and a group nothing has entered holds
+           neither. No choice point: which body runs is settled by the
+           captures as they stand, and a failure inside the body backtracks
+           past this instruction to whatever was pushed before it, which is
+           what may change the captures and bring the search back here with
+           the other answer. */
+        int group = inst.a;
+        if (group * 2 + 1 < ncap &&
+            captures[group * 2] >= 0 && captures[group * 2 + 1] >= 0) {
+          pc++;
+        }
+        else {
+          pc = inst.offset;
+        }
       }
       break;
 

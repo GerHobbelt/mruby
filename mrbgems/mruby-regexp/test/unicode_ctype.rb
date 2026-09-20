@@ -144,3 +144,79 @@ assert("Regexp - POSIX brackets read a byte above 127 as no character") do
   assert_equal 0, bytes =~ /[[:^print:]]/
   assert_equal 0, bytes =~ /[^[:alpha:]]/
 end
+
+assert("Regexp - a negated nested class carries one bracket type and no more") do
+  # A negated nested class is complemented at compile time, and a class holds
+  # a bracket type as a question put to the table rather than as members.
+  # class_match() reads its terms as one OR, so the complement is an AND of
+  # their negations, which this structure can only write where one term is
+  # there to negate. One type alone changes polarity: [[^[:alpha:]]x] is a
+  # character that is no letter, or `x`, which is what [[:^alpha:]x] holds and
+  # what CRuby answers there.
+  re = Regexp.new("[[^[:alpha:]]x]")
+  assert_equal 0, re =~ "1"
+  assert_equal 0, re =~ "x"
+  assert_nil re =~ "a"
+  assert_nil re =~ "é"
+  # /i reads it as the negated bracket too, both here and in CRuby.
+  folded = Regexp.new("[[^[:upper:]]x]", Regexp::IGNORECASE)
+  assert_equal 0, folded =~ "a"
+  assert_equal 0, folded =~ "A"
+  # A second type, or a member beside the type, is the AND that cannot be
+  # written, and is refused rather than answered with another set. CRuby holds
+  # both.
+  ["[[^[:alpha:][:digit:]]x]", "[[^[:alpha:]é]x]"].each do |src|
+    assert_raise_with_message(RegexpError,
+      "this negated nested character class is not supported: /#{src}/", src) do
+      Regexp.new(src)
+    end
+  end
+end
+
+assert("Regexp - `&&` puts the brackets either side of it as one question") do
+  skip unless __ENCODING__ == "UTF-8"
+  # An intersection of brackets is a conjunction where a union is the
+  # disjunction the class is otherwise written with, and both come to one
+  # question the class puts about a character's type.
+  re = Regexp.new("[[:alpha:]&&[:^lower:]]")
+  assert_equal 0, re =~ "Ā"
+  assert_equal 0, re =~ "あ"
+  assert_nil re =~ "ā"
+  assert_nil re =~ "１"
+  # as many of them as are written, and a disjunction on one side of the `&&`
+  assert_equal 0, Regexp.new("[[:alpha:]&&[:^lower:]&&[:^upper:]]") =~ "あ"
+  assert_nil Regexp.new("[[:alpha:]&&[:^lower:]&&[:^upper:]]") =~ "Ā"
+  both = Regexp.new("[[:alpha:][:digit:]&&[:^lower:]]")
+  assert_equal 0, both =~ "Ā"
+  assert_equal 0, both =~ "１"
+  assert_nil both =~ "ā"
+
+  # A bracket meeting a range is written out as the part of the range it
+  # holds, since the class carries no list of what a bracket names.
+  span = Regexp.new("[\u{100}-\u{200}&&[:^lower:]]")
+  assert_equal 0, span =~ "Ā"
+  assert_nil span =~ "ā"
+  assert_nil span =~ "Ⅷ"
+
+  # A conjunction still joins a union of members, and negates.
+  assert_equal 0, Regexp.new("[[[:alpha:]&&[:^lower:]]x]") =~ "x"
+  assert_equal 0, Regexp.new("[[[:alpha:]&&[:^lower:]]x]") =~ "Ā"
+  assert_equal 0, Regexp.new("[[^[:alpha:]&&[:alpha:]]]") =~ "１"
+  assert_nil Regexp.new("[[^[:alpha:]&&[:alpha:]]]") =~ "Ā"
+
+  # What it cannot join is a second bracket, a disjunction and a conjunction
+  # being one question apiece where the class has room for one. CRuby holds
+  # both; refused rather than answered with another set.
+  ["[[[:alpha:]&&[:^lower:]][:digit:]]", "[[:digit:][[:alpha:]&&[:^lower:]]]"].each do |src|
+    assert_raise_with_message(RegexpError,
+      "this character class union is not supported: /#{src}/", src) do
+      Regexp.new(src)
+    end
+  end
+  # nor a disjunction on both sides of the `&&`, which is two questions to put
+  # together where the class puts one
+  assert_raise_with_message(RegexpError,
+    "this character class intersection is not supported: /[[:alpha:][:digit:]&&[:alpha:][:digit:]]/") do
+    Regexp.new("[[:alpha:][:digit:]&&[:alpha:][:digit:]]")
+  end
+end

@@ -58,6 +58,16 @@ enum re_opcode {
   RE_WBOUND,     /* assert word boundary (\b) */
   RE_NWBOUND,    /* assert non-word boundary (\B) */
   RE_BACKREF,    /* backreference: a = group number, offset = 1 if case-insensitive */
+  RE_COND,       /* the conditional (?(cond)yes|no): a = the group the
+                    condition names, offset = where `no` begins. Goes on at
+                    pc + 1 where the group has matched, its capture pair
+                    being closed, and at `offset` where it has not; a group
+                    still open, or one a repetition has just re-entered,
+                    has not. Nothing is pushed: the choice is the captures'
+                    and a failure after it backtracks past it as past any
+                    straight-line instruction. `yes` ends with a jump past
+                    `no`, and with no `no` the offset is the text after the
+                    group. */
   RE_LOOKAHEAD,  /* positive lookahead: offset = end of sub-pattern */
   RE_NEG_LOOKAHEAD, /* negative lookahead: offset = end of sub-pattern */
   RE_LOOKBEHIND,     /* positive lookbehind: offset = end, a = 1 once the
@@ -198,13 +208,23 @@ typedef struct {
      every character. A byte that is no character has no type: it belongs
      under ctype_no and not under ctype_yes.
 
-     ctype_fold is set under /i when either is: the type read is then that of
-     the character and of every character sharing its folding, so that
-     [[:upper:]] under /i holds "ā" through "Ā". A member the class holds by
-     bit or by range is closed under folding at compile time instead; see
-     compile_charclass(). */
+     ctype_all and ctype_none are the same question in the other direction:
+     the character's type must have every bit of the one and no bit of the
+     other. `&&` is what asks for them, an intersection of brackets being a
+     conjunction where a union is the disjunction the pair above spells, and
+     a bracket on its own reaches them through the pair, [[:alpha:]] naming
+     one bit either way. A class holds a character through its brackets when
+     the pair admits it, if the class has one, and the two masks do.
+
+     ctype_fold is set under /i when the class has any of the four: the type
+     read is then that of the character and of every character sharing its
+     folding, so that [[:upper:]] under /i holds "ā" through "Ā". A member the
+     class holds by bit or by range is closed under folding at compile time
+     instead; see compile_charclass(). */
   uint16_t ctype_yes;
   uint16_t ctype_no;
+  uint16_t ctype_all;
+  uint16_t ctype_none;
   mrb_bool ctype_fold;
 #endif
 } re_charclass;
@@ -512,6 +532,19 @@ uint16_t mrb_re_ctype(uint32_t cp);
    class matcher calls this for a class holding any bracket, once the ranges
    have said nothing. */
 mrb_bool mrb_re_class_ctype_match(const re_charclass *cc, uint32_t cp);
+
+/* Whether the class says anything about a character's type at all. */
+#define RE_CLASS_HAS_CTYPE(cc) \
+  ((cc)->ctype_yes | (cc)->ctype_no | (cc)->ctype_all | (cc)->ctype_none)
+
+/* The longest run of [lo, hi] the brackets in a class answer alike, as its
+   last codepoint, with *in the answer they give it. The table holds the types
+   as runs of codepoints sharing a set, so a span is read off it a run at a
+   time where asking codepoint by codepoint would be a search each. Both
+   bounds are above ASCII. The compiler calls this to write out the part of a
+   range list a bracket holds, which is what an intersection needs and a class
+   that only holds its brackets does not. */
+uint32_t mrb_re_ctype_span(const re_charclass *cc, uint32_t lo, uint32_t hi, mrb_bool *in);
 #endif
 
 /* Simple case folding: the folded codepoint, or cp itself when it folds to

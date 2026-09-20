@@ -13,6 +13,9 @@ simulation) with backtracking fallback.
 - `*+`, `++`, `?+` possessive quantifiers, `a*+` being `(?>a*)`
 - `{n}`, `{n,}`, `{n,m}` repetition counts
 - `[abc]`, `[a-z]`, `[^abc]` character classes
+- `[[a]b]`, `[[^a]b]` nested character classes, whose union the class is
+- `[a-z&&[^aeiou]]` character class intersection, the class being what the
+  operands `&&` separates hold between them
 - `[[:alpha:]]`, `[[:^alpha:]]` POSIX brackets inside a class: `alpha`,
   `digit`, `alnum`, `upper`, `lower`, `space`, `blank`, `xdigit`, `word`,
   `cntrl`, `print`, `graph`, `ascii`, `punct`
@@ -37,6 +40,8 @@ simulation) with backtracking fallback.
 - `(?<!...)` negative lookbehind (fixed-length, per branch)
 - `(?>...)` atomic group
 - `(?~...)` absent repeater
+- `(?(n)yes|no)`, `(?(<name>)yes|no)`, `(?('name')yes|no)` conditional: `yes`
+  where the group has matched, `no` where it has not, `no` optional
 - `(?imx-imx)` options for the rest of the enclosing group
 - `(?imx-imx:...)` options for the group's own body
 
@@ -222,8 +227,8 @@ Regexp.new("(a)(?<b>b)\\1")
 Two engines, chosen automatically at compile time by pattern analysis.
 
 - **Pike VM (NFA simulation)** for patterns without backreferences, non-greedy
-  quantifiers, lookaround, atomic groups, absent repeaters or subexpression
-  calls. O(pattern x text), so it is immune to ReDoS.
+  quantifiers, lookaround, atomic groups, absent repeaters, conditionals or
+  subexpression calls. O(pattern x text), so it is immune to ReDoS.
 - **Backtracking engine** for the rest, whose state the Pike VM's threads have
   no stack to hold. It backtracks on a stack of its own on the heap, so a
   search spends a constant amount of C stack however long the subject is.
@@ -255,16 +260,36 @@ Every entry is a place this engine answers a pattern differently from CRuby.
   letter. `[[:alpha:]]` asks for a letter of any script.
 - **No `\M-X` meta escape**: it always raises `RegexpError`, where CRuby
   refuses it only outside a binary pattern.
-- **A `[` inside a class opens something**: only a POSIX bracket is read there.
-  A collating element (`[[.a.]]`), an equivalence class (`[[=a=]]`) and a
-  nested class (`[[a][b]]`) raise `RegexpError`. Write `[\[]`.
+- **A `[` inside a class opens something**: a POSIX bracket and a nested class
+  are read there, and a collating element (`[[.a.]]`) and an equivalence class
+  (`[[=a=]]`) raise `RegexpError`. Write `[\[]` to hold the bracket itself.
+  A nested class closing a range raises too: CRuby answers `[a-[b]]` with
+  neither the range nor an error, the class holding `b` alone with the `a` and
+  the `-` gone. A negated nest is written out as members at compile time, and
+  a bracket type is a question put to a table rather than members, so a
+  complement that would have to negate one type beside another or beside a
+  member is refused: `[[^[:alpha:][:digit:]]x]` and `[[^[:alpha:]é]x]` raise
+  where CRuby holds both. One type alone changes polarity, so
+  `[[^[:alpha:]]x]` is read as CRuby reads it, which is `[[:^alpha:]x]`.
 - **No `\G`, `\K`, `\R` or `\X`**: they raise `RegexpError` rather than
   standing for their own letter. Inside a character class each is the letter,
   and so is a bare `\g` either way.
 - **No nest level on a backreference**: `\k<name+n>` and `\k<name-n>` ask for a
   capture memory per call level where this engine keeps one flat slot per
-  group, so they raise `RegexpError`. A plain `\k<name>` still works inside a
-  recursion, reading the pair the innermost completed invocation left.
+  group, so they raise `RegexpError`, and so does a conditional whose
+  condition spells one, `(?(<name+n>)...)`. A plain `\k<name>` still works
+  inside a recursion, reading the pair the innermost completed invocation
+  left, and so does `(?(<name>)...)`.
+- **A named pattern refuses a numbered condition in every spelling**: CRuby
+  refuses `(?(1)...)` there as it refuses `\1` and `\k<1>`, and reads the
+  delimited spellings `(?(<1>)...)`, `(?(<-1>)...)` and `(?('1')...)` all the
+  same. Here the number is read the way `\k<1>` reads it, and refused with it.
+- **A conditional's body is its own**: `(?(1)(?:b|c))` is `yes` = `(?:b|c)`
+  with no `no`. CRuby reads it as `(?(1)b|c)`: Onigmo's non-capturing group
+  leaves no node of its own, so an alternation that fills the body is taken
+  for the conditional's two bodies, and `(?(1)(?:b|c|d))` is refused as three
+  of them. A body the group does not fill, `(?(1)(?:b|c)x)`, and a group of
+  any other kind, `(?(1)(?i:b|c))`, are read alike by both.
 - **An empty iteration ends a repeat around a call too**, which is the rule
   every inline repeat here follows. Onigmo switches such repeats to a
   capture-tracking empty check that answers a few of them differently, among
@@ -276,8 +301,29 @@ Every entry is a place this engine answers a pattern differently from CRuby.
   in `/(?~(a)(b))/` holds `"a"` there against a subject starting with one
   though the body never matched, and drops it where it has one, which leaves
   `/(?~(a|b)+)/` with an empty group in both engines.
-- **No character class intersection**: `[a&&b]` raises `RegexpError`. A lone
-  `&` is a member of the class.
+- **An intersection puts one question about a character's type**: the POSIX
+  brackets of a class are a disjunction, and an intersection of them a
+  conjunction, which the class carries beside it. What has no room left is a
+  disjunction on both sides of a `&&`, `[[:alpha:][:digit:]&&[:alnum:][:space:]]`,
+  and a union of one of these conjunctions with another bracket,
+  `[[[:alpha:]&&[:^lower:]][:digit:]]`. Both raise `RegexpError`; CRuby holds
+  them. Anything short of that is read, `[[:alpha:]&&[:^lower:]&&[:^upper:]]`
+  included.
+- **A member of an intersection folds by what it is, not by how it was
+  written**: under `/i` the class is closed once the operands have met, and
+  what an ASCII-only set brought is closed no further than ASCII, so
+  `[s&&\w]` holds `s` and `S`. CRuby closes a single character where it
+  stands instead, which takes that one out of ASCII where the same character
+  written as a range does not: there `[s&&\w]` holds `ſ` and `[s-t&&\w]` does
+  not.
+- **An intersection folds a character above ASCII whatever admitted it**:
+  `[\u{100}-\u{200}&&\W]` under `/i` holds `s`, the long s in the range having
+  folded to it. CRuby holds that fold back, the side that admitted the long s
+  being `\W`, a set ASCII defines.
+- **A negated shorthand keeps its ASCII in an intersection**: `[[^\W]]` is the
+  ASCII word characters in both engines, and `[[^\W]&&[^a]]` is those without
+  `a` here. CRuby reads the nest as the Unicode word characters once it stands
+  in an intersection.
 - **No encodings**: a byte that starts no whole character is that byte, inside
   a character class as much as outside one. `[\xB5]` and `\xB5` both hold the
   byte `0xB5` and neither matches `µ` (`C2 B5`), where CRuby raises
