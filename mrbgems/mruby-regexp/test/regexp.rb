@@ -96,6 +96,81 @@ assert("Regexp#===") do
   assert_equal "theo", $1
 end
 
+assert("Regexp#match - Symbol argument") do
+  md = /a(b)/.match(:xaby)
+  assert_kind_of MatchData, md
+  assert_equal "ab", md[0]
+  assert_equal "b", md[1]
+  assert_equal "xaby", md.string
+  assert_equal "x", md.pre_match
+  assert_equal "ab", $~[0]
+  assert_equal "b", /(?<x>b)/.match(:ab)[:x]
+  assert_equal "A", (/a/.match(:ab) { |m| m[0].upcase })
+  assert_nil /z/.match(:ab)
+end
+
+assert("Regexp#match - Symbol argument with pos") do
+  assert_equal 3, /a/.match(:abxay, 1).begin(0)
+  assert_nil /a/.match(:ab, 2)
+end
+
+assert("Regexp#match - multibyte Symbol argument") do
+  # a multibyte name never fits the inline symbol representation, so this is
+  # the shared-buffer path, with a subject the offset conversion has to walk
+  assert_equal "い", /(い)/.match(:あいう)[1]
+  assert_equal __ENCODING__ == "UTF-8" ? 1 : 3, /い/ =~ :あい
+  assert_true /う/.match?(:あいう, 2)
+  assert_false /あ/.match?(:あいう, 1)
+  assert_true(/^あ/ === :あい)
+end
+
+assert("Regexp#match - Symbol argument does not alias the symbol table") do
+  # A symbol long enough to miss the inline representation shares the symbol
+  # table's buffer, and a dup keeps sharing it, so a destructive update has to
+  # copy first.
+  s = /a/.match(:abcdefghijklmnop).string.dup
+  s << "Z"
+  assert_equal "abcdefghijklmnopZ", s
+  assert_equal "abcdefghijklmnop", :abcdefghijklmnop.to_s
+end
+
+assert("Regexp#match? - Symbol argument") do
+  assert_true /a/.match?(:ab)
+  assert_false /z/.match?(:ab)
+  assert_false /a/.match?(:ab, 1)
+  assert_true /b/.match?(:ab, 1)
+end
+
+assert("Regexp#=~ - Symbol argument") do
+  assert_equal 1, (/b/ =~ :ab)
+  assert_equal "b", $~[0]
+  assert_nil(/z/ =~ :ab)
+  assert_nil $~
+end
+
+assert("Regexp#=== - Symbol argument") do
+  assert_true(/^to_/ === :to_s)
+  assert_false(/^to_/ === :size)
+  # Enumerable#grep is the motivating case: it dispatches through #===, so it
+  # used to answer [] rather than raise
+  assert_equal %i[to_s to_i], %i[to_s to_i size].grep(/^to_/)
+  result = case :hello123
+           when /\d+/ then "has digits"
+           else "no digits"
+           end
+  assert_equal "has digits", result
+end
+
+assert("Regexp - match operand rejects other types") do
+  assert_raise(TypeError) { /a/.match(1) }
+  assert_raise(TypeError) { /a/.match?(1) }
+  assert_raise(TypeError) { /a/ =~ 1 }
+  # #=== answers false rather than raising, for symbols and everything else
+  assert_false(/a/ === 1)
+  assert_false(/a/ === Object.new)
+  assert_false(/a/ === nil)
+end
+
 assert("Regexp - character class") do
   re = Regexp.new("[a-z]+")
   md = re.match("123abc456")
@@ -565,6 +640,15 @@ assert("String#=~ with a String argument raises TypeError") do
   assert_raise(TypeError) { "abc" !~ "b" }
 end
 
+assert("String#=~ dispatches to the argument") do
+  # A non-Regexp, non-String argument is answered by its own `=~`, so `nil`
+  # gets a value from `NilClass#=~` and everything else without one raises.
+  assert_nil "abc" =~ nil
+  assert_true "abc" !~ nil
+  assert_raise(NoMethodError) { "abc" =~ 1 }
+  assert_raise(NoMethodError) { "abc" =~ Object.new }
+end
+
 class StringMatchIsALiar
   def is_a?(klass)
     true
@@ -589,8 +673,18 @@ end
 class StringMatchString < String
 end
 
+class StringMatchStringDenier < String
+  def is_a?(klass)
+    false
+  end
+
+  def nil?
+    true
+  end
+end
+
 class StringMatchHelperOverride < String
-  private def __match_pattern(re)
+  private def __check_pattern(re)
     Regexp.new(re.to_s)
   end
 end
@@ -734,6 +828,97 @@ assert("String#gsub without a block returns an enumerator") do
   assert_equal ["b", "b"], "abcb".gsub("b").to_a
   # Iterating the enumerator with a block performs the substitution.
   assert_equal "aBcB", "abcb".gsub(/b/).each { |m| m.upcase }
+end
+
+assert("String#sub / #gsub / #scan / #split with a non-Regexp pattern raise TypeError") do
+  # The same check `match` uses, so the naming matches: nil, true and false by
+  # value, everything else by class.
+  [
+    ["nil", nil], ["true", true], ["false", false],
+    ["Symbol", :b], ["Integer", 1], ["Array", []],
+  ].each do |name, pat|
+    message = "wrong argument type #{name} (expected Regexp)"
+    assert_raise_with_message(TypeError, message) { "abc".sub(pat, "X") }
+    assert_raise_with_message(TypeError, message) { "abc".gsub(pat, "X") }
+    assert_raise_with_message(TypeError, message) { "abc".sub(pat) { "X" } }
+    assert_raise_with_message(TypeError, message) { "abc".gsub(pat) { "X" } }
+    assert_raise_with_message(TypeError, message) { "abc".scan(pat) }
+    # split delegates nil to the core implementation instead of raising.
+    assert_raise_with_message(TypeError, message) { "abc".split(pat) } unless pat.nil?
+  end
+
+  # An argument claiming to be a Regexp through `is_a?` or `class` is still
+  # rejected, and still named by its real class.  `split` routes nil and String
+  # patterns to the core implementation, so it has to reach the same check
+  # without asking the argument what it is.
+  liar = StringMatchIsALiar.new
+  assert_raise_with_message(TypeError, "wrong argument type StringMatchIsALiar (expected Regexp)") do
+    "abc".sub(liar, "X")
+  end
+  assert_raise_with_message(TypeError, "wrong argument type StringMatchIsALiar (expected Regexp)") do
+    "abc".split(liar)
+  end
+  class_liar = StringMatchClassLiar.new
+  assert_raise_with_message(TypeError, "wrong argument type StringMatchClassLiar (expected Regexp)") do
+    "abc".gsub(class_liar, "X")
+  end
+  assert_raise_with_message(TypeError, "wrong argument type StringMatchClassLiar (expected Regexp)") do
+    "abc".split(class_liar)
+  end
+
+  # A Symbol answers `match`, which the block form of `sub` used to reach: it
+  # matched with the operands reversed and returned a string built from the
+  # symbol's name instead of raising.
+  assert_raise_with_message(TypeError, "wrong argument type Symbol (expected Regexp)") do
+    "ab".sub(:xaby) { "Z" }
+  end
+end
+
+assert("String#sub / #gsub / #scan / #split accept a Regexp subclass, and quote a String") do
+  assert_equal "aXc", "abc".sub(StringMatchRegexp.new("b"), "X")
+  assert_equal "aXcX", "abcb".gsub(StringMatchRegexp.new("b"), "X")
+  assert_equal ["b", "b"], "abcb".scan(StringMatchRegexp.new("b"))
+  assert_equal ["a", "c"], "abc".split(StringMatchRegexp.new("b"))
+
+  # A String pattern is a literal here, not a pattern: `.` matches only `.`.
+  assert_equal "aXc", "a.c".sub(".", "X")
+  assert_equal "aXc", "a.c".gsub(".", "X")
+  assert_equal ["."], "a.c".scan(".")
+  assert_equal "a[.]c", "a.c".gsub(".") { |m| "[#{m}]" }
+  # A String subclass is accepted on the same terms.
+  assert_equal "aXc", "a.c".sub(StringMatchString.new("."), "X")
+  # Even one denying that it is a String, or claiming to be nil: `split` reads
+  # the real type before choosing between the core implementation and the
+  # regexp path.
+  assert_equal ["a", "c"], "a.c".split(StringMatchStringDenier.new("."))
+end
+
+assert("String#=~ reads the real type of a String argument") do
+  # `=~` dispatches everything but a String to the argument, so a String
+  # subclass denying its own type used to pass the guard and dispatch back
+  # here, recursing until the stack ran out instead of raising.
+  denier = StringMatchStringDenier.new("b")
+  assert_raise_with_message(TypeError, "type mismatch: String given") do
+    "abc" =~ denier
+  end
+  assert_raise_with_message(TypeError, "type mismatch: String given") do
+    denier =~ denier
+  end
+end
+
+assert("String#gsub / #split examine the pattern only where CRuby does") do
+  # gsub without a block builds the enumerator first, so the TypeError is
+  # raised on the first iteration rather than at the call.
+  if Object.const_defined?(:Enumerator)
+    enum = "abc".gsub(:b)
+    assert_raise_with_message(TypeError, "wrong argument type Symbol (expected Regexp)") do
+      enum.to_a
+    end
+  end
+
+  # split returns before looking at the pattern when the limit is 1.
+  assert_equal ["abc"], "abc".split(true, 1)
+  assert_equal [], "".split(:b, 1)
 end
 
 assert("String#sub with \\& \\` \\' specials") do
@@ -884,13 +1069,55 @@ assert("String#split with regexp limit") do
   assert_raise(TypeError) { "a,b".split(/,/, nil) }
   assert_equal ["a,b"], "a,b".split(/,/, 1.5)
 
+  # mruby has no implicit conversion protocol, so an object defining `to_int`
+  # is rejected here exactly as `Array.new(obj)` and `ary[obj]` reject it. The
+  # limit is never asked what it responds to, so an object overriding
+  # `respond_to?` reaches the same TypeError rather than a NoMethodError.
   limit = Object.new
   def limit.to_int; 2; end
-  assert_equal ["a", "b"], "a,b".split(/,/, limit)
+  assert_raise(TypeError) { "a,b".split(/,/, limit) }
 
   limit = Object.new
-  def limit.to_int; 1.5; end
+  def limit.respond_to?(name, include_all = false); true; end
   assert_raise(TypeError) { "a,b".split(/,/, limit) }
+end
+
+class StringSplitLimitIsALiar
+  def is_a?(klass)
+    true
+  end
+end
+
+class StringSplitLimitComparable
+  def is_a?(klass)
+    true
+  end
+
+  def ==(other)
+    false
+  end
+
+  def >(other)
+    true
+  end
+
+  def -(other)
+    1
+  end
+end
+
+assert("String#split limit cannot pose as an Integer") do
+  # `is_a?` is redefinable, so a limit claiming to be an Integer used to skip
+  # the conversion and reach the split loop as itself.
+  assert_raise(TypeError) { "a,b,c".split(/,/, StringSplitLimitIsALiar.new) }
+  # The String pattern delegates to __split, which converts the limit again in
+  # C, so this one held before the fix too. Asserted so that the two halves of
+  # the method stay pinned to the same answer.
+  assert_raise(TypeError) { "a,b,c".split(",", StringSplitLimitIsALiar.new) }
+
+  # Answering the operators the loop uses used to produce a wrong result
+  # instead of an error.
+  assert_raise(TypeError) { "a,b,c".split(/,/, StringSplitLimitComparable.new) }
 end
 
 assert("String#split with empty regexp") do
@@ -968,6 +1195,38 @@ assert("Regexp - named captures") do
   assert_equal "03", md[:month]
   assert_equal "21", md[:day]
   assert_equal "2026", md["year"]
+end
+
+assert("MatchData#[] - negative index") do
+  md = /(a)(b)/.match("ab")
+  assert_equal "b", md[-1]
+  assert_equal "a", md[-2]
+  # -num_captures and below are nil: a negative index never reaches group 0
+  assert_nil md[-3]
+  assert_nil md[-4]
+  # a group that did not participate is nil either way
+  assert_nil(/(a)|(b)/.match("a")[-1])
+  # out of range upwards stays nil
+  assert_nil md[5]
+end
+
+assert("MatchData#[] - undefined group name") do
+  md = /(?<x>a)/.match("a")
+  assert_equal "a", md[:x]
+  assert_raise(IndexError) { md[:zz] }
+  assert_raise(IndexError) { md["zz"] }
+  # a pattern without any named group raises just the same
+  assert_raise(IndexError) { /(a)/.match("a")[:zz] }
+end
+
+assert("MatchData#[] - group name longer than a uint16 length") do
+  # Regression: the length test truncated the requested length to uint16_t
+  # while the memcmp() next to it did not, so (uint16_t)65539 == 3 ==
+  # "abc".length let a 65539-byte read run off a 3-byte arena. The result is
+  # unchanged either way; only a sanitizer build fails on it.
+  md = /(?<abc>x)/.match("x")
+  assert_raise(IndexError) { md["abc" + "A" * 65536] }
+  assert_equal "x", md[:abc]
 end
 
 assert("Regexp - named backreference \\k") do

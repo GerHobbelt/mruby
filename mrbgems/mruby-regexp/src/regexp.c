@@ -296,6 +296,15 @@ create_matchdata(mrb_state *mrb, mrb_value regexp, mrb_value str, int *captures,
   return obj;
 }
 
+/* Internal: the string a match operates on. A Symbol is matched against its
+   name; anything else has to be a String. */
+static mrb_value
+match_operand(mrb_state *mrb, mrb_value obj)
+{
+  if (mrb_symbol_p(obj)) return mrb_sym_str(mrb, mrb_symbol(obj));
+  return mrb_ensure_string_type(mrb, obj);
+}
+
 /* Internal: execute match and create MatchData.
    Returns MatchData on match, nil on no match.
    Sets $~ and $1-$9 globals. */
@@ -337,7 +346,7 @@ regexp_match(mrb_state *mrb, mrb_value self)
     clear_match_globals(mrb);
     return mrb_nil_value();
   }
-  str = mrb_ensure_string_type(mrb, str);
+  str = match_operand(mrb, str);
   pos = re_char_to_byte(mrb, str, pos);
   if (pos < 0) {
     clear_match_globals(mrb);
@@ -370,7 +379,7 @@ regexp_match_p(mrb_state *mrb, mrb_value self)
   mrb_int pos = 0;
   mrb_get_args(mrb, "o|i", &str, &pos);
   if (mrb_nil_p(str)) return mrb_false_value();
-  str = mrb_ensure_string_type(mrb, str);
+  str = match_operand(mrb, str);
   pos = re_char_to_byte(mrb, str, pos);
   if (pos < 0) return mrb_false_value();
 
@@ -394,7 +403,7 @@ regexp_match_op(mrb_state *mrb, mrb_value self)
     clear_match_globals(mrb);
     return mrb_nil_value();
   }
-  str = mrb_ensure_string_type(mrb, str);
+  str = match_operand(mrb, str);
 
   mrb_value md = exec_match(mrb, self, str, 0);
   if (mrb_nil_p(md)) return mrb_nil_value();
@@ -413,7 +422,8 @@ regexp_case_match(mrb_state *mrb, mrb_value self)
   mrb_regexp_pattern *pat;
 
   mrb_get_args(mrb, "o", &str);
-  if (!mrb_string_p(str)) return mrb_false_value();
+  if (!mrb_string_p(str) && !mrb_symbol_p(str)) return mrb_false_value();
+  str = match_operand(mrb, str);
 
   pat = DATA_GET_PTR(mrb, self, &regexp_type, mrb_regexp_pattern);
   if (!pat) return mrb_false_value();
@@ -582,7 +592,10 @@ matchdata_aref(mrb_state *mrb, mrb_value self)
     if (!mrb_nil_p(md->regexp)) {
       pat = DATA_GET_PTR(mrb, md->regexp, &regexp_type, mrb_regexp_pattern);
     }
-    if (pat) {
+    /* A stored name never exceeds UINT16_MAX, so a longer request can name no
+       group. Rejecting it here keeps the cast in the loop lossless; without it
+       the length test truncates while the memcmp() next to it does not. */
+    if (pat && name_len <= UINT16_MAX) {
       for (uint16_t i = 0; i < pat->num_named; i++) {
         if (pat->named_captures[i].name_len == (uint16_t)name_len &&
             memcmp(pat->named_captures[i].name, name, name_len) == 0) {
@@ -591,14 +604,25 @@ matchdata_aref(mrb_state *mrb, mrb_value self)
         }
       }
     }
-    return mrb_nil_value();
+    /* A name that resolves to no group is a mistake at the point of the call,
+       not a failed match. CRuby raises here even when the pattern has no
+       named group at all. */
+    mrb_raisef(mrb, E_INDEX_ERROR, "undefined group name reference: %l", name, (size_t)name_len);
   }
   else {
     idx = mrb_as_int(mrb, arg);
+    if (idx < 0) {
+      /* A negative index counts back from the last group. CRuby's
+         rb_reg_nth_match() drops the result unless it is positive, so the
+         lowest group a negative index reaches is 1, never the whole match:
+         /(a)(b)/.match("ab")[-3] is nil, not "ab". */
+      idx += md->num_captures;
+      if (idx <= 0) return mrb_nil_value();
+    }
   }
 
 found:
-  if (idx < 0 || idx >= md->num_captures) return mrb_nil_value();
+  if (idx >= md->num_captures) return mrb_nil_value();
   int start = md->captures[idx * 2];
   int end = md->captures[idx * 2 + 1];
   if (start < 0) return mrb_nil_value();
@@ -1089,15 +1113,16 @@ regexp_scan(mrb_state *mrb, mrb_value self)
   return ary;
 }
 
-/* Check the pattern given to String#match and #match?: a Regexp or a String
-   passes through, everything else raises. The test runs here rather than in
-   Ruby so it never dispatches on the argument, where a redefined `is_a?` or
-   `class` could pose as a Regexp or fake the type name. Compiling a String
-   pattern is left to the caller, so this needs no callback into the VM.
-   CRuby names `nil`, `true` and `false` by value and everything else by
-   class. */
+/* Check the pattern given to String#match, #match?, #sub, #gsub, #scan and
+   #split: a Regexp or a String passes through, everything else raises. The
+   test runs here rather than in Ruby so it never dispatches on the argument,
+   where a redefined `is_a?` or `class` could pose as a Regexp or fake the type
+   name. What to do with an accepted String is left to the caller, which
+   compiles it for `match` and quotes it first for `sub` and friends, so this
+   needs no callback into the VM. CRuby names `nil`, `true` and `false` by
+   value and everything else by class. */
 static mrb_value
-regexp_match_pattern(mrb_state *mrb, mrb_value self)
+regexp_check_pattern(mrb_state *mrb, mrb_value self)
 {
   mrb_value re;
   mrb_get_args(mrb, "o", &re);
@@ -1132,7 +1157,7 @@ mrb_mruby_regexp_gem_init(mrb_state *mrb)
   mrb_define_class_method(mrb, re, "escape", regexp_escape, MRB_ARGS_REQ(1));
   mrb_define_class_method(mrb, re, "quote", regexp_escape, MRB_ARGS_REQ(1));
   mrb_define_class_method(mrb, re, "__binary_string?", regexp_binary_string_p, MRB_ARGS_REQ(1));
-  mrb_define_class_method(mrb, re, "__match_pattern", regexp_match_pattern, MRB_ARGS_REQ(1));
+  mrb_define_class_method(mrb, re, "__check_pattern", regexp_check_pattern, MRB_ARGS_REQ(1));
 
   /* Instance methods */
   mrb_define_method(mrb, re, "match", regexp_match, MRB_ARGS_ARG(1, 1)|MRB_ARGS_BLOCK());

@@ -1826,7 +1826,13 @@ static void codegen_pattern(mrc_codegen_scope *s, mrc_node *pattern, int target,
 static mrc_sym
 nsym(mrc_parser_state *p, const uint8_t *start, size_t length)
 {
-  if (length == 0 || (start >= p->start && start < p->end)) {
+  if (length == 0) {
+    /* An empty name has no bytes to keep alive, and `start` can be NULL for
+       one. The pool compares colliding entries with `memcmp()`, which is
+       declared nonnull, so hand it an empty string instead. */
+    return pm_constant_pool_insert_constant(&p->constant_pool, (const uint8_t *)"", 0);
+  }
+  if (start >= p->start && start < p->end) {
     /* Source-backed bytes stay valid for the parser's lifetime. */
     return pm_constant_pool_insert_constant(&p->constant_pool, start, length);
   }
@@ -3670,7 +3676,14 @@ lambda_body(mrc_codegen_scope *s, mrc_node *tree, mrc_node *body, pm_constant_id
 
   s->mscope = !blk;
   if (blk) {
-    s->for_depth = s->prev->for_depth; /* inherit for-depth from enclosing scope */
+    /* `for_depth` compensates for the loop body scope that `for` needs but
+       Prism does not have, so a Prism depth of 0 there means the enclosing
+       scope rather than the loop body.  A block is a scope Prism knows about,
+       so depth 0 means its own locals again and the compensation must not
+       carry into it: `gen_lvar()` reads depth only as local-or-upvar, and an
+       inherited depth turned every own local into an upvar that the enclosing
+       scopes do not hold ("Can't find local variables", #7012). */
+    s->for_depth = 0;
     struct loopinfo *lp = loop_push(s, LOOP_BLOCK);
     lp->pc0 = new_label(s);
   }
