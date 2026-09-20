@@ -54,7 +54,7 @@ its own, and the last one can still open a range: `/[\u{61 62}-z]/` is
 ### Flags
 
 - `i` (`Regexp::IGNORECASE`) case-insensitive matching (ASCII, or Unicode
-  with `MRB_REGEXP_UNICODE_CASE`)
+  with `MRB_UNICODE_CASE`)
 - `m` (`Regexp::MULTILINE`) `.` matches newline; `^`/`$` match at line boundaries
 - `x` (`Regexp::EXTENDED`) free-spacing mode; unescaped whitespace ignored, `#` starts comments
 
@@ -158,6 +158,13 @@ pattern analysis.
 
 ## Limitations
 
+- **UTF-8 only where the build reads it**: the engine reads a pattern and a
+  subject the way the build's `String` reads them, so everything below about
+  characters holds on a build that defines `MRB_UTF8_STRING` (mruby-encoding
+  is what defines it). Where it is not defined a string is bytes and so is the
+  engine: `/./` matches one byte, `/Ā/` is two atoms of one byte each, and
+  `/i` folds ASCII letters and nothing else. A binary (`ASCII-8BIT`) subject
+  reads by byte on either build.
 - **Fixed-length lookbehind only**: `(?<=...)` and `(?<!...)`
   require a fixed-length pattern (no `*`, `+`, `?`, or alternation).
   Maximum 255 bytes.
@@ -165,19 +172,20 @@ pattern analysis.
   supported.
 - **No `\x{...}` hex escape**: the hex escape is `\xHH`, so it reaches
   `0xff` at most. Write `\u{...}` for a codepoint above that.
-- **No encodings**: a pattern is a byte string read as UTF-8, and there is no
-  encoding to consult about a byte that starts no whole character. Such a byte
-  is that byte, inside a character class as much as outside one: `[\xB5]` and
-  `\xB5` both hold the byte `0xB5`, and neither matches `µ`, which is `C2 B5`.
-  CRuby settles the same question with the pattern's encoding and raises
-  `RegexpError` for either spelling. A range whose ends are a byte and a
-  character (`[\x80-µ]`) names neither and raises `RegexpError`.
+- **No encodings**: a pattern is a byte string read the way the build reads a
+  String, and there is no encoding to consult about a byte that starts no
+  whole character. Such a byte is that byte, inside a character class as much
+  as outside one: `[\xB5]` and `\xB5` both hold the byte `0xB5`, and neither
+  matches `µ`, which is `C2 B5`. CRuby settles the same question with the
+  pattern's encoding and raises `RegexpError` for either spelling. A range
+  whose ends are a byte and a character (`[\x80-µ]`) names neither and raises
+  `RegexpError`.
 - **ASCII case folding by default**: The `i` flag handles ASCII letters
-  only unless the build defines `MRB_REGEXP_UNICODE_CASE`, which adds the
-  Unicode foldings that pair one codepoint with one other. Without the
-  option, a pattern holding a character that needs one of those raises
-  `RegexpError` rather than answering as if the character had no case; see
-  Configuration. A codepoint with no single counterpart to fold to (`ﬀ` to
+  only unless the build defines `MRB_UNICODE_CASE`, which reads the Unicode
+  foldings that pair one codepoint with one other off core's case table.
+  Without the option, a pattern holding a character that needs one of those
+  raises `RegexpError` rather than answering as if the character had no case;
+  see Configuration. A codepoint with no single counterpart to fold to (`ﬀ` to
   `ff`) is never folded by either build.
 - **Case-insensitive backreferences match a superset**: `\1` under `i`
   folds each side and compares, so it matches where the capture and the
@@ -228,21 +236,27 @@ there.
 #endif
 ```
 
-Case folding beyond ASCII is opt-in, since it carries a table of the Unicode
-foldings. Define `MRB_REGEXP_UNICODE_CASE` to enable it:
+Case folding beyond ASCII is opt-in, since it carries the walks over core's
+case table. Define `MRB_UNICODE_CASE` to enable it:
 
 ```ruby
-conf.cc.defines << 'MRB_REGEXP_UNICODE_CASE'
+conf.cc.defines << 'MRB_UNICODE_CASE'
 ```
 
-It costs about 4KB of text, of which roughly 2.5KB is the table itself. With
-it, `/Ā/i` matches `"ā"`, `/Σ/i` matches `"σ"`, and `[^Ā]` under `/i` stops
-accepting `"ā"`.
+The table itself is core's, carried by any build that defines
+`MRB_UTF8_STRING`, which is what `String#downcase` and the four case methods
+beside it read. What this option adds is the two directions /i needs over that
+table, at about 4KB of text. It therefore takes `MRB_UTF8_STRING` to do
+anything: without it there is no table under the walks, and a pattern read as
+bytes has no character to fold in the first place.
+
+With the option, `/Ā/i` matches `"ā"`, `/Σ/i` matches `"σ"`, and `[^Ā]` under
+`/i` stops accepting `"ā"`.
 
 Without it, those same patterns do not compile:
 
 ```ruby
-/Ā/i     # RegexpError: /i needs MRB_REGEXP_UNICODE_CASE for this character
+/Ā/i     # RegexpError: /i needs MRB_UNICODE_CASE for this character
 ```
 
 The test is whether a character has a case folding, not whether it is

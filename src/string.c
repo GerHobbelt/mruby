@@ -380,12 +380,10 @@ mrb_utf8_to_buf(char *buf, mrb_int cp)
   return 0;  /* above U+10FFFF */
 }
 
-/* What a run of bytes spells is a question apart from whether String indexes
-   by character, and mruby-regexp asks the first one whatever the build does.
-   So this much is here for any build that asks, through MRB_UTF8_SCAN or
-   MRB_UTF8_STRING; what indexes a string by character waits behind the latter
-   alone, below. A build with neither carries none of it. */
-#if defined(MRB_UTF8_STRING) || defined(MRB_UTF8_SCAN)
+/* UTF-8: what a run of bytes spells, and what a string holds character by
+   character. Only a build that indexes strings by character has to answer
+   either, so a build without MRB_UTF8_STRING carries none of it. */
+#ifdef MRB_UTF8_STRING
 
 #define utf8_islead(c) ((unsigned char)((c)&0xc0) != 0x80)
 
@@ -484,10 +482,6 @@ mrb_utf8_decode(const char *p, const char *e, mrb_int *lenp)
     return c;  /* ASCII, or invalid/truncated byte returned as-is */
   }
 }
-
-#endif  /* MRB_UTF8_STRING || MRB_UTF8_SCAN */
-
-#ifdef MRB_UTF8_STRING
 
 #define NOASCII(c) ((c) & 0x80)
 
@@ -734,7 +728,7 @@ mrb_str_char_to_byte(mrb_state *mrb, mrb_value str, mrb_int off, mrb_int idx)
 {
   (void)mrb;
   struct RString *s = mrb_str_ptr(str);
-  if (RSTR_CODERANGE(s) == MRB_STR_CODERANGE_7BIT || RSTR_BINARY_P(s)) {
+  if (RSTR_SINGLE_BYTE_P(s)) {
     return idx;
   }
 
@@ -775,7 +769,7 @@ mrb_str_byte_to_char(mrb_state *mrb, mrb_value str, mrb_int bi)
   (void)mrb;
   struct RString *s = mrb_str_ptr(str);
   if (bi < 0 || RSTR_LEN(s) < bi) return -1;
-  if (RSTR_CODERANGE(s) == MRB_STR_CODERANGE_7BIT || RSTR_BINARY_P(s)) {
+  if (RSTR_SINGLE_BYTE_P(s)) {
     return bi;
   }
 
@@ -1255,37 +1249,40 @@ mrb_locale_from_utf8(const char *utf8, int len)
  * @param s The RString structure to modify.
  *
  * Prepares a string for modification. If the string is shared or not extensible,
- * it will be unshared or converted to a normal string. This version keeps the
- * string standing at 7BIT if that is where it stood.
- * Raises an error if the string is frozen.
- */
-MRB_API void
-mrb_str_modify_keep_ascii(mrb_state *mrb, struct RString *s)
-{
-  mrb_check_frozen(mrb, s);
-  str_unshare_buffer(mrb, s);
-  /* Every in-place write reaches here, including the ones that keep the string
-     ASCII, so this is where the walk's answer stops holding. What a string of
-     nothing but ASCII stands at is the caller's to keep. */
-  if (RSTR_CODERANGE(s) != MRB_STR_CODERANGE_7BIT) {
-    RSTR_CODERANGE_SET(s, MRB_STR_CODERANGE_UNKNOWN);
-  }
-}
-
-/*
- * @param mrb The mruby state.
- * @param s The RString structure to modify.
- *
- * Prepares a string for modification. Similar to `mrb_str_modify_keep_ascii`,
- * but also takes 7BIT back, assuming the modification might introduce
- * multi-byte characters.
+ * it will be unshared or converted to a normal string. What the bytes were read
+ * as stops holding here, so this is the prepare for a write that can change it.
  * Raises an error if the string is frozen.
  */
 MRB_API void
 mrb_str_modify(mrb_state *mrb, struct RString *s)
 {
-  mrb_str_modify_keep_ascii(mrb, s);
+  mrb_check_frozen(mrb, s);
+  str_unshare_buffer(mrb, s);
   RSTR_CODERANGE_SET(s, MRB_STR_CODERANGE_UNKNOWN);
+}
+
+/* mrb_str_modify() for a caller whose write leaves what the bytes read as
+   standing: it puts ASCII where ASCII stood, or it cuts where a character
+   ends. Such a write cannot turn a sound string unsound, so the answer the
+   string came in carrying is still the answer, and the next asker is spared
+   the walk that would arrive at it again.
+
+   Only a string already read as broken has to be asked again, since a write
+   is as likely to have mended it as to have left it broken. A string that
+   the write leaves holding nothing but ASCII keeps saying VALID rather than
+   moving to 7BIT: that is an answer worth less than the truth, not a wrong
+   one, and finding the truth is the walk this is here to skip.
+
+   The promise this asks of its caller cannot be checked here, which is why
+   it is not offered outside the library. */
+static void
+str_modify_keep_cr(mrb_state *mrb, struct RString *s)
+{
+  mrb_check_frozen(mrb, s);
+  str_unshare_buffer(mrb, s);
+  if (RSTR_CODERANGE(s) == MRB_STR_CODERANGE_BROKEN) {
+    RSTR_CODERANGE_SET(s, MRB_STR_CODERANGE_UNKNOWN);
+  }
 }
 
 /*
@@ -2002,6 +1999,128 @@ mrb_str_aset_m(mrb_state *mrb, mrb_value str)
   return replace;
 }
 
+#ifdef MRB_UTF8_STRING
+
+/* What the walk below makes of an ASCII character. Each method keeps its own
+   loop over a string that holds nothing but ASCII, so this is reached only for
+   the ASCII characters of a string that holds others beside them. */
+static int
+ascii_case_conv(int c, enum mrb_case_mode mode, mrb_bool first)
+{
+  switch (mode) {
+  case MRB_CASE_UP:
+    return TOUPPER(c);
+  case MRB_CASE_CAPITALIZE:
+    return first ? TOUPPER(c) : TOLOWER(c);
+  case MRB_CASE_SWAP:
+    return ISUPPER(c) ? TOLOWER(c) : TOUPPER(c);
+  default:
+    return TOLOWER(c);
+  }
+}
+
+static enum mrb_case_kind
+case_kind_of(enum mrb_case_mode mode, mrb_bool first)
+{
+  switch (mode) {
+  case MRB_CASE_UP:
+    return MRB_CASE_KIND_UPPER;
+  case MRB_CASE_CAPITALIZE:
+    return first ? MRB_CASE_KIND_TITLE : MRB_CASE_KIND_LOWER;
+  case MRB_CASE_SWAP:
+    return MRB_CASE_KIND_SWAP;
+  case MRB_CASE_FOLD:
+    return MRB_CASE_KIND_FOLD;
+  default:
+    return MRB_CASE_KIND_LOWER;
+  }
+}
+
+/* Convert a string that holds characters the tables can speak about. A mapping
+   changes how many bytes a character takes ("K" U+212A lower cases to the one
+   byte of "k"), so the answer is built beside the string rather than over it,
+   and the string takes the buffer's bytes at the end. */
+static mrb_bool
+str_case_convert_utf8(mrb_state *mrb, mrb_value str, enum mrb_case_mode mode)
+{
+  struct RString *s = mrb_str_ptr(str);
+  const char *p = RSTR_PTR(s);
+  const char *pend = p + RSTR_LEN(s);
+  mrb_value out = mrb_str_new_capa(mrb, RSTR_LEN(s));
+  mrb_bool modify = FALSE;
+  mrb_bool ascii_only = TRUE;
+  mrb_bool first = TRUE;
+
+  while (p < pend) {
+    char buf[MRB_UNI_CASE_MAX_BYTES];
+    const char *src = p;
+    mrb_int clen;
+    uint32_t cp = mrb_utf8_decode(p, pend, &clen);
+    mrb_int n;
+
+    if (cp < 0x80) {
+      buf[0] = (char)ascii_case_conv((int)cp, mode, first);
+      n = 1;
+    }
+    else {
+      /* A run of bytes that spells no character has no case to convert, and
+         answering as though it were the byte it starts with would hand back a
+         string neither its own reading nor the caller asked for. */
+      if (clen == 1) {
+        mrb_raise(mrb, E_ARGUMENT_ERROR, "input string invalid");
+      }
+      n = mrb_uni_case_map(case_kind_of(mode, first), cp, buf);
+      /* A character with no mapping stands as it is. */
+      if (n == 0) {
+        memcpy(buf, src, (size_t)clen);
+        n = clen;
+      }
+    }
+    p += clen;
+    first = FALSE;
+
+    if (n != clen || memcmp(buf, src, (size_t)n) != 0) modify = TRUE;
+    for (mrb_int i = 0; i < n; i++) {
+      if ((unsigned char)buf[i] & 0x80) ascii_only = FALSE;
+    }
+    mrb_str_cat(mrb, out, buf, n);
+  }
+
+  if (!modify) return FALSE;
+
+  /* Every byte of the source spelled a character, since the walk refuses one
+     that does not, and every mapping spells characters, so what was written
+     is sound. Nothing but ASCII is the stronger answer where it holds. */
+  struct RString *o = mrb_str_ptr(out);
+  RSTR_CODERANGE_SET(o, ascii_only ? MRB_STR_CODERANGE_7BIT
+                                   : MRB_STR_CODERANGE_VALID);
+  str_replace(mrb, s, o);
+  return TRUE;
+}
+
+int
+mrb_str_case_convert_unicode(mrb_state *mrb, mrb_value str, enum mrb_case_mode mode)
+{
+  struct RString *s = mrb_str_ptr(str);
+
+  /* A string of nothing but ASCII holds no character the tables speak about,
+     and one read as bytes holds no characters at all. Neither is this walk's
+     to make, so both go back to the caller's own loop, which converts the
+     bytes where they stand. A string that has not been walked yet is walked
+     for it: reading it through is what the loop below does anyway, and this
+     way an ASCII one is spared the second string the walk builds beside it.
+     The byte reading is asked about first, since a string read as bytes must
+     not be recorded as holding one character per byte. */
+  if (RSTR_BINARY_P(s) || str_ascii_p(s)) return -1;
+
+  str_modify_keep_cr(mrb, s);
+  if (RSTR_LEN(s) == 0 || RSTR_PTR(s) == NULL) return -1;
+
+  return str_case_convert_utf8(mrb, str, mode) ? 1 : 0;
+}
+
+#endif  /* MRB_UTF8_STRING */
+
 /* 15.2.10.5.8  */
 /*
  *  call-seq:
@@ -2018,11 +2137,14 @@ mrb_str_aset_m(mrb_state *mrb, mrb_value str)
 static mrb_value
 mrb_str_capitalize_bang(mrb_state *mrb, mrb_value str)
 {
+  int uc = mrb_str_case_convert_unicode(mrb, str, MRB_CASE_CAPITALIZE);
+  if (uc >= 0) return uc ? str : mrb_nil_value();
+
   mrb_bool modify = FALSE;
   struct RString *s = mrb_str_ptr(str);
   mrb_int len = RSTR_LEN(s);
 
-  mrb_str_modify_keep_ascii(mrb, s);
+  str_modify_keep_cr(mrb, s);
   char *p = RSTR_PTR(s);
   char *pend = RSTR_PTR(s) + len;
   if (len == 0 || p == NULL) return mrb_nil_value();
@@ -2046,7 +2168,8 @@ mrb_str_capitalize_bang(mrb_state *mrb, mrb_value str)
  *     str.capitalize   => new_str
  *
  *  Returns a copy of *str* with the first character converted to uppercase
- *  and the remainder to lowercase.
+ *  and the remainder to lowercase. Where a character has a title case apart
+ *  from its upper case, the first one takes that ("ǳ" to "ǲ").
  *
  *     "hello".capitalize    #=> "Hello"
  *     "HELLO".capitalize    #=> "Hello"
@@ -2075,7 +2198,7 @@ mrb_str_chomp_bang(mrb_state *mrb, mrb_value str)
   mrb_int argc = mrb_get_args(mrb, "|S", &rs);
   struct RString *s = mrb_str_ptr(str);
 
-  mrb_str_modify_keep_ascii(mrb, s);
+  str_modify_keep_cr(mrb, s);
   mrb_int len = RSTR_LEN(s);
   if (argc == 0) {
     if (len == 0) return mrb_nil_value();
@@ -2131,8 +2254,7 @@ mrb_str_chomp_bang(mrb_state *mrb, mrb_value str)
        a character of its own, and cutting there would leave a string that is
        not UTF-8: "あ".chomp("\x82") is the whole of the last byte of a
        three-byte character. CRuby reads that as no match. */
-    if (!RSTR_BINARY_P(s) && RSTR_CODERANGE(s) != MRB_STR_CODERANGE_7BIT &&
-        mrb_utf8_char_head(p, pp, p + len) != pp) {
+    if (!RSTR_SINGLE_BYTE_P(s) && mrb_utf8_char_head(p, pp, p + len) != pp) {
       return mrb_nil_value();
     }
 #endif
@@ -2183,7 +2305,7 @@ mrb_str_chop_bang(mrb_state *mrb, mrb_value str)
 {
   struct RString *s = mrb_str_ptr(str);
 
-  mrb_str_modify_keep_ascii(mrb, s);
+  str_modify_keep_cr(mrb, s);
   if (RSTR_LEN(s) > 0) {
     mrb_int len;
 #ifdef MRB_UTF8_STRING
@@ -2251,11 +2373,14 @@ mrb_str_chop(mrb_state *mrb, mrb_value self)
 static mrb_value
 mrb_str_downcase_bang(mrb_state *mrb, mrb_value str)
 {
+  int uc = mrb_str_case_convert_unicode(mrb, str, MRB_CASE_DOWN);
+  if (uc >= 0) return uc ? str : mrb_nil_value();
+
   char *p, *pend;
   mrb_bool modify = FALSE;
   struct RString *s = mrb_str_ptr(str);
 
-  mrb_str_modify_keep_ascii(mrb, s);
+  str_modify_keep_cr(mrb, s);
   p = RSTR_PTR(s);
   pend = RSTR_PTR(s) + RSTR_LEN(s);
   while (p < pend) {
@@ -2276,8 +2401,9 @@ mrb_str_downcase_bang(mrb_state *mrb, mrb_value str)
  *     str.downcase   => new_str
  *
  *  Returns a copy of *str* with all uppercase letters replaced with their
- *  lowercase counterparts. The operation is locale insensitive---only
- *  characters 'A' to 'Z' are affected.
+ *  lowercase counterparts. The operation is locale insensitive. A build that
+ *  reads a string as characters maps every character Unicode gives a lower
+ *  case; one that reads it as bytes maps 'A' to 'Z' alone.
  *
  *     "hEllO".downcase   #=> "hello"
  */
@@ -2443,7 +2569,7 @@ mrb_str_check_byte_pos(mrb_state *mrb, mrb_value str, mrb_int pos)
 {
 #ifdef MRB_UTF8_STRING
   struct RString *s = mrb_str_ptr(str);
-  if (RSTR_CODERANGE(s) == MRB_STR_CODERANGE_7BIT || RSTR_BINARY_P(s)) return;
+  if (RSTR_SINGLE_BYTE_P(s)) return;
 
   const char *b = RSTR_PTR(s);
   const char *p = b + pos;
@@ -2797,7 +2923,7 @@ static mrb_value
 mrb_str_rindex_m(mrb_state *mrb, mrb_value str)
 {
   struct RString *s = mrb_str_ptr(str);
-  if (RSTR_CODERANGE(s) == MRB_STR_CODERANGE_7BIT || RSTR_BINARY_P(s)) {
+  if (RSTR_SINGLE_BYTE_P(s)) {
     return mrb_str_byterindex_m(mrb, str);
   }
 
@@ -3195,7 +3321,7 @@ mrb_string_value_cstr(mrb_state *mrb, mrb_value *ptr)
   }
 
   /*
-   * Even after str_modify_keep_ascii(), NULL termination is not ensured if
+   * Even after mrb_str_modify(), NULL termination is not ensured if
    * RSTR_SET_LEN() is used explicitly (e.g. String#delete_suffix!).
    */
   str_unshare_buffer(mrb, ps);
@@ -3430,11 +3556,14 @@ mrb_str_to_s(mrb_state *mrb, mrb_value self)
 static mrb_value
 mrb_str_upcase_bang(mrb_state *mrb, mrb_value str)
 {
+  int uc = mrb_str_case_convert_unicode(mrb, str, MRB_CASE_UP);
+  if (uc >= 0) return uc ? str : mrb_nil_value();
+
   struct RString *s = mrb_str_ptr(str);
   char *p, *pend;
   mrb_bool modify = FALSE;
 
-  mrb_str_modify_keep_ascii(mrb, s);
+  str_modify_keep_cr(mrb, s);
   p = RSTRING_PTR(str);
   pend = RSTRING_END(str);
   while (p < pend) {
@@ -3455,8 +3584,10 @@ mrb_str_upcase_bang(mrb_state *mrb, mrb_value str)
  *     str.upcase   => new_str
  *
  *  Returns a copy of *str* with all lowercase letters replaced with their
- *  uppercase counterparts. The operation is locale insensitive---only
- *  characters 'a' to 'z' are affected.
+ *  uppercase counterparts. The operation is locale insensitive. A build that
+ *  reads a string as characters maps every character Unicode gives an upper
+ *  case, which can spell more characters than it was handed ("ß" to "SS"); one
+ *  that reads it as bytes maps 'a' to 'z' alone.
  *
  *     "hEllO".upcase   #=> "HELLO"
  */

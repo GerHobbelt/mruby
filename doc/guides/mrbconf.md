@@ -215,7 +215,23 @@ end
 `MRB_UTF8_STRING`
 
 - Adds UTF-8 encoding support to character-oriented String instance methods.
+- Case conversion follows Unicode: `String#downcase`, `#upcase`, `#capitalize`
+  and `#swapcase` map every character Unicode gives a case, and a mapping may
+  spell several characters (`"ß".upcase` is `"SS"`). `String#casecmp?` folds
+  by the same data rather than converting.
+- A string read as bytes (`String#b`) converts and folds ASCII alone, and one
+  holding bytes that spell no character is refused with `ArgumentError`.
 - If it isn't defined, they only support the US-ASCII encoding.
+
+`MRB_UNICODE_CASE`
+
+- Widens the regexp `i` flag from ASCII letters to the Unicode case foldings
+  that pair one codepoint with one other, read off the case table
+  `MRB_UTF8_STRING` carries.
+- Without it, `i` folds ASCII alone and a pattern holding a character that
+  needs one of those foldings raises `RegexpError` rather than answering as if
+  the character had no case.
+- Takes `MRB_UTF8_STRING`, there being no table to read otherwise.
 
 `MRB_STR_LENGTH_MAX`
 

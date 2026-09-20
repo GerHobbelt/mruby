@@ -47,7 +47,7 @@ end
 assert('String#valid_encoding? after an append inside a shared buffer') do
   # An append to a string sharing a buffer with room to spare writes in place
   # rather than detaching, and that path forgets the remembered answer on its
-  # own rather than through mrb_str_modify_keep_ascii(). Nothing else here
+  # own rather than through mrb_str_modify(). Nothing else here
   # reaches it: a string built by `*` or from a literal has no spare capacity,
   # so its sharers all take the detaching path instead.
   #
@@ -473,6 +473,20 @@ assert('a byte-read string padded to width') do
     # a byte-read pad of ASCII bytes moves nothing
     assert_equal Encoding::UTF_8, "ab".center(4, "-".b).encoding
     assert_equal Encoding::UTF_8, "あ".center(3).encoding
+  end
+end
+
+assert('a byte-read string converted case') do
+  # Bytes read as bytes spell no characters, so a case conversion has nothing
+  # above ASCII to map and hands back the bytes it was given, still read as
+  # bytes. The same bytes read as UTF-8 spell "Ä", which does map.
+  if UTF8STRING
+    s = "\xC3\x84B".b
+    assert_equal [195, 132, 98], s.downcase.bytes
+    assert_equal [195, 132, 66], s.upcase.bytes
+    assert_equal [195, 132, 98], s.capitalize.bytes
+    assert_equal Encoding::BINARY, s.downcase.encoding
+    assert_equal [195, 164, 98], "\xC3\x84B".downcase.bytes
   end
 end
 

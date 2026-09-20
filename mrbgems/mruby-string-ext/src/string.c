@@ -65,11 +65,13 @@ int_chr_utf8(mrb_state *mrb, mrb_value num)
  *
  *  Equivalent to `String#swapcase`, but modifies the receiver in
  *  place, returning *str*, or `nil` if no changes were made.
- *  Note: case conversion is effective only in ASCII region.
  */
 static mrb_value
 str_swapcase_bang(mrb_state *mrb, mrb_value str)
 {
+  int uc = mrb_str_case_convert_unicode(mrb, str, MRB_CASE_SWAP);
+  if (uc >= 0) return uc ? str : mrb_nil_value();
+
   int modify = 0;
   struct RString *s = mrb_str_ptr(str);
 
@@ -97,8 +99,10 @@ str_swapcase_bang(mrb_state *mrb, mrb_value str)
  *     str.swapcase   -> new_str
  *
  *  Returns a copy of *str* with uppercase alphabetic characters converted
- *  to lowercase and lowercase characters converted to uppercase.
- *  Note: case conversion is effective only in ASCII region.
+ *  to lowercase and lowercase characters converted to uppercase. A build that
+ *  reads a string as characters swaps every character Unicode gives a case,
+ *  which can spell more characters than it was handed ("ß" to "SS"); one that
+ *  reads it as bytes swaps ASCII letters alone.
  *
  *     "Hello".swapcase          #=> "hELLO"
  *     "cYbEr_PuNk11".swapcase   #=> "CyBeR_pUnK11"
@@ -1033,7 +1037,7 @@ str_ord(mrb_state* mrb, mrb_value str)
   if (p == e) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "empty string");
   }
-  if (RSTR_CODERANGE(s) == MRB_STR_CODERANGE_7BIT || RSTR_BINARY_P(s)) {
+  if (RSTR_SINGLE_BYTE_P(s)) {
     c = p[0];
   }
   else {
@@ -1123,7 +1127,7 @@ str_scrub_core(mrb_state *mrb, mrb_value self)
   }
 
   struct RString *s = mrb_str_ptr(self);
-  if (RSTR_CODERANGE(s) == MRB_STR_CODERANGE_7BIT || RSTR_BINARY_P(s)) {
+  if (RSTR_SINGLE_BYTE_P(s)) {
     return mrb_str_dup(mrb, self);
   }
 
@@ -1166,7 +1170,7 @@ str_scrub_chunks(mrb_state *mrb, mrb_value self)
 {
   mrb_value ary = mrb_ary_new(mrb);
   struct RString *s = mrb_str_ptr(self);
-  if (RSTR_CODERANGE(s) == MRB_STR_CODERANGE_7BIT || RSTR_BINARY_P(s)) {
+  if (RSTR_SINGLE_BYTE_P(s)) {
     mrb_ary_push(mrb, ary, mrb_str_dup(mrb, self));
     return ary;
   }
@@ -1201,7 +1205,7 @@ str_codepoints(mrb_state *mrb, mrb_value str)
 
   mrb->c->ci->mid = 0;
   mrb_value result = mrb_ary_new(mrb);
-  if (RSTR_CODERANGE(s) == MRB_STR_CODERANGE_7BIT || RSTR_BINARY_P(s)) {
+  if (RSTR_SINGLE_BYTE_P(s)) {
     while (p < e) {
       mrb_ary_push(mrb, result, mrb_int_value(mrb, (mrb_int)*p));
       p++;
@@ -1413,7 +1417,10 @@ str_casecmp(mrb_state *mrb, mrb_value self)
   if (p1 == p2) return mrb_fixnum_value(0);
 
   for (mrb_int i=0; i<len; i++) {
-    int c1 = p1[i], c2 = p2[i];
+    /* Read as unsigned, as `String#<=>` reads the same bytes: a plain `char`
+       is signed on most targets, which would order a byte of 0x80 or above
+       below every ASCII one. */
+    int c1 = (unsigned char)p1[i], c2 = (unsigned char)p2[i];
     if (ISASCII(c1) && ISUPPER(c1)) c1 = TOLOWER(c1);
     if (ISASCII(c2) && ISUPPER(c2)) c2 = TOLOWER(c2);
     if (c1 > c2) return mrb_fixnum_value(1);
@@ -1425,16 +1432,67 @@ str_casecmp(mrb_state *mrb, mrb_value self)
 }
 #undef lesser
 
+#ifdef MRB_UTF8_STRING
+/* Whether a string holds anything the fold table could speak about. A string
+   of nothing but ASCII does not, and one read as bytes spells no characters
+   at all, so neither needs the walk. */
+static mrb_bool
+str_folds_beyond_ascii(mrb_value str)
+{
+  struct RString *s = mrb_str_ptr(str);
+  return RSTR_CODERANGE(s) != MRB_STR_CODERANGE_7BIT && !RSTR_BINARY_P(s);
+}
+
+/* Fold the one side the tables have nothing to say about. Only one of the two
+   has to hold a character above ASCII for both to be folded, and folding is
+   ASCII's lower case where it is nothing more: "SS" has to reach "ss" for
+   `"ß".casecmp?("SS")` to be true, and the walk in core hands such a string
+   back untouched. */
+static void
+str_fold_ascii(mrb_state *mrb, mrb_value str)
+{
+  struct RString *s = mrb_str_ptr(str);
+  mrb_str_modify(mrb, s);
+  char *p = RSTR_PTR(s);
+  for (char *pend = p + RSTR_LEN(s); p < pend; p++) {
+    if (ISUPPER(*p)) *p = TOLOWER(*p);
+  }
+}
+#endif
+
 /*
  * call-seq:
  *   str.casecmp?(other)  -> true, false, or nil
  *
  * Returns true if str and other_str are equal after case folding,
  * false if they are not equal, and nil if other is not a string.
+ *
+ * Folding is what makes this wider than `casecmp`, which orders strings by
+ * ASCII case alone: a build that reads a string as characters folds every
+ * character Unicode gives a folding, and one folding spells a character as
+ * several ("ß" as "ss").
+ *
+ *   "ä".casecmp("Ä")    #=> 1
+ *   "ä".casecmp?("Ä")   #=> true
+ *   "ß".casecmp?("ss")  #=> true
  */
 static mrb_value
 str_casecmp_p(mrb_state *mrb, mrb_value self)
 {
+#ifdef MRB_UTF8_STRING
+  mrb_value other = mrb_get_arg1(mrb);
+  if (!mrb_string_p(other)) return mrb_nil_value();
+
+  /* Nothing above ASCII on either side leaves nothing for the tables to fold,
+     and the two strings order by their bytes as they always have. */
+  if (str_folds_beyond_ascii(self) || str_folds_beyond_ascii(other)) {
+    mrb_value a = mrb_str_dup(mrb, self);
+    mrb_value b = mrb_str_dup(mrb, other);
+    if (mrb_str_case_convert_unicode(mrb, a, MRB_CASE_FOLD) < 0) str_fold_ascii(mrb, a);
+    if (mrb_str_case_convert_unicode(mrb, b, MRB_CASE_FOLD) < 0) str_fold_ascii(mrb, b);
+    return mrb_bool_value(mrb_str_equal(mrb, a, b));
+  }
+#endif
   mrb_value c = str_casecmp(mrb, self);
   if (mrb_nil_p(c)) return c;
   return mrb_bool_value(mrb_fixnum(c) == 0);
@@ -1799,7 +1857,7 @@ str_chars_ary(mrb_state *mrb, mrb_value self)
   int ai = mrb_gc_arena_save(mrb);
 
 #ifdef MRB_UTF8_STRING
-  if (RSTR_CODERANGE(s) != MRB_STR_CODERANGE_7BIT && !RSTR_BINARY_P(s)) {
+  if (!RSTR_SINGLE_BYTE_P(s)) {
     while (p < e) {
       mrb_int char_len = mrb_utf8len(p, e);
       mrb_ary_push(mrb, result, mrb_str_new(mrb, p, char_len));

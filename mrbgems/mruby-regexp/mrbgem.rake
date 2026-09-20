@@ -5,13 +5,6 @@ MRuby::Gem::Specification.new('mruby-regexp') do |spec|
 
   spec.add_dependency 'mruby-string-ext', :core => 'mruby-string-ext'
 
-  # The engine reads UTF-8 whatever a build's strings index by, so it asks core
-  # for the functions that answer what a run of bytes spells. They wait
-  # behind MRB_UTF8_STRING otherwise, and this build has no reason to set that:
-  # mruby-encoding is what does, and the default gembox carries this gem
-  # without it.
-  spec.build.defines << 'MRB_UTF8_SCAN'
-
   # Enumerator is optional: only String#gsub without a block reaches `to_enum`,
   # and without mruby-enumerator that is core Kernel#to_enum, which raises
   # NotImplementedError -- the same deal as Kernel#loop and String#each_char
@@ -49,8 +42,11 @@ MRuby::Gem::Specification.new('mruby-regexp') do |spec|
   # had its say, which is what `build_settings` waits for; this gem sets no
   # build command in the block above, so the reset that comes with it drops
   # nothing.
+  # The pair below is what `RE_UNICODE_CASE` is defined from in re_internal.h:
+  # the foldings are core's table, which only a build reading characters
+  # carries, so the option alone does not put them within /i's reach.
   spec.build_settings do
-    if build.has_define?('MRB_REGEXP_UNICODE_CASE')
+    if build.has_define?('MRB_UNICODE_CASE') && build.has_define?('MRB_UTF8_STRING')
       spec.test_rbfiles -= ["#{spec.dir}/test/ascii_case.rb"]
     else
       spec.test_rbfiles -= ["#{spec.dir}/test/unicode_case.rb"]

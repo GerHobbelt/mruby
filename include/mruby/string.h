@@ -47,30 +47,51 @@ struct RStringEmbed {
 #define MRB_STR_EMBED     8
 #define MRB_STR_TYPE_MASK 15
 
-#define MRB_STR_EMBED_LEN_SHIFT 6
+/* The four fields the flags word carries, in the order they sit in it:
+
+     bit 0-3    the type, spelled by the MRB_STR_* words above
+     bit 4-8    the embedded length
+     bit 9-10   the coderange
+     bit 11-12  the encoding index
+     bit 13-19  free
+
+   The order is the one that leaves what is free in a single run rather than in
+   pieces, and puts the field likeliest to widen at the top of what is used. A
+   field that widens from the top takes the free bits above it, which is a
+   change to its own MRB_STR_*_BITS and nothing else; a field that widens
+   anywhere else pushes every field above it along. Of the two that can widen
+   it is the encoding index that is expected to first, since a build carrying
+   more than the four encodings two bits name is what this field is here to
+   allow. The embedded length is the other, and only where sizeof(void*) grows
+   to 16: RSTRING_EMBED_LEN_MAX is 11 on 32-bit and 27 on 64-bit, both of which
+   five bits hold. */
+#define MRB_STR_EMBED_LEN_SHIFT 4
 #define MRB_STR_EMBED_LEN_BITS 5
 #define MRB_STR_EMBED_LEN_MASK (((1 << MRB_STR_EMBED_LEN_BITS) - 1) << MRB_STR_EMBED_LEN_SHIFT)
 
-#define MRB_STR_SINGLE_BYTE 32
-/* bit 4 is free, and bits 6..10 are the embedded length, so 11 is the first
-   one free above it */
-#define MRB_STR_VALID_ENC 2048
-#define MRB_STR_BROKEN_ENC 4096
+/* Where in the flags word the coderange sits. Its four answers are exclusive,
+   so two bits spell every one of them and spell nothing else. */
+#define MRB_STR_CODERANGE_SHIFT 9
+#define MRB_STR_CODERANGE_BITS 2
+#define MRB_STR_CODERANGE_MASK (((1 << MRB_STR_CODERANGE_BITS) - 1) << MRB_STR_CODERANGE_SHIFT)
 
 /* Where in the flags word the encoding index sits. Two bits name four
    encodings, which is more than the two a build carries now; widening them is
-   for whenever a third is carried. They sit above the flags rather than in
-   bit 4, the bit the index leaves behind, because a pair needs two bits in a
-   row and MRB_STR_SINGLE_BYTE holds the one beside it. Moving them down is
-   for whenever the word is laid out afresh. */
-#define MRB_STR_ENCODING_SHIFT 13
+   for whenever a third is carried. */
+#define MRB_STR_ENCODING_SHIFT 11
 #define MRB_STR_ENCODING_BITS 2
 #define MRB_STR_ENCODING_MASK (((1 << MRB_STR_ENCODING_BITS) - 1) << MRB_STR_ENCODING_SHIFT)
 
 #define RSTR_EMBED_P(s) ((s)->flags & MRB_STR_EMBED)
 #define RSTR_SET_EMBED_FLAG(s) ((s)->flags |= MRB_STR_EMBED)
+/* The length is shifted in without being masked to the field's width, unlike
+   the coderange and the encoding index, and that is what a length wants: it is
+   read at run time, so a mask is an instruction on every write rather than
+   something a constant folds away. What the field needs of it is said here
+   instead, the way ARY_SET_LEN says it in mruby/array.h. */
 #define RSTR_SET_EMBED_LEN(s, n) do {\
   size_t tmp_n = (n);\
+  mrb_assert(tmp_n <= (size_t)RSTRING_EMBED_LEN_MAX);\
   (s)->flags &= ~MRB_STR_EMBED_LEN_MASK;\
   (s)->flags |= (tmp_n) << MRB_STR_EMBED_LEN_SHIFT;\
 } while (0)
@@ -106,28 +127,25 @@ struct RStringEmbed {
 #define MRB_STR_CODERANGE_BROKEN  3
 
 #ifdef MRB_UTF8_STRING
-/* Kept for now in the three bits that held the answers one at a time, one bit
-   per answer. Nothing writes two of them, so the order below only decides what
-   a combination no writer makes would read as. 7BIT says more than VALID: a
-   string of nothing but ASCII reads as UTF-8 as it stands, and it is also one
-   character per byte, which is the part every index on it wants. */
+/* The answer read back is the field as it stands: the four are numbered 0..3
+   and the field is two bits wide, so every value it can hold names one of
+   them. That is what a field buys over a bit per answer, where a combination
+   nothing writes had to be given a reading anyway.
+
+   An answer is masked to the field's width on the way in, as an encoding index
+   is, so a fifth one lands wrong rather than reaching the bits beside it. Here
+   those bits are the encoding index rather than free ones, so an unmasked
+   write would not merely be a wrong answer: it would have the bytes read as
+   another encoding. What is written is one of the four either way, spelled
+   outright or read back out of another string's field, so nothing is left of
+   this at -O3. */
 # define RSTR_CODERANGE(s) \
-  (((s)->flags & MRB_STR_BROKEN_ENC) ? MRB_STR_CODERANGE_BROKEN : \
-   ((s)->flags & MRB_STR_SINGLE_BYTE) ? MRB_STR_CODERANGE_7BIT : \
-   ((s)->flags & MRB_STR_VALID_ENC) ? MRB_STR_CODERANGE_VALID : \
-   MRB_STR_CODERANGE_UNKNOWN)
-# define RSTR_CODERANGE_SET(s, cr) \
-  ((s)->flags = ((s)->flags & \
-                 ~(MRB_STR_SINGLE_BYTE|MRB_STR_VALID_ENC|MRB_STR_BROKEN_ENC)) | \
-                (((cr) == MRB_STR_CODERANGE_7BIT) ? MRB_STR_SINGLE_BYTE : \
-                 ((cr) == MRB_STR_CODERANGE_VALID) ? MRB_STR_VALID_ENC : \
-                 ((cr) == MRB_STR_CODERANGE_BROKEN) ? MRB_STR_BROKEN_ENC : 0))
+  (((s)->flags & MRB_STR_CODERANGE_MASK) >> MRB_STR_CODERANGE_SHIFT)
 #else
 /* A build that indexes by byte hands every byte back as a character and asks
    the bytes nothing, so every string in it stands where 7BIT stands and there
    is nothing to record. */
 # define RSTR_CODERANGE(s) MRB_STR_CODERANGE_7BIT
-# define RSTR_CODERANGE_SET(s, cr) ((void)0)
 #endif
 
 /* The encoding a string's bytes are read as, named as an index into the set of
@@ -149,34 +167,18 @@ struct RStringEmbed {
 
 #define RSTR_ENCODING(s) \
   (((s)->flags & MRB_STR_ENCODING_MASK) >> MRB_STR_ENCODING_SHIFT)
-/* The index is masked to the width of the field it goes into, so an index the
-   field is too narrow for lands wrong rather than reaching the bits beside it.
-   Widening MRB_STR_ENCODING_BITS is what a build carrying that many encodings
-   needs; until then this keeps the mistake where it can be seen. Both operands
-   are constants at every call, so nothing is left of this at -O3. */
-#define RSTR_ENCODING_SET(s, e) \
-  ((s)->flags = ((s)->flags & ~MRB_STR_ENCODING_MASK) | \
-                (((e) & ((1 << MRB_STR_ENCODING_BITS) - 1)) << MRB_STR_ENCODING_SHIFT))
 #define RSTR_BINARY_P(s) (RSTR_ENCODING(s) == MRB_STR_ENCODING_BINARY)
-/* A copy of a string is read the way the string it copies is, so the encoding
-   travels with the bytes rather than being left behind on the original. */
-#define RSTR_ENC_COPY(dst, src) RSTR_ENCODING_SET(dst, RSTR_ENCODING(src))
-/* A copy that ends up holding exactly the source's bytes reads them the same
-   way and stands exactly where the source stands, so the two answers travel
-   together. Splitting them apart would let a copy keep one and drop the
-   other, which is the way flags went missing when there was a macro per
-   flag. */
-#define RSTR_ENC_CR_COPY(dst, src) \
-  (RSTR_ENC_COPY(dst, src), RSTR_CODERANGE_SET(dst, RSTR_CODERANGE(src)))
-/* A subrange holds bytes of the source, so it is read the same way, but a cut
-   can leave a character in pieces and can also cut away the piece that spelled
-   none: it inherits neither soundness nor brokenness. Nothing but ASCII is
-   what survives being cut anywhere, so that is the one answer it carries
-   over. */
-#define RSTR_ENC_CR_COPY_FOR_SUBSTR(dst, src) \
-  (RSTR_ENC_COPY(dst, src), \
-   RSTR_CODERANGE_SET(dst, (RSTR_CODERANGE(src) == MRB_STR_CODERANGE_7BIT) \
-                           ? MRB_STR_CODERANGE_7BIT : MRB_STR_CODERANGE_UNKNOWN))
+/* Whether a character index into this string is already a byte index: every
+   byte of it stands for a character of its own. That is so where the bytes are
+   nothing but ASCII, and so where they are read as bytes to begin with. The
+   two arrive at it from different sides, which is why this is derived from
+   what the string carries rather than carried alongside it. */
+#define RSTR_SINGLE_BYTE_P(s) \
+  (RSTR_CODERANGE(s) == MRB_STR_CODERANGE_7BIT || RSTR_BINARY_P(s))
+
+/* Writing either field is in mruby/internal.h. What is read back here is what
+   the bytes were found to be; what is written there is a claim about them,
+   which only what can make good on it should be spelling. */
 
 /**
  * Returns a pointer from a Ruby string
@@ -191,8 +193,6 @@ struct RStringEmbed {
 #define RSTRING_CSTR(mrb,s)  mrb_string_cstr(mrb, s)
 
 MRB_API void mrb_str_modify(mrb_state *mrb, struct RString *s);
-/* mrb_str_modify() with keeping ASCII flag if set */
-MRB_API void mrb_str_modify_keep_ascii(mrb_state *mrb, struct RString *s);
 
 /**
  * Finds the index of a substring in a string
