@@ -16,9 +16,11 @@ simulation) with backtracking fallback.
 - `\D`, `\W`, `\S` negated shortcuts
 - `(...)` capture group
 - `(?:...)` non-capturing group
+- `(?#...)` comment group
 - `(?<name>...)` named capture group
 - `|` alternation
 - `\1`-`\9` backreferences
+- `\k<name>`, `\k'name'` named backreferences
 - `(?=...)` positive lookahead
 - `(?!...)` negative lookahead
 - `(?<=...)` positive lookbehind (fixed-length only)
@@ -36,7 +38,8 @@ simulation) with backtracking fallback.
 
 ### Flags
 
-- `i` (`Regexp::IGNORECASE`) case-insensitive matching (ASCII)
+- `i` (`Regexp::IGNORECASE`) case-insensitive matching (ASCII, or Unicode
+  with `MRB_REGEXP_UNICODE_CASE`)
 - `m` (`Regexp::MULTILINE`) `.` matches newline; `^`/`$` match at line boundaries
 - `x` (`Regexp::EXTENDED`) free-spacing mode; unescaped whitespace ignored, `#` starts comments
 
@@ -85,12 +88,21 @@ str.gsub(re, replacement)         # replace all occurrences
 str.gsub(re) { |m| ... }          # replace all with block
 str.scan(re)                      # => array of matches
 str.split(re)                     # => array of parts
+str[re]                           # => matched substring or nil
+str[re, capture]                  # => capture by index or name
+str.slice(re)                     # => same as str[re]
+str[re] = repl                    # replace the match
+str[re, capture] = repl           # replace a capture by index or name
+str.slice!(re)                    # remove and return the match, or nil
+str.slice!(re, capture)           # same, for a capture by index or name
 
 # Symbol methods (the String methods applied to the symbol's name)
 sym.match(re)                     # => MatchData or nil
 sym.match(re) { |md| ... }        # => block result, or nil if no match
 sym.match?(re)                    # => true/false
 sym =~ re                         # => index or nil
+sym[re]                           # => matched substring or nil
+                                  #    (Symbol#[] comes from mruby-symbol-ext)
 
 # Global variables
 $~                                # last MatchData
@@ -121,13 +133,40 @@ pattern analysis.
   Maximum 255 bytes.
 - **No Unicode properties**: `\p{Alpha}`, `\p{L}`, etc. are not
   supported.
-- **ASCII case folding only**: The `i` flag handles ASCII letters
-  only.
+- **ASCII case folding by default**: The `i` flag handles ASCII letters
+  only unless the build defines `MRB_REGEXP_UNICODE_CASE`, which adds the
+  Unicode foldings that map one codepoint to one other. A codepoint whose
+  fold is several codepoints (`ß` to `ss`) is never folded.
 - **Step limit on backtracking**: Patterns that require the
   backtracking engine are subject to a step limit.
-- **No regexp form of `String#[]`**: `str[re]` and `str.slice(re)`
-  are not supported, and neither is `sym[re]`, which delegates to
-  them.
+- **No inline extended mode**: `(?x)` and `(?x:...)` raise a
+  `RegexpError`, because extended mode is applied to the whole pattern
+  before it is parsed. A `-x` is accepted and ignored, so inside a
+  pattern that is itself extended it does not bring back the
+  whitespace that pass removed.
+
+## Named Captures
+
+As in CRuby, declaring a named group anywhere in a pattern changes how the
+whole pattern is numbered: a plain `(...)` groups without capturing, and a
+numbered backreference is a `RegexpError` in every spelling (`\1`, `\k<1>`,
+`\k<-1>`). Refer to a group by name instead.
+
+```ruby
+md = /(?<a>a)(b)/.match("ab")
+md.size                          # => 2
+md.captures                      # => ["a"]
+md[:a]                           # => "a"
+md[2]                            # => nil
+
+"aa".match(/(?<n>\w)\k<n>/)[0]   # => "aa"
+
+Regexp.new("(a)(?<b>b)\\1")
+# RegexpError: numbered backref/call is not allowed. (use name)
+```
+
+A pattern with no named group numbers its groups as usual, and `\1`-`\9` work
+there.
 
 ## Configuration
 
@@ -137,6 +176,17 @@ pattern analysis.
 #define MRB_REGEXP_STEP_LIMIT 1000000
 #endif
 ```
+
+Case folding beyond ASCII is opt-in, since it carries a table of the Unicode
+foldings. Define `MRB_REGEXP_UNICODE_CASE` to enable it:
+
+```ruby
+conf.cc.defines << 'MRB_REGEXP_UNICODE_CASE'
+```
+
+It costs about 6KB of text, of which roughly 2.4KB is the table itself. With
+it, `/Ā/i` matches `"ā"`, `/Σ/i` matches `"σ"`, and `[^Ā]` under `/i` stops
+accepting `"ā"`. Without it those all behave as they always have.
 
 ## License
 

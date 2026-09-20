@@ -19,4 +19,18 @@ MRuby::Gem::Specification.new('mruby-regexp') do |spec|
   if build.gems.any? {|g| g.name == 'mruby-enumerator'}
     spec.add_dependency 'mruby-enumerator', :core => 'mruby-enumerator'
   end
+
+  # Same deal for `Symbol#[]` and `#slice`, which live in mruby-symbol-ext and
+  # delegate to the String methods: the regexp form is this gem's, so mrbtest
+  # can only exercise it when that gem is part of the state.
+  if build.gems.any? {|g| g.name == 'mruby-symbol-ext'}
+    spec.add_dependency 'mruby-symbol-ext', :core => 'mruby-symbol-ext'
+  end
+
+  # test/unicode_case.rb asserts what /i does once MRB_REGEXP_UNICODE_CASE is
+  # defined, so it only belongs to a build that defines it. Every assertion in
+  # it would fail otherwise, since /i folds ASCII letters and nothing else.
+  unless build.cc.defines.include?('MRB_REGEXP_UNICODE_CASE')
+    spec.test_rbfiles -= ["#{spec.dir}/test/unicode_case.rb"]
+  end
 end

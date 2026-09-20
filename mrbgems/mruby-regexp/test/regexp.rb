@@ -177,6 +177,36 @@ assert("Regexp - character class") do
   assert_equal "abc", md[0]
 end
 
+assert("Regexp - character class range across the ASCII boundary") do
+  # A range from an ASCII bound to a non-ASCII one used to be stored whole in
+  # the codepoint list, which the matcher never reads below 128, so the ASCII
+  # half of the range matched nothing.
+  assert_equal "a", "a".match(/[a-Ā]/)[0]
+  assert_equal "z", "z".match(/[a-Ā]/)[0]
+  assert_equal "{", "{".match(/[a-Ā]/)[0]      # 0x7b, inside a-Ā
+  assert_nil "A".match(/[a-Ā]/)                # 0x41, below the range
+  assert_nil "`".match(/[a-Ā]/)                # 0x60, just below 'a'
+  assert_equal "abĀz", "!abĀz!".match(/[a-Ā]+/)[0]
+  # The non-ASCII half still answers on its own.
+  assert_equal "Ā", "Ā".match(/[a-Ā]/)[0]
+  assert_equal "À", "À".match(/[a-Ā]/)[0]
+  assert_nil "ā".match(/[a-Ā]/)                # one past the upper bound
+  # Negation reads the same class, so it rejected the ASCII half it had to
+  # accept and accepted the half it had to reject.
+  assert_nil "a".match(/[^a-Ā]/)
+  assert_nil "Ā".match(/[^a-Ā]/)
+  assert_equal "A", "A".match(/[^a-Ā]/)[0]
+  assert_equal "ā", "ā".match(/[^a-Ā]/)[0]
+  # The /i fold walks the bitmap, so it reaches the ASCII half once that half
+  # is stored there. Non-ASCII case folding is still not applied.
+  assert_equal "A", "A".match(/[a-Ā]/i)[0]
+  assert_nil "A".match(/[^a-Ā]/i)
+  # Ranges that stay on one side of the boundary are unaffected.
+  assert_equal "b", "b".match(/[a-c]/)[0]
+  assert_equal "ą", "ą".match(/[Ā-Đ]/)[0]
+  assert_nil "a".match(/[Ā-Đ]/)
+end
+
 assert("Regexp - POSIX bracket classes") do
   # ASCII semantics, like this gem's \w/\d shorthands.
   assert_equal "abc", "123abc456".match(/[[:alpha:]]+/)[0]
@@ -249,6 +279,55 @@ assert("Regexp - quantifiers") do
   assert_equal "", Regexp.new("a*").match("bbb")[0]
   assert_equal "ab", Regexp.new("ab?").match("ab")[0]
   assert_equal "a", Regexp.new("ab?").match("ac")[0]
+end
+
+assert("Regexp - a repetition stops on an empty iteration") do
+  # A repetition whose body matches empty runs that iteration and then stops,
+  # so a body that prefers the empty branch ends the loop at once instead of
+  # going around again on the branch that consumes.
+  assert_equal "", "a".match(/(|a)*/)[0]
+  assert_equal "", "aaa".match(/(|a)*/)[0]
+  assert_equal "", "a".match(/(?:|a)+/)[0]
+  # a body that can only match empty after consuming still consumes first
+  assert_equal "aaa", "aaa".match(/(a|)*/)[0]
+  assert_equal "aa", "aab".match(/(a?)*/)[0]
+end
+
+assert("Regexp - a repetition keeps its last, empty iteration's capture") do
+  # The final iteration is the empty one, and the group keeps what it
+  # captured: the empty string where the loop stopped. The linear-time engine
+  # used to drop that iteration and report the previous one's text, or nil
+  # when there was no previous one.
+  md = "a".match(/(a?)*/)
+  assert_equal "a", md[0]
+  assert_equal "", md[1]
+  assert_equal 1, md.begin(1)
+  assert_equal "", "aab".match(/(a*)*b/)[1]
+  assert_equal "", "a".match(/(a|)*/)[1]
+  assert_equal "", "a".match(/(a?)+/)[1]
+  # with no earlier iteration the group still participates
+  assert_equal "", "b".match(/(a?)*/)[1]
+  assert_equal "", "".match(/(a?)*/)[1]
+  assert_equal "", "b".match(/(a*)*b/)[1]
+  # a nullable body nested in a repetition reaches the same answer
+  assert_equal "", "a".match(/((a?)*)*/)[1]
+  # both engines agree: a lookaround routes the same pattern to the other one
+  assert_equal "", "a".match(/(?=a)(a?)*/)[1]
+  assert_equal 1, "a".match(/(?=a)(a?)*/).begin(1)
+  assert_equal "", "b".match(/(?=b)(a?)*/)[1]
+end
+
+assert("Regexp - a repetition whose body always consumes is unaffected") do
+  assert_equal "b", "ab".match(/(a|b)*/)[1]
+  assert_nil "c".match(/(a|b)*/)[1]
+  assert_equal "aa", "aa".match(/(a)*/)[0]
+  assert_equal "a", "aa".match(/(a)*/)[1]
+  assert_equal ["", "b", ""], "ab".split(/(?:a?)*/, -1)
+end
+
+assert("String#split and String#scan see the empty iteration's capture") do
+  assert_equal ["", "", "b", "", ""], "ab".split(/(a?)*/, -1)
+  assert_equal [[""], [""], [""]], "ab".scan(/(a?)*/)
 end
 
 assert("Regexp - quantified first alternative does not leak into the next") do
@@ -449,8 +528,57 @@ assert("Regexp - inline options (?i) / (?i:...)") do
   assert_equal 0, (/(?m:a.b)/ =~ "a\nb")
   assert_nil (/a.b/ =~ "a\nb")
 
-  # x (extended) cannot be scoped inline with the current architecture.
+  # x (extended) cannot be scoped inline with the current architecture, so
+  # turning it on is rejected.
   assert_raise(RegexpError) { Regexp.new("(?x)a b") }
+  assert_raise(RegexpError) { Regexp.new("(?x:a b)") }
+
+  # Turning it off is accepted, because Regexp#to_s writes a '-x' for every
+  # pattern that is not extended and that form has to recompile.
+  assert_equal 0, (/(?-x:a b)/ =~ "a b")
+  assert_equal 0, (/(?i-mx:a)b/ =~ "Ab")
+  assert_true Regexp.new("(?-mix:a b)").match?("a b")
+
+  # The '-x' is dropped rather than honoured, so in a pattern that is
+  # itself extended the whitespace stays stripped. CRuby matches "a b"
+  # here.
+  assert_true Regexp.new("(?-x:a b)", Regexp::EXTENDED).match?("ab")
+end
+
+assert("Regexp - comment groups (?#...)") do
+  # The group is removed before the pattern is parsed, so it can stand
+  # anywhere, including where an atom cannot.
+  assert_true(/a(?#note)b/.match?("ab"))
+  assert_true Regexp.new("(?#lead)ab").match?("ab")
+  assert_true Regexp.new("ab(?#trail)").match?("ab")
+  assert_true Regexp.new("a(?#)b").match?("ab")          # empty comment
+  assert_true Regexp.new("a(?#no\nte)b").match?("ab")    # newline is comment text
+  assert_equal ["ab", "ab"], Regexp.new("(a(?#c)b)").match("ab").to_a
+
+  # The group is not an atom: a quantifier after it repeats what came before.
+  assert_equal 0, (Regexp.new("a(?#x)*") =~ "aaa")
+  assert_raise(RegexpError) { Regexp.new("(?#x)*") }
+
+  # A backslash escapes the following byte, so \) does not close the group.
+  assert_true Regexp.new("a(?#x\\)y)b").match?("ab")
+  # ... but an escaped backslash does not reach the ')', which then closes
+  # the group and leaves the second one unmatched.
+  assert_raise(RegexpError) { Regexp.new("a(?#x\\\\)y)b") }
+
+  # Comment groups do not nest: the first ')' closes, the second is unmatched.
+  assert_raise(RegexpError) { Regexp.new("x(?#a(?#b))y") }
+
+  # An unterminated group raises rather than swallowing the rest.
+  assert_raise_with_message(RegexpError, "unterminated comment group: /a(?#note/") do
+    Regexp.new("a(?#note")
+  end
+
+  # Inside a character class the same bytes are ordinary members.
+  assert_true Regexp.new("a[(?#c)]b").match?("a#b")
+  assert_true Regexp.new("a[(?#c)]b").match?("a(b")
+
+  # An escaped '(' does not open a comment group.
+  assert_raise(RegexpError) { Regexp.new("a\\(?#note)b") }
 end
 
 assert("MatchData#captures") do
@@ -483,6 +611,37 @@ end
 assert("MatchData#string") do
   md = Regexp.new("bc").match("abcde")
   assert_equal "abcde", md.string
+end
+
+assert("MatchData - subject is snapshotted at match time") do
+  # Regression: source used to alias the subject, so mutating it afterwards
+  # retroactively changed what an already-created MatchData reported.
+  s = "hello"
+  md = /l/.match(s)
+  s.upcase!
+  assert_equal "l", md[0]
+  assert_equal "hello", md.string
+  assert_equal "he", md.pre_match
+  assert_equal "lo", md.post_match
+  assert_true md.string.frozen?
+
+  s2 = "hello"
+  s2 =~ /l/
+  s2.upcase!
+  assert_equal "l", $~[0]
+  assert_equal "hello", $~.string
+end
+
+assert("MatchData - match globals survive subject mutation in a gsub block") do
+  # Regression: the mrblib gsub loop republishes $&, $` and $' from the
+  # MatchData after the block runs, so a block that mutates the subject used
+  # to make them describe the mutated string.
+  t = "hello"
+  n = 0
+  t.gsub(/l/) { n += 1; t.upcase! if n == 2; "X" }
+  assert_equal "l", $&
+  assert_equal "hel", $`
+  assert_equal "o", $'
 end
 
 assert("MatchData#regexp") do
@@ -527,6 +686,151 @@ assert("MatchData#begin / #end - index out of matches") do
   md = /(a)|(b)/.match("a")
   assert_nil md.begin(2)
   assert_nil md.end(2)
+end
+
+assert("Regexp - quantifier on a multibyte literal") do
+  # The bytes of a multibyte literal used to be separate atoms, so a
+  # quantifier bound to the last one: /Ā+/ was \xC4(\x80)+ and stopped after
+  # one Ā. The byte counts below are what tells the two apart.
+  assert_equal 4, "ĀĀ".match(/Ā+/)[0].bytesize
+  assert_equal 4, "ĀĀ".match(/Ā*/)[0].bytesize
+  assert_equal 6, "ĀĀĀ".match(/Ā{2,3}/)[0].bytesize
+  assert_true "ĀĀ".match?(/Ā{2}/)
+  assert_false "Ā".match?(/Ā{2}/)
+  # Three and four byte characters take the same path.
+  assert_equal 6, "日日".match(/日+/)[0].bytesize
+  assert_equal 8, "𝕏𝕏".match(/𝕏+/)[0].bytesize
+  # A quantified literal after another atom, and a non-greedy one.
+  assert_equal 5, "aĀĀ".match(/aĀ+/)[0].bytesize
+  assert_equal 2, "ĀĀ".match(/Ā+?/)[0].bytesize
+  # Scanning must not split a run into one match per character.
+  assert_equal [4, 2], "ĀĀxĀ".scan(/Ā+/).map { |s| s.bytesize }
+  # An optional multibyte literal that is absent still matches empty.
+  assert_equal 0, "z".match(/Ā?/)[0].bytesize
+end
+
+assert("Regexp - quantifier on an escaped multibyte literal") do
+  # A backslash before a character with no escape meaning is just that
+  # character, so \Ā has to be one atom exactly like Ā. The escape path used
+  # to emit the lead byte alone and leave the continuation byte to the parse
+  # loop, so the quantifier bound to that byte instead.
+  # The /.../ spelling cannot show this, because the lexer drops the backslash
+  # before the gem sees the pattern: /\Ā/.source is the two bytes of Ā alone.
+  # A pattern built at runtime arrives through Regexp.new with the backslash
+  # still in it.
+  assert_equal 4, Regexp.new("\\Ā+").match("ĀĀ")[0].bytesize
+  assert_equal 6, Regexp.new("\\ĀĀĀ").match("ĀĀĀ")[0].bytesize
+  assert_true Regexp.new("\\Ā{2}").match?("ĀĀ")
+  assert_false Regexp.new("\\Ā{2}").match?("Ā")
+  assert_equal 6, Regexp.new("\\日+").match("日日")[0].bytesize
+  assert_equal 8, Regexp.new("\\𝕏+").match("𝕏𝕏")[0].bytesize
+  assert_equal 5, Regexp.new("a\\Ā+").match("aĀĀ")[0].bytesize
+  assert_equal 2, Regexp.new("\\Ā+?").match("ĀĀ")[0].bytesize
+  # Inside [...] the same escape has to read as one codepoint, or the class
+  # holds the lead byte and the continuation byte as two wrong members.
+  assert_true Regexp.new("[\\Ā]").match?("Ā")
+  assert_false Regexp.new("[\\Ā]").match?("Ä")
+  assert_true Regexp.new("[\\Ā-\\ā]").match?("ā")
+  assert_false Regexp.new("[\\Ā-\\ā]").match?("Ă")
+  # A raw byte escape names a byte rather than a character, so it keeps taking
+  # the parse_escape path and the quantifier binds to that one byte. CRuby
+  # joins byte escapes that spell a valid UTF-8 sequence into one character
+  # and matches four bytes here; closing that gap is a separate change.
+  assert_equal 2, Regexp.new("\\xC4\\x80+").match("ĀĀ")[0].bytesize
+end
+
+assert("Regexp - quantifier on an invalid multibyte literal") do
+  # A byte above 127 is one atom only while it starts a whole character. The
+  # sequences below never complete one, so each byte stands alone and the
+  # quantifier binds to the byte in front of it, not to the pair.
+  lead2 = "\xC4"  # starts a two byte character
+  lead3 = "\xE3"  # starts a three byte character
+  cont = "\x81"   # continuation byte
+
+  # "x" is not a continuation byte, so `+` repeats "x".
+  assert_equal 4, (lead2 + "xxx").match(Regexp.new(lead2 + "x+"))[0].bytesize
+  assert_equal 4, (lead3 + "abb").match(Regexp.new(lead3 + "ab+"))[0].bytesize
+  # The quantifier itself must not be taken for a continuation byte either.
+  assert_equal 2, (lead2 + lead2).match(Regexp.new(lead2 + "+"))[0].bytesize
+  # A sequence cut short by the end of the pattern emits its bytes one by one.
+  assert_equal 2, (lead3 + cont).match(Regexp.new(lead3 + cont))[0].bytesize
+  assert_equal 3, (lead3 + cont + cont).match(Regexp.new(lead3 + cont + "+"))[0].bytesize
+  # A valid character right after an invalid lead byte is still one atom.
+  assert_equal 5, (lead2 + "ĀĀ").match(Regexp.new(lead2 + "Ā+"))[0].bytesize
+  # The subject side reads the same way: `.` takes the lead byte alone.
+  assert_equal 1, (lead2 + "x").match(/./)[0].bytesize
+  assert_equal 2, "Ā".match(/./)[0].bytesize
+end
+
+assert("Regexp - a byte that belongs to no character is a match position") do
+  # A byte in 0x80-0xBF is the interior of a character only while a lead byte
+  # in front of it reaches that far. One that stands on its own is a boundary
+  # like any other, and the engines used to disagree about it: the literal
+  # fast path matched there, the NFA never started a match there.
+  b = "\x81"
+  assert_equal 0, (b + b).match(Regexp.new(b + b)).begin(0)
+  assert_equal 2, (b + b).match(Regexp.new(b + "+"))[0].bytesize
+  assert_equal 2, (b + b).match(Regexp.new(b + "*"))[0].bytesize
+  assert_equal 1, (b + b).match(Regexp.new(b + "?"))[0].bytesize
+  assert_equal 1, ("x" + b + b).match(Regexp.new(b + "+")).begin(0)
+  # Inside a character there is still no match position.
+  assert_nil "あ".match(Regexp.new("\x81"))
+  assert_nil "あ".match(Regexp.new("\x82"))
+  assert_nil "\u{1D54F}".match(Regexp.new("\x95"))
+  # Next to one there is.
+  assert_equal 0, (b + "あ").match(Regexp.new(b)).begin(0)
+  # Through pre_match, since #begin counts characters where the build has
+  # them and bytes where it does not.
+  assert_equal 3, ("あ" + b).match(Regexp.new(b)).pre_match.bytesize
+end
+
+assert("Regexp - an attempt in flight opens no match position inside a character") do
+  # "ĵ" is C4 B5 and "µ" is C2 B5, so the two share their trailing byte. That
+  # byte is the interior of "ĵ" and no match may start there, but the test
+  # for it only ran while nothing was in flight. The branch of `.?` that
+  # consumes the character parks a thread past it, and the attempt seeded at
+  # the shared byte then matched it on its own, cutting "ĵ" in half.
+  assert_nil "ĵ".match(/.?[µ]/)
+  assert_nil "ĵ".gsub(/.?[µ]/, "!").match(/!/)
+  assert_nil ("あ" + "ĵ").match(/.?[µ]/)
+  # A character the class does hold is still found through the same branch.
+  assert_equal 4, ("ĵ" + "µ").match(/.?[µ]/)[0].bytesize
+  assert_equal 5, ("あ" + "µ").match(/.?[µ]/)[0].bytesize
+  # And so is the byte itself where no lead byte reaches it.
+  assert_equal 2, ("x" + "\xb5").match(/.?[µ]/)[0].bytesize
+end
+
+assert("Regexp - a match does not end inside a character") do
+  # A pattern is compiled byte by byte and RE_CHAR consumes one byte, so a
+  # pattern holding a byte that reaches no character ends its match in the
+  # middle of one. "ĵ" is C4 B5, and a pattern of the single byte C4 used to
+  # match its lead byte alone and hand back half a character.
+  j = "ĵ"
+  assert_nil j.match(Regexp.new("\xc4"))          # literal fast path
+  assert_nil ("x" + j).match(Regexp.new("\xc4"))
+  assert_nil j.match(Regexp.new("\xc4+"))         # pike VM
+  assert_nil j.match(Regexp.new("(\xc4)\\1?"))    # backtracking engine
+  assert_equal j.bytes, j.gsub(Regexp.new("\xc4"), "!").bytes
+  # A branch that does end on a boundary still matches, greedy or not.
+  assert_equal 2, j.match(Regexp.new("\xc4."))[0].bytesize
+  assert_equal 2, j.match(Regexp.new("\xc4(?:\xb5)?"))[0].bytesize
+  assert_equal 2, j.match(Regexp.new("\xc4(?:\xb5)??"))[0].bytesize
+  assert_equal 2, j.match(Regexp.new("(\xc4\xb5)\\1?"))[0].bytesize
+  assert_equal 0, j.match(Regexp.new("\xc4*"))[0].bytesize
+  # A lookaround ends at a position without consuming it, so it is not the
+  # end of the match and keeps its own answer.
+  assert_equal 2, j.match(Regexp.new("(?=\xc4)\xc4\xb5"))[0].bytesize
+  # A byte no lead byte reaches is a boundary, so a byte pattern still works.
+  b = "\x81"
+  assert_equal 1, (b + b).match(Regexp.new(b))[0].bytesize
+  assert_equal 2, (b + b).match(Regexp.new(b + "+"))[0].bytesize
+  assert_equal 1, ("a" + b).match(Regexp.new(b))[0].bytesize
+  # Read as binary every position is a boundary, so nothing changes there.
+  if Object.const_defined?(:Encoding)
+    bin = j.dup.force_encoding("ASCII-8BIT")
+    assert_equal 1, bin.match(Regexp.new("\xc4"))[0].bytesize
+    assert_equal 2, bin.match(Regexp.new("\xc4."))[0].bytesize
+  end
 end
 
 assert("Regexp - multibyte (UTF-8) match extraction") do
@@ -601,13 +905,32 @@ end
 assert("Regexp#inspect") do
   re = Regexp.new("abc", Regexp::IGNORECASE)
   assert_equal "/abc/i", re.inspect
+  # several flags are written in the m, i, x order, whatever order they
+  # were given in
+  assert_equal "/abc/mi", Regexp.new("abc", Regexp::IGNORECASE | Regexp::MULTILINE).inspect
+  assert_equal "/abc/mix", Regexp.new("abc", Regexp::IGNORECASE | Regexp::MULTILINE | Regexp::EXTENDED).inspect
 end
 
 assert("Regexp#to_s") do
-  assert_equal "(?:abc)", Regexp.new("abc").to_s
-  assert_equal "(?i:abc)", Regexp.new("abc", Regexp::IGNORECASE).to_s
-  assert_equal "(?m:abc)", Regexp.new("abc", Regexp::MULTILINE).to_s
-  assert_equal "(?im:abc)", Regexp.new("abc", Regexp::IGNORECASE | Regexp::MULTILINE).to_s
+  assert_equal "(?-mix:abc)", Regexp.new("abc").to_s
+  assert_equal "(?i-mx:abc)", Regexp.new("abc", Regexp::IGNORECASE).to_s
+  assert_equal "(?m-ix:abc)", Regexp.new("abc", Regexp::MULTILINE).to_s
+  assert_equal "(?mi-x:abc)", Regexp.new("abc", Regexp::IGNORECASE | Regexp::MULTILINE).to_s
+  # the '-' run is dropped only when no flag is off
+  assert_equal "(?mix:abc)", Regexp.new("abc", Regexp::IGNORECASE | Regexp::MULTILINE | Regexp::EXTENDED).to_s
+
+  # the form recompiles, and the flags it names do not leak either way
+  assert_true Regexp.new(Regexp.new("abc", Regexp::IGNORECASE).to_s).match?("ABC")
+  assert_false Regexp.new(Regexp.new("abc").to_s + "d", Regexp::IGNORECASE).match?("ABCd")
+end
+
+assert("Regexp#to_s - interpolation") do
+  inner = Regexp.new("abc", Regexp::IGNORECASE)
+  # the inner Regexp keeps its own flags where the outer has none
+  assert_true(/#{inner}d/.match?("ABCd"))
+  assert_false(/#{inner}d/.match?("ABCD"))
+  # and does not pick up the outer ones
+  assert_false(/#{Regexp.new("abc")}d/i.match?("ABCd"))
 end
 
 assert("Regexp#== and Regexp#eql?") do
@@ -682,6 +1005,15 @@ assert("Regexp extended mode (x flag)") do
 
   assert_equal " 1 ", Regexp.new('[[:digit:] ]+', Regexp::EXTENDED).match(" 1 ")[0]
 
+  # a bracket the pattern truncates leaves the scan with nothing after the
+  # name, and the class is still the parser's error to report
+  assert_raise_with_message(RegexpError, "unterminated character class: /[[:alpha/") do
+    Regexp.new("[[:alpha", Regexp::EXTENDED)
+  end
+  assert_raise_with_message(RegexpError, "unterminated character class: /[[:alpha:/") do
+    Regexp.new("[[:alpha:", Regexp::EXTENDED)
+  end
+
   # a ']' written first in a class is a literal member, so the class is
   # still open after it
   re = Regexp.new('[] ]', Regexp::EXTENDED)
@@ -696,11 +1028,23 @@ assert("Regexp extended mode (x flag)") do
   re = Regexp.new('a\\ b', Regexp::EXTENDED)
   assert_true re.match?("a b")
 
+  # a comment group is removed ahead of the line-comment pass, so its ')'
+  # survives the '#' inside it
+  re = Regexp.new("a (?#note) b", Regexp::EXTENDED)
+  assert_true re.match?("ab")
+
+  re = Regexp.new("a (?#note) b # tail\nc", Regexp::EXTENDED)
+  assert_true re.match?("abc")
+
+  assert_raise_with_message(RegexpError, "unterminated comment group: /a (?#note/") do
+    Regexp.new("a (?#note", Regexp::EXTENDED)
+  end
+
   # inspect shows x flag
   assert_equal "/abc/x", Regexp.new("abc", Regexp::EXTENDED).inspect
 
   # to_s shows x flag
-  assert_equal "(?x:abc)", Regexp.new("abc", Regexp::EXTENDED).to_s
+  assert_equal "(?x-mi:abc)", Regexp.new("abc", Regexp::EXTENDED).to_s
 
   # errors quote the pattern as written, not the stripped text
   assert_raise_with_message(RegexpError, "unterminated character class: /a # c\n[/") do
@@ -947,6 +1291,164 @@ assert("String#gsub without a block returns an enumerator") do
   assert_equal "aBcB", "abcb".gsub(/b/).each { |m| m.upcase }
 end
 
+assert("String#sub! / #gsub! with a Regexp pattern") do
+  # The core definitions decide whether a substitution happened with
+  # `String#index`, which only takes a String, so every form below used to
+  # raise TypeError once the pattern reached it.
+  s = "hello world"
+  assert_equal "hell0 world", s.sub!(/o/, "0")
+  assert_equal "hell0 world", s
+  s = "hello world"
+  assert_equal "hell0 w0rld", s.gsub!(/o/, "0")
+  assert_equal "hell0 w0rld", s
+
+  s = "hello"
+  assert_equal "heLlo", s.sub!(/l/) { |m| m.upcase }
+  s = "hello"
+  assert_equal "heLLo", s.gsub!(/l/) { |m| m.upcase }
+
+  s = "John Smith"
+  assert_equal "Smith John", s.sub!(/(\w+) (\w+)/, '\2 \1')
+  s = "a1b2"
+  assert_equal "1a2b", s.gsub!(/([a-z])(\d)/, '\2\1')
+
+  # The receiver itself comes back, not a copy of it.
+  s = "abc"
+  assert_same s, s.sub!(/b/, "X")
+  s = "abcb"
+  assert_same s, s.gsub!(/b/, "X")
+
+  # A replacement argument wins over the block, as in `sub`/`gsub`.
+  assert_equal "aYc", "abc".sub!(/b/, "Y") { "X" }
+  assert_equal "aYcY", "abcb".gsub!(/b/, "Y") { "X" }
+end
+
+assert("String#sub! / #gsub! return nil only when nothing matched") do
+  s = "abc"
+  assert_nil s.sub!(/z/, "X")
+  assert_nil s.gsub!(/z/, "X")
+  assert_nil s.sub!("z", "X")
+  assert_nil s.gsub!("z", "X")
+  assert_equal "abc", s
+  # The block is not called for a pattern that does not match.
+  assert_nil "abc".sub!(/z/) { flunk "block called" }
+
+  # A match is a match even where the replacement leaves the string as it was,
+  # so the answer cannot come from comparing the result with the receiver.
+  s = "aaa"
+  assert_same s, s.sub!(/a/, "a")
+  assert_same s, s.gsub!(/a/, "a")
+  assert_equal "aaa", s
+end
+
+assert("String#sub! / #gsub! quote a String pattern") do
+  # A String is a literal here, as it is for `sub`/`gsub`: `.` matches only `.`.
+  s = "a.c.e"
+  assert_equal "aXc.e", s.sub!(".", "X")
+  s = "a.c.e"
+  assert_equal "aXcXe", s.gsub!(".", "X")
+
+  # Anything that is neither a Regexp nor a String is rejected, rather than
+  # reaching a match with the operands reversed.
+  [["nil", nil], ["true", true], ["Symbol", :b], ["Integer", 1]].each do |name, pat|
+    message = "wrong argument type #{name} (expected Regexp)"
+    assert_raise_with_message(TypeError, message) { "abc".sub!(pat, "X") }
+    assert_raise_with_message(TypeError, message) { "abc".gsub!(pat, "X") }
+    assert_raise_with_message(TypeError, message) { "abc".sub!(pat) { "X" } }
+    assert_raise_with_message(TypeError, message) { "abc".gsub!(pat) { "X" } }
+  end
+end
+
+assert("String#sub! / #gsub! - wrong number of arguments") do
+  assert_raise_with_message(ArgumentError, "wrong number of arguments (given 0, expected 2)") do
+    "abc".sub!
+  end
+  assert_raise_with_message(ArgumentError, "wrong number of arguments (given 1, expected 2)") do
+    "abc".sub!(/b/)
+  end
+  assert_raise_with_message(ArgumentError, "wrong number of arguments (given 3, expected 2)") do
+    "abc".sub!(/b/, "X", "Y")
+  end
+  assert_raise_with_message(ArgumentError, "wrong number of arguments (given 3, expected 1..2)") do
+    "abc".sub!(/b/, "X", "Y") { "Z" }
+  end
+  assert_raise_with_message(ArgumentError, "wrong number of arguments (given 0, expected 1..2)") do
+    "abc".gsub!
+  end
+  assert_raise_with_message(ArgumentError, "wrong number of arguments (given 3, expected 1..2)") do
+    "abc".gsub!(/b/, "X", "Y")
+  end
+end
+
+assert("String#gsub! without a block returns an enumerator") do
+  skip "Enumerator is not available" unless Object.const_defined?(:Enumerator)
+  assert_equal Enumerator, "abc".gsub!(/a/).class
+  # Iterating it performs the substitution on the original receiver.
+  s = "abcb"
+  assert_equal "aBcB", s.gsub!(/b/).each { |m| m.upcase }
+  assert_equal "aBcB", s
+  # As with `gsub`, the pattern is examined on the first iteration, not at the
+  # call.
+  enum = "abc".gsub!(:b)
+  assert_raise_with_message(TypeError, "wrong argument type Symbol (expected Regexp)") do
+    enum.each { "X" }
+  end
+end
+
+assert("String#sub! / #gsub! on a frozen string") do
+  message = "can't modify frozen String"
+  assert_raise_with_message(FrozenError, message) { "abc".freeze.sub!(/a/, "X") }
+  assert_raise_with_message(FrozenError, message) { "abc".freeze.gsub!(/a/, "X") }
+  # Before the no-match check: the receiver is rejected whether or not a
+  # substitution would have taken place.
+  assert_raise_with_message(FrozenError, message) { "abc".freeze.sub!(/z/, "X") }
+  assert_raise_with_message(FrozenError, message) { "abc".freeze.gsub!(/z/, "X") }
+  # And before the enumerator, which CRuby does not hand back here either.
+  assert_raise_with_message(FrozenError, message) { "abc".freeze.gsub!(/a/) }
+
+  # `sub!` reads its arguments first, though, as CRuby does.
+  assert_raise_with_message(ArgumentError, "wrong number of arguments (given 1, expected 2)") do
+    "abc".freeze.sub!(/z/)
+  end
+  assert_raise_with_message(TypeError, "wrong argument type Symbol (expected Regexp)") do
+    "abc".freeze.sub!(:z, "X")
+  end
+end
+
+assert("String#sub! / #gsub! leave the match behind") do
+  $~ = nil
+  s = "hello world"
+  s.sub!(/o/, "0")
+  assert_equal "o", $~[0]
+  # The subject is the string as it was matched, not the replaced one: a
+  # MatchData snapshots it, so overwriting the receiver afterwards is safe.
+  assert_equal "hello world", $~.string
+  assert_equal "hell", $~.pre_match
+  assert_equal " world", $~.post_match
+
+  # `gsub!` leaves the last match, as `gsub` does.
+  $~ = nil
+  s = "hello world"
+  s.gsub!(/o/, "0")
+  assert_equal "hello world", $~.string
+  assert_equal "hello w", $~.pre_match
+
+  $~ = nil
+  s = "hello"
+  s.gsub!(/l/) { "X" }
+  assert_equal "hello", $~.string
+  assert_equal "hel", $~.pre_match
+
+  # Matching nothing clears it, which is why the check is `match` and not
+  # `match?`.
+  /b(c)/ =~ "abcd"
+  assert_nil "hello".sub!(/z/, "X")
+  assert_nil $~
+  /b(c)/ =~ "abcd"
+  assert_nil "hello".gsub!(/z/, "X")
+  assert_nil $~
+end
+
 assert("String#sub / #gsub / #scan / #split with a non-Regexp pattern raise TypeError") do
   # The same check `match` uses, so the naming matches: nil, true and false by
   # value, everything else by class.
@@ -1127,6 +1629,59 @@ assert("Regexp - non-capturing group") do
   assert_equal "ab", md[0]
   assert_equal "b", md[1]
   assert_nil md[2]
+end
+
+assert("Regexp - a named group makes plain groups non-capturing") do
+  # Onigmo's ONIG_OPTION_DONT_CAPTURE_GROUP, which CRuby turns on once the
+  # pattern declares a named group: (...) then groups without capturing.
+  md = /(?<a>a)(b)/.match("ab")
+  assert_equal 2, md.size
+  assert_equal ["ab", "a"], md.to_a
+  assert_equal ["a"], md.captures
+  assert_nil md[2]
+  assert_raise_with_message(IndexError, "index 2 out of matches") { md.begin(2) }
+  assert_equal "a", md[:a]
+
+  # a plain group written before the named group is demoted just the same,
+  # which is what the pre-scan buys: the parser reaches it before it has seen
+  # the declaration that decides the question
+  md = /(a)(?<b>b)/.match("ab")
+  assert_equal 2, md.size
+  assert_equal ["ab", "b"], md.to_a
+  assert_equal ["b"], md.captures
+  assert_equal "b", md[1]
+  assert_equal "b", md[:b]
+
+  # the shrunken count is what $2, $+ and a \2 in a replacement read
+  "ab" =~ /(?<a>a)(b)/
+  assert_nil $2
+  assert_equal "a", $+
+  assert_equal "[]", "ab".sub(/(?<a>a)(b)/, '[\2]')
+
+  # (?<= and (?<! open a lookbehind, not a named group, so they demote nothing
+  assert_equal ["b", "b"], /(?<=a)(b)/.match("ab").to_a
+  assert_equal ["b", "b"], /(?<!x)(b)/.match("ab").to_a
+  # nor does a "(?<" that is escaped or sits inside a character class
+  assert_equal ["(<a>b", "b"], /\(?<a>(b)/.match("(<a>b").to_a
+  assert_equal ["(?<b", "b"], /[(?<a>]+(b)/.match("(?<b").to_a
+  assert_equal ["a(?<b", "b"], /[[:alpha:](?<]+(b)/.match("a(?<b").to_a
+  # nor one inside a (?#...) comment group, which is gone before the scan runs
+  assert_equal ["b", "b"], /(?# (?<a>x )(b)/.match("b").to_a
+
+  # in /x mode the scan reads the pattern after free-spacing and comments go
+  assert_equal ["xy", "x"], /(?<a>x) # (b)
+                             (y)/x.match("xy").to_a
+  assert_equal ["y", "y"], /# (?<a>x)
+                            (y)/x.match("y").to_a
+
+  # a truncated "(?<" is still the parser's error, not a silent named group
+  assert_raise(RegexpError) { Regexp.new("(?<") }
+
+  # the scan runs on every pattern, so a truncated POSIX bracket reaches
+  # skip_posix_bracket() without /x too, and is still the parser's error
+  assert_raise_with_message(RegexpError, "unterminated character class: /[[:alpha/") do
+    Regexp.new("[[:alpha")
+  end
 end
 
 assert("String#sub with block") do
@@ -1455,6 +2010,20 @@ assert("Regexp - named backreference \\k") do
   assert_nil "ab".match(/(?<n>a)\k<n>/i)
   # an unknown name is an error
   assert_raise(RegexpError) { Regexp.new("\\k<missing>") }
+
+  # once the pattern has a named group a numbered backreference is rejected,
+  # whatever its spelling, because there is no longer a number to reach
+  msg = "numbered backref/call is not allowed. (use name)"
+  assert_raise_with_message(RegexpError, "#{msg}: /(a)(?<b>b)\\1/") do
+    Regexp.new("(a)(?<b>b)\\1")
+  end
+  assert_raise_with_message(RegexpError, "#{msg}: /(a)(?<b>b)\\k<1>/") do
+    Regexp.new("(a)(?<b>b)\\k<1>")
+  end
+  assert_raise_with_message(RegexpError, "#{msg}: /(a)(?<b>b)\\k<-1>/") do
+    Regexp.new("(a)(?<b>b)\\k<-1>")
+  end
+  assert_raise(RegexpError) { Regexp.new("(?<b>b)\\k'1'") }
 end
 
 assert("Regexp - numeric \\k backreference out of int range") do
@@ -1545,6 +2114,37 @@ assert("Regexp - negative lookbehind at string start") do
   # negative lookbehind succeeds when not enough text before
   md = Regexp.new("(?<!x)a").match("a")
   assert_equal "a", md[0]
+end
+
+assert("Regexp - lookbehind rejects a class that can match a multibyte character") do
+  # A class holding non-ASCII members consumes one byte here and two there,
+  # so no single rewind width is right. Refusing the pattern beats rewinding
+  # into the middle of a character, where a positive lookbehind reports no
+  # match and a negative one reports a match.
+  assert_raise(RegexpError) { Regexp.new("(?<=[Ā])x") }
+  assert_raise(RegexpError) { Regexp.new("(?<![Ā])b") }
+  assert_raise(RegexpError) { Regexp.new("(?<=[Ā-ă])x") }
+  assert_raise(RegexpError) { Regexp.new("(?<=[aĀ])x") }
+  assert_raise(RegexpError) { Regexp.new("(?<=[Ā]{2})x") }
+  # a negated class always admits non-ASCII, whatever its members are
+  assert_raise(RegexpError) { Regexp.new("(?<=[^あ])x") }
+  assert_raise(RegexpError) { Regexp.new("(?<![^a])b") }
+  # the uppercase shorthands carry the same catch-all
+  assert_raise(RegexpError) { Regexp.new("(?<=a\\W)x") }
+  assert_raise(RegexpError) { Regexp.new("(?<=\\W\\W)x") }
+  assert_raise(RegexpError) { Regexp.new("(?<=\\D)x") }
+  assert_raise(RegexpError) { Regexp.new("(?<=\\S)x") }
+end
+
+assert("Regexp - lookbehind measures an ASCII-only class") do
+  assert_equal "x", "ax".match(/(?<=[a-z])x/)[0]
+  assert_nil "1x".match(/(?<=[a-z])x/)
+  assert_equal "x", "1x".match(/(?<=\d)x/)[0]
+  assert_equal "x", " x".match(/(?<=\s)x/)[0]
+  # a multibyte literal compiles to a run of one-byte instructions, so it
+  # keeps its exact width and must keep measuring
+  assert_equal "x", "Āx".match(/(?<=Ā)x/)[0]
+  assert_nil "bx".match(/(?<=Ā)x/)
 end
 
 assert("$1-$9 global variables") do
@@ -1711,6 +2311,60 @@ assert("Regexp - truncated UTF-8 at subject end") do
   assert_equal 0, ("ab\xf0" =~ /[^cd]+$/)
 end
 
+assert("Regexp - overlong UTF-8 is not the character it spells") do
+  # C0 BC is the two-byte overlong spelling of "<" and E0 84 80 the three-byte
+  # spelling of "Ā". A class compares the decoded codepoint and a literal
+  # compares bytes, so a decoder that hands out a codepoint for these makes the
+  # two disagree about the same subject: assert them together.
+  assert_nil ("\xC0\xBC" =~ /[<]/)
+  assert_nil ("\xC0\xBC" =~ /</)
+  assert_equal 0, ("\xC0\xBC" =~ /[^<]/)
+  assert_equal "\xC0\xBC", "\xC0\xBC".gsub(/[<]/, "&lt;")
+  assert_nil ("\xE0\x80\xBC" =~ /[<]/)
+  assert_false Regexp.new("[Ā]").match?("\xE0\x84\x80")
+  assert_false (/Ā/.match?("\xE0\x84\x80"))
+  # the pattern side decodes through the same helper
+  assert_false Regexp.new("[\xC0\xBC]").match?("<")
+  # surrogates and codepoints above U+10FFFF encode no character either, so
+  # each byte stands on its own
+  assert_equal 2, "\xC0\xBC".scan(/./).size
+  assert_equal 3, "\xED\xA0\x80".scan(/./).size
+  assert_equal 4, "\xF0\x80\x80\xBC".scan(/./).size
+  assert_equal 4, "\xF4\x90\x80\x80".scan(/./).size
+  assert_equal 4, "\xF5\x80\x80\x80".scan(/./).size
+  # the shortest spelling on each side of those bounds is still one character
+  assert_equal 1, "\u{0080}".scan(/./).size    # C2 80
+  assert_equal 1, "\u{0800}".scan(/./).size    # E0 A0 80
+  assert_equal 1, "\u{D7FF}".scan(/./).size    # ED 9F BF
+  assert_equal 1, "\u{E000}".scan(/./).size    # EE 80 80
+  assert_equal 1, "\u{10000}".scan(/./).size   # F0 90 80 80
+  assert_equal 1, "\u{10FFFF}".scan(/./).size  # F4 8F BF BF
+  assert_equal 0, ("\u{0800}" =~ Regexp.new("[\u{0800}]"))
+  assert_equal 0, ("\u{10FFFF}" =~ Regexp.new("[\u{10FFFF}]"))
+end
+
+assert("Regexp - pattern too large for its jump targets is refused") do
+  # Jump targets live in a 16-bit field, so a program that outgrows the field
+  # used to wrap them and jump to an unrelated instruction: the pattern then
+  # quietly stopped matching text it describes instead of reporting anything.
+  # Each (?:abc) unit costs three instructions and the bound is on the whole
+  # program, so the two counts below sit either side of it.
+  assert_kind_of Regexp, Regexp.new("(?:abc){21844}")
+  assert_raise_with_message(RegexpError, "regexp too large: /(?:abc){21845}/") do
+    Regexp.new("(?:abc){21845}")
+  end
+
+  # the shapes that used to answer wrongly rather than raise: a quantifier
+  # whose skip target is patched past the bound, and an alternation whose
+  # branch and exit targets both wrap
+  assert_raise(RegexpError) { Regexp.new("(?:abc){21844}x*y") }
+  assert_raise(RegexpError) { Regexp.new("(?:abc){30000}(?:y|z)") }
+
+  # a quantifier the parser still accepts reaches the bound on its own once
+  # the repeated atom costs more than one instruction
+  assert_raise(RegexpError) { Regexp.new("(?:ab){32768}") }
+end
+
 assert("Regexp - large non-ASCII character class does not overflow") do
   # a class listing tens of thousands of non-ASCII codepoints used to
   # overflow the 16-bit range capacity (32768 * 2 wrapped to 0, feeding a
@@ -1737,4 +2391,305 @@ assert("Regexp - large non-ASCII character class does not overflow") do
   assert_equal 0, (re =~ utf8.call(0x8080))
   assert_nil (re =~ utf8.call(0x8081))
   assert_nil (re =~ "A")
+end
+
+assert("String#[] with regexp") do
+  assert_equal "ll", "hello"[/l+/]
+  assert_equal "ll", "hello".slice(/l+/)
+  assert_nil "hello"[/z/]
+  assert_nil "hello".slice(/z/)
+  assert_equal "", "hello"[//]
+
+  # the result is a plain String even for a subclass receiver, as in CRuby
+  sub = Class.new(String)
+  assert_equal String, sub.new("hello")[/l+/].class
+end
+
+assert("String#[] with regexp and capture") do
+  assert_equal "llo", "hello"[/(l+)(o)/, 0]
+  assert_equal "ll", "hello"[/(l+)(o)/, 1]
+  assert_equal "o", "hello"[/(l+)(o)/, 2]
+  assert_equal "ll", "hello"[/(?<x>l+)/, :x]
+  assert_equal "ll", "hello"[/(?<x>l+)/, "x"]
+  assert_equal "ll", "hello".slice(/(l+)/, 1)
+
+  # a group that did not take part in the match answers nil
+  assert_nil "hello"[/(z)?(l+)/, 1]
+
+  # handed to MatchData#[] as it stands: a negative index counts back from
+  # the last group, an index past the last group is nil, and a name that
+  # resolves to no group is a mistake at the point of the call
+  assert_equal "o", "hello"[/(l+)(o)/, -1]
+  assert_nil "hello"[/(l+)/, 5]
+  assert_raise(IndexError) { "hello"[/(?<x>l+)/, :zz] }
+  assert_raise(IndexError) { "hello"[/(l+)/, "x"] }
+  assert_raise(TypeError) { "hello"[/(l+)/, nil] }
+
+  # a failed match answers nil without ever looking at the capture argument
+  assert_nil "hello"[/(z)/, 1]
+  assert_nil "hello"[/(?<x>z)/, :zz]
+end
+
+assert("String#[] with regexp sets the match globals") do
+  assert_equal "ll", "hello"[/l+/]
+  assert_equal "ll", $~[0]
+  assert_equal "ll", Regexp.last_match(0)
+
+  "hello"[/(l)(l)/, 2]
+  assert_equal "l", $1
+
+  # a failed match clears $~, which is why this goes through `match` rather
+  # than `match?`
+  assert_nil "hello"[/z/]
+  assert_nil $~
+end
+
+assert("String#[] delegates every non-regexp argument") do
+  assert_equal "e", "hello"[1]
+  assert_equal "e", "hello".slice(1)
+  assert_equal "ell", "hello"[1, 3]
+  assert_equal "ell", "hello".slice(1, 3)
+  assert_equal "ell", "hello"[1..3]
+  assert_equal "llo", "hello"[-3..-1]
+  assert_equal "ll", "hello"["ll"]
+  assert_nil "hello"["bye"]
+  assert_nil "hello"[12]
+  assert_nil "hello"[12, 1]
+
+  # the same delegation on a subclass receiver, which the inline index
+  # opcodes never answer and which therefore always arrives here
+  sub = Class.new(String)
+  assert_equal "e", sub.new("hello")[1]
+  assert_equal "ell", sub.new("hello")[1..3]
+  assert_equal "ll", sub.new("hello")["ll"]
+
+  # the arity and type errors are the ones the C method raises
+  assert_raise(ArgumentError) { "hello"[] }
+  assert_raise(ArgumentError) { "hello"[1, 2, 3] }
+  assert_raise(ArgumentError) { "hello".slice(1, 2, 3) }
+  assert_raise(ArgumentError) { "hello"[/l/, 1, 2] }
+  assert_raise(TypeError) { "hello"[nil] }
+end
+
+assert("String#[] reads the real type of its argument") do
+  # `is_a?` is redefinable, so a Regexp denying its own type must still be
+  # matched against, and an object claiming to be one must not be
+  re = /l+/
+  def re.is_a?(klass); false; end
+  assert_equal "ll", "hello"[re]
+
+  fake = Object.new
+  def fake.is_a?(klass); true; end
+  def fake.match(str); raise "must not be called"; end
+  assert_raise(TypeError) { "hello"[fake] }
+end
+
+assert("String#[]= with regexp") do
+  s = "hello"
+  assert_equal "X", (s[/l+/] = "X")
+  assert_equal "heXo", s
+
+  # a multibyte subject: `MatchData#begin` and `#end` report character
+  # offsets, which is the space the two-integer form of `[]=` works in
+  s = "あいlluえお"
+  s[/l+/] = "X"
+  assert_equal "あいXuえお", s
+
+  # an empty match replaces an empty span
+  s = "hello"
+  s[/x*/] = "X"
+  assert_equal "Xhello", s
+
+  # a pattern that does not match is an error, unlike the read side's nil
+  s = "hello"
+  assert_raise(IndexError) { s[/z/] = "X" }
+  assert_equal "hello", s
+end
+
+assert("String#[]= with regexp and capture") do
+  s = "hello"
+  s[/(l+)(o)/, 1] = "X"
+  assert_equal "heXo", s
+
+  s = "hello"
+  s[/(l+)(o)/, 0] = "X"
+  assert_equal "heX", s
+
+  # a negative index counts back from the last group, and is rejected once
+  # it reaches group 0, so the whole match is out of its reach
+  s = "hello"
+  s[/(l+)(o)/, -1] = "X"
+  assert_equal "hellX", s
+  assert_raise(IndexError) { "hello"[/l+/, -1] = "X" }
+
+  s = "hello"
+  s[/(?<x>l+)/, :x] = "Y"
+  assert_equal "heYo", s
+
+  s = "あいlluえお"
+  s[/(?<x>l+)/, "x"] = "Y"
+  assert_equal "あいYuえお", s
+
+  # an index that reaches no group is an error here, where the read side
+  # answers nil
+  assert_raise(IndexError) { "hello"[/(l+)/, 5] = "X" }
+  # so is a group that exists but did not take part in the match
+  assert_raise(IndexError) { "hello"[/(h)|(z)/, 2] = "X" }
+  # and so is a name that resolves to no group
+  assert_raise(IndexError) { "hello"[/(?<x>l+)/, :zz] = "X" }
+  assert_raise(IndexError) { "hello"[/(l+)/, "x"] = "X" }
+  assert_raise(TypeError) { "hello"[/(l+)/, nil] = "X" }
+end
+
+assert("String#[]= with regexp sets the match globals") do
+  s = "hello"
+  s[/l+/] = "X"
+  assert_equal "ll", $~[0]
+  # the MatchData describes the subject as it was before the replacement
+  assert_equal "hello", $~.string
+
+  s = "hello"
+  s[/(l)(l)/, 2] = "X"
+  assert_equal "l", $1
+
+  # a failed match clears $~ before the IndexError, which is why this goes
+  # through `match` rather than `match?`
+  assert_raise(IndexError) { "hello"[/z/] = "X" }
+  assert_nil $~
+end
+
+assert("String#[]= with regexp searches before it checks the receiver") do
+  # CRuby modifies last, so a frozen receiver raises only once the search
+  # has left its match behind, and a pattern that does not match raises
+  # IndexError rather than FrozenError
+  $~ = nil
+  assert_raise(FrozenError) { "hello".freeze[/l+/] = "X" }
+  assert_equal "ll", $~[0]
+
+  $~ = nil
+  assert_raise(IndexError) { "hello".freeze[/z/] = "X" }
+  assert_nil $~
+end
+
+assert("String#[]= delegates every non-regexp argument") do
+  s = "hello"
+  s[0] = "H"
+  assert_equal "Hello", s
+  s[1, 3] = "X"
+  assert_equal "HXo", s
+  s = "hello"
+  s[1..3] = "X"
+  assert_equal "hXo", s
+  s = "hello"
+  s["ll"] = "X"
+  assert_equal "heXo", s
+
+  # the errors are the ones the C method raises, and the replacement reaches
+  # its type check unconverted.  Only the regexp form's arity is the
+  # override's to report: the core reads its arguments in order, so a
+  # four-argument call is rejected for the replacement's type before the
+  # count is ever looked at.
+  assert_raise(ArgumentError) { "hello"[/l/, 1, 2] = "X" }
+  assert_raise(TypeError) { "hello"[1, 2, 3] = "X" }
+  assert_raise(IndexError) { "hello"["bye"] = "X" }
+  assert_raise(TypeError) { "hello"[nil] = "X" }
+  assert_raise(TypeError) { "hello"[/l/] = :sym }
+
+  # `is_a?` is redefinable, so the real type is what decides
+  re = /l+/
+  def re.is_a?(klass); false; end
+  s = "hello"
+  s[re] = "X"
+  assert_equal "heXo", s
+end
+
+assert("String#slice! with regexp") do
+  s = "hello"
+  assert_equal "ll", s.slice!(/l+/)
+  assert_equal "heo", s
+
+  s = "あいlluえお"
+  assert_equal "ll", s.slice!(/l+/)
+  assert_equal "あいuえお", s
+
+  # a pattern that does not match removes nothing and answers nil
+  s = "hello"
+  assert_nil s.slice!(/z/)
+  assert_equal "hello", s
+
+  # an empty match removes nothing but is still a match
+  s = "hello"
+  assert_equal "", s.slice!(/x*/)
+  assert_equal "hello", s
+
+  # a plain String even for a subclass receiver, as in CRuby
+  sub = Class.new(String)
+  assert_equal String, sub.new("hello").slice!(/l+/).class
+end
+
+assert("String#slice! with regexp and capture") do
+  s = "hello"
+  assert_equal "l", s.slice!(/(l)(o)/, 1)
+  assert_equal "helo", s
+  # the MatchData left behind describes the whole match, not the capture
+  assert_equal "lo", $~[0]
+
+  s = "hello"
+  assert_equal "o", s.slice!(/(l+)(o)/, -1)
+  assert_equal "hell", s
+
+  s = "hello"
+  assert_equal "ll", s.slice!(/(?<x>l+)/, :x)
+  assert_equal "heo", s
+
+  # where `[]=` raises, an index that reaches no group answers nil here,
+  # group 0 included once the index is negative
+  s = "hello"
+  assert_nil s.slice!(/(l+)/, 5)
+  assert_nil s.slice!(/l+/, -1)
+  assert_equal "hello", s
+
+  # a group that exists but did not take part in the match answers "" and
+  # removes nothing, as in CRuby
+  s = "hello"
+  assert_equal "", s.slice!(/(h)|(z)/, 2)
+  assert_equal "hello", s
+
+  # only a name that resolves to no group raises, as it does for `[]=`
+  assert_raise(IndexError) { "hello".slice!(/(?<x>l+)/, :zz) }
+  assert_raise(IndexError) { "hello".slice!(/(l+)/, "x") }
+  assert_raise(TypeError) { "hello".slice!(/(l+)/, nil) }
+end
+
+assert("String#slice! with regexp checks the receiver before it searches") do
+  # the opposite order from `[]=`, and CRuby draws the same distinction: the
+  # check comes first, so a pattern that would not have matched still raises
+  # and $~ is left alone
+  $~ = nil
+  assert_raise(FrozenError) { "hello".freeze.slice!(/l+/) }
+  assert_nil $~
+  assert_raise(FrozenError) { "hello".freeze.slice!(/z/) }
+  assert_nil $~
+end
+
+assert("String#slice! delegates every non-regexp argument") do
+  s = "hello"
+  assert_equal "e", s.slice!(1)
+  assert_equal "hllo", s
+  s = "hello"
+  assert_equal "ell", s.slice!(1, 3)
+  assert_equal "ho", s
+  s = "hello"
+  assert_equal "ell", s.slice!(1..3)
+  assert_equal "ho", s
+  s = "hello"
+  assert_equal "ll", s.slice!("ll")
+  assert_equal "heo", s
+  assert_nil "hello".slice!("bye")
+
+  assert_raise(ArgumentError) { "hello".slice! }
+  assert_raise(ArgumentError) { "hello".slice!(1, 2, 3) }
+  assert_raise(ArgumentError) { "hello".slice!(/l/, 1, 2) }
+  assert_raise(TypeError) { "hello".slice!(nil) }
+  assert_raise(FrozenError) { "hello".freeze.slice!(0) }
 end

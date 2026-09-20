@@ -53,19 +53,40 @@ class_match(const re_charclass *cc, uint32_t cp)
   return cc->utf8_any;
 }
 
-/* Compare two byte spans ignoring ASCII case. Folding stops at ASCII, like
-   every other ignorecase decision in this engine (see compile_atom()'s /i
-   handling, which only folds A-Z and a-z into a class bitmap). */
-static mrb_bool
-memcmp_ci(const char *a, const char *b, int len)
+/* Compare two spans ignoring case. Returns how many bytes of `a` were
+   consumed, or -1 when they differ. The count is not always the length of
+   `b`: with Unicode folding a counterpart can be a different width (U+212A
+   folds to 'k'), so the two spans can match while holding different numbers
+   of bytes. */
+static int
+memcmp_ci(const char *a, const char *a_end, const char *b, const char *b_end,
+          mrb_bool binary)
 {
+#ifdef MRB_REGEXP_UNICODE_CASE
+  const char *a0 = a;
+  while (b < b_end) {
+    if (a >= a_end) return -1;
+    int alen = 0, blen = 0;
+    uint32_t ca = mrb_re_decode_char(a, a_end, &alen, binary);
+    uint32_t cb = mrb_re_decode_char(b, b_end, &blen, binary);
+    if (mrb_re_case_fold(ca) != mrb_re_case_fold(cb)) return -1;
+    a += mrb_re_charlen(a, a_end, binary);
+    b += mrb_re_charlen(b, b_end, binary);
+  }
+  return (int)(a - a0);
+#else
+  /* Folding stops at ASCII, so the two spans always hold the same bytes. */
+  (void)binary;
+  int len = (int)(b_end - b);
+  if (a + len > a_end) return -1;
   for (int i = 0; i < len; i++) {
     uint8_t ca = (uint8_t)a[i], cb = (uint8_t)b[i];
     if (ca >= 'A' && ca <= 'Z') ca += 32;
     if (cb >= 'A' && cb <= 'Z') cb += 32;
-    if (ca != cb) return FALSE;
+    if (ca != cb) return -1;
   }
-  return TRUE;
+  return len;
+#endif
 }
 
 /*
@@ -94,7 +115,9 @@ typedef struct {
   int pool_next;          /* next free slot */
   int pool_capa;          /* total slots allocated */
   uint32_t *visited;      /* generation-based */
-  uint32_t gen;
+  uint32_t gen;           /* visited key this step's first epsilon pass uses */
+  uint32_t key_max;       /* highest key a further pass may reach this step */
+  uint32_t pass_span;     /* keys one step reserves: key_max - gen + 1 */
   const char *str;
   const char *str_end;
   mrb_bool matched;
@@ -129,21 +152,71 @@ pool_copy(pike_state *s, int src_slot)
 
 #define CAP(s, slot) (&(s)->cap_pool[(slot) * (s)->ncap])
 
-/* Add thread following epsilon transitions.
-   visited[pc] == gen means already visited this step. */
+/* TRUE once this step's closure has walked the loop head at pc, which means
+   the body just ran without consuming: an empty iteration. */
+static mrb_bool
+loop_head_seen(pike_state *s, uint32_t pc)
+{
+  return s->visited[pc] >= s->gen;
+}
+
+/* A fork also closes e+: the body is laid out before it, so its jump target
+   is the body start and pc+1 is the loop's exit. Returns the key the jump
+   target's branch walks under, or RE_LOOP_STOP when the body matched empty
+   and the repetition therefore has to stop. An ordinary fork, or one closing
+   a loop whose body always consumes (`a` is 0, see mark_empty_loops()), has
+   no empty iteration to account for and keeps the current key. */
+#define RE_LOOP_STOP UINT32_MAX
+
+static uint32_t
+re_loop_back(pike_state *s, re_inst inst, uint32_t pc, uint32_t key)
+{
+  if (inst.offset > pc || !inst.a) return key;
+  if (loop_head_seen(s, inst.offset)) return RE_LOOP_STOP;
+  return key < s->key_max ? key + 1 : key;
+}
+
+/* Add thread following epsilon transitions. `key` is s->gen for the first
+   pass over this step's closure and one higher per further pass, and
+   visited[pc] holds the key of the pass that last walked pc: a later pass may
+   re-walk what an earlier one marked, and no key is ever reused by a later
+   step. */
 static void
 add_thread(pike_state *s, re_threadlist *list,
-           uint32_t pc, int cap_slot, const char *sp)
+           uint32_t pc, int cap_slot, const char *sp, uint32_t key)
 {
   for (;;) {
     if (s->cut) return;
     if (pc >= s->pat->code_len) return;
-    if (s->visited[pc] == s->gen) return;
-    s->visited[pc] = s->gen;
+    if (s->visited[pc] >= key) return;
+    s->visited[pc] = key;
 
     re_inst inst = s->pat->code[pc];
     switch (inst.op) {
     case RE_JMP:
+      /* A backward jump closes a repetition (e*, e{n,}): it returns to the
+         RE_SPLIT/RE_SPLITNG head, whose offset is the loop's exit. `a` is set
+         only when that body can run empty (see mark_empty_loops()), which is
+         the only case with a final empty iteration to account for. */
+      if (inst.offset <= pc && inst.a) {
+        uint32_t head = inst.offset;
+        if (loop_head_seen(s, head)) {
+          /* The head was walked at this position, so the iteration that just
+             finished consumed nothing. Onigmo stops a repetition on an empty
+             iteration and keeps what that iteration captured, so leave the
+             loop from here rather than dying on the head's mark: this path
+             outranks the exit the head itself queued before the body ran, and
+             claims the exit pc first. */
+          pc = s->pat->code[head].offset;
+          continue;
+        }
+        /* The head is unmarked, so this closure resumed inside the body and
+           the iteration it just finished is a real one. Run the next
+           iteration in a fresh pass, past the marks the resumed tail left. */
+        if (key < s->key_max) key++;
+        pc = head;
+        continue;
+      }
       pc = inst.offset;
       continue;
 
@@ -155,19 +228,24 @@ add_thread(pike_state *s, re_threadlist *list,
          pc+1's closure can mutate the shared slot; the jump branch then runs
          on that snapshot. */
       {
+        uint32_t back = re_loop_back(s, inst, pc, key);
+        if (back == RE_LOOP_STOP) { pc++; continue; }
         int cp = s->match_only ? 0 : pool_copy(s, cap_slot);
-        add_thread(s, list, pc + 1, cap_slot, sp);
+        add_thread(s, list, pc + 1, cap_slot, sp, key);
         if (s->cut) return;
         pc = inst.offset;
         cap_slot = cp;
+        key = back;
       }
       continue;
 
     case RE_SPLITNG:
       /* Non-greedy fork: the jump target outranks the fall-through. */
       {
+        uint32_t back = re_loop_back(s, inst, pc, key);
+        if (back == RE_LOOP_STOP) { pc++; continue; }
         int cp = s->match_only ? 0 : pool_copy(s, cap_slot);
-        add_thread(s, list, inst.offset, cap_slot, sp);
+        add_thread(s, list, inst.offset, cap_slot, sp, back);
         if (s->cut) return;
         pc = pc + 1;
         cap_slot = cp;
@@ -175,6 +253,14 @@ add_thread(pike_state *s, re_threadlist *list,
       continue;
 
     case RE_SAVE:
+      /* Slot 1 is the end of group 0, so this is where the whole match
+         closes. It may not close inside a character, the same rule the
+         seeding loop applies to where a match opens. Killing the thread
+         rather than the attempt lets a longer branch match instead. */
+      if (inst.offset == 1 && !s->binary && sp < s->str_end &&
+          mrb_re_utf8_interior_p(s->str, sp, s->str_end)) {
+        return;
+      }
       if (!s->match_only) {
         CAP(s, cap_slot)[inst.offset] = (int)(sp - s->str);
       }
@@ -262,7 +348,7 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
   int ncap = pat->num_captures * 2;
   if (ncap == 0) ncap = 2;
 
-  int list_capa = (int)pat->code_len * 2 + 16;
+  int list_capa = RE_LIST_CAPA(pat->code_len, pat->loop_depth);
 
   mrb_bool match_only = (captures == NULL || captures_size == 0);
 
@@ -281,7 +367,9 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
   s.match_only = match_only;
   s.binary = binary;
   s.cut = FALSE;
-  s.gen = 1;
+  s.pass_span = RE_PASS_SPAN(pat->loop_depth);
+  s.gen = s.pass_span;
+  s.key_max = s.gen + s.pass_span - 1;
   if (match_only) {
     s.pool_capa = 1;
     s.pool_next = 0;
@@ -326,19 +414,23 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
           if (sp > str_end) break;
         }
       }
-      /* Don't seed a new match attempt at a UTF-8 continuation byte --
-         a multi-byte char's interior is not a valid char boundary, and
-         starting a thread there mis-decodes the char (e.g. a class-
-         match on a stray 0x82 instead of the leader's full codepoint). */
-      if (!s.binary && curr.count == 0 && sp < str_end && mrb_re_utf8_continuation_p(sp)) {
-        continue;
+      /* Don't seed a new match attempt inside a character. Its interior is
+         not a char boundary, and starting a thread there mis-decodes the
+         char (e.g. a class match on a stray 0x82 instead of the leader's
+         full codepoint). A byte that no lead byte reaches belongs to no
+         character and is a boundary of its own.
+         Threads seeded earlier are still stepped at this position, so the
+         test guards the seeding alone and never skips the iteration. */
+      if (s.binary || sp >= str_end ||
+          !mrb_re_utf8_interior_p(str, sp, str_end)) {
+        int slot = match_only ? 0 : pool_alloc(&s);
+        if (!match_only) memset(CAP(&s, slot), -1, sizeof(int) * ncap);
+        s.gen += s.pass_span;
+        s.key_max += s.pass_span;
+        s.cut = FALSE;
+        add_thread(&s, &curr, 0, slot, sp, s.gen);
+        if (s.matched && curr.count == 0) break;
       }
-      int slot = match_only ? 0 : pool_alloc(&s);
-      if (!match_only) memset(CAP(&s, slot), -1, sizeof(int) * ncap);
-      s.gen++;
-      s.cut = FALSE;
-      add_thread(&s, &curr, 0, slot, sp);
-      if (s.matched && curr.count == 0) break;
     }
 
     if (sp >= str_end) break;
@@ -364,7 +456,8 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
       s.pool_next = curr.count;
     }
 
-    s.gen++;
+    s.gen += s.pass_span;
+    s.key_max += s.pass_span;
     s.cut = FALSE;
     next.count = 0;
 
@@ -397,35 +490,35 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
       case RE_CHAR:
         if (ch == inst.a) {
           int cp = match_only ? 0 : pool_copy(&s, th->cap_slot);
-          add_thread(&s, &next, th->pc + 1, cp, sp + 1);
+          add_thread(&s, &next, th->pc + 1, cp, sp + 1, s.gen);
         }
         break;
 
       case RE_ANY:
         if (ch != '\n') {
           int cp = match_only ? 0 : pool_copy(&s, th->cap_slot);
-          add_thread(&s, &next, th->pc + 1, cp, sp + advance);
+          add_thread(&s, &next, th->pc + 1, cp, sp + advance, s.gen);
         }
         break;
 
       case RE_ANY_NL:
         {
           int cp = match_only ? 0 : pool_copy(&s, th->cap_slot);
-          add_thread(&s, &next, th->pc + 1, cp, sp + advance);
+          add_thread(&s, &next, th->pc + 1, cp, sp + advance, s.gen);
         }
         break;
 
       case RE_CLASS:
         if (class_match(&pat->classes[inst.a], curr_cp)) {
           int cp = match_only ? 0 : pool_copy(&s, th->cap_slot);
-          add_thread(&s, &next, th->pc + 1, cp, sp + advance);
+          add_thread(&s, &next, th->pc + 1, cp, sp + advance, s.gen);
         }
         break;
 
       case RE_NCLASS:
         if (!class_match(&pat->classes[inst.a], curr_cp)) {
           int cp = match_only ? 0 : pool_copy(&s, th->cap_slot);
-          add_thread(&s, &next, th->pc + 1, cp, sp + advance);
+          add_thread(&s, &next, th->pc + 1, cp, sp + advance, s.gen);
         }
         break;
 
@@ -543,6 +636,13 @@ bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
     case RE_SAVE:
       {
         int slot = inst.offset;
+        /* End of group 0: the whole match may not close inside a character
+           (see the Pike VM case). Failing here backtracks into the other
+           branches, so a longer one can still match. */
+        if (slot == 1 && !binary && sp < str_end &&
+            mrb_re_utf8_interior_p(str, sp, str_end)) {
+          return FALSE;
+        }
         if (slot < ncap) {
           int old = captures[slot];
           captures[slot] = (int)(sp - str);
@@ -601,12 +701,18 @@ bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
         int ge = captures[group * 2 + 1];
         if (gs < 0 || ge < 0) return FALSE;
         int blen = ge - gs;
-        if (sp + blen > str_end) return FALSE;
         if (inst.offset) {
-          if (!memcmp_ci(sp, str + gs, blen)) return FALSE;
+          /* A folded comparison can consume a different number of bytes than
+             the captured text holds, so the span is measured, not assumed. */
+          int used = memcmp_ci(sp, str_end, str + gs, str + ge, binary);
+          if (used < 0) return FALSE;
+          sp += used;
         }
-        else if (memcmp(sp, str + gs, blen) != 0) return FALSE;
-        sp += blen;
+        else {
+          if (sp + blen > str_end) return FALSE;
+          if (memcmp(sp, str + gs, blen) != 0) return FALSE;
+          sp += blen;
+        }
         pc++;
       }
       break;
@@ -674,7 +780,7 @@ backtrack_exec(mrb_state *mrb, const mrb_regexp_pattern *pat,
       while (sp < str_end && !FIRST_BYTE_OK(pat, (uint8_t)*sp)) sp++;
       if (sp > str_end) break;
     }
-    if (!binary && sp < str_end && mrb_re_utf8_continuation_p(sp)) {
+    if (!binary && sp < str_end && mrb_re_utf8_interior_p(str, sp, str_end)) {
       continue;
     }
     memset(caps, -1, sizeof(int) * ncap);
@@ -697,7 +803,7 @@ backtrack_exec(mrb_state *mrb, const mrb_regexp_pattern *pat,
 static int
 literal_exec(const mrb_regexp_pattern *pat,
              const char *str, mrb_int len, mrb_int start,
-             int *captures, int captures_size)
+             int *captures, int captures_size, mrb_bool binary)
 {
   const char *sp = str + start;
   const char *str_end = str + len;
@@ -706,7 +812,17 @@ literal_exec(const mrb_regexp_pattern *pat,
   while (sp + plen <= str_end) {
     const char *found = (const char*)memchr(sp, pat->prefix[0], str_end - sp);
     if (!found || found + plen > str_end) return 0;
+    if (!binary && mrb_re_utf8_interior_p(str, found, str_end)) {
+      sp = found + 1;  /* not a char boundary, same rule as the other engines */
+      continue;
+    }
     if (plen == 1 || memcmp(found + 1, pat->prefix + 1, plen - 1) == 0) {
+      if (!binary && found + plen < str_end &&
+          mrb_re_utf8_interior_p(str, found + plen, str_end)) {
+        sp = found + 1;  /* ends inside a character, same rule as the end of
+                            group 0 in the other engines */
+        continue;
+      }
       /* match found */
       if (captures && captures_size >= 2) {
         captures[0] = (int)(found - str);
@@ -726,7 +842,7 @@ mrb_re_exec(mrb_state *mrb, const mrb_regexp_pattern *pat,
         int *captures, int captures_size, mrb_bool binary)
 {
   if (pat->is_literal) {
-    return literal_exec(pat, str, len, start, captures, captures_size);
+    return literal_exec(pat, str, len, start, captures, captures_size, binary);
   }
   if (pat->has_backref || pat->needs_backtrack) {
     return backtrack_exec(mrb, pat, str, len, start, captures, captures_size, binary);

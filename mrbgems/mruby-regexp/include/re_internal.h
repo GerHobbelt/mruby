@@ -90,6 +90,8 @@ typedef struct mrb_regexp_pattern {
   uint8_t first_bytes[16]; /* bitmap of possible first bytes (128-bit, ASCII) */
   mrb_bool has_first_bytes; /* true if first_bytes is usable for skipping */
   mrb_bool is_literal;     /* true if pattern is pure literal (no metacharacters) */
+  uint8_t loop_depth;      /* deepest nesting of repetitions whose body can
+                              match empty (see RE_MAX_PASS) */
   /* Cached VM state for pike_vm (avoids malloc per mrb_re_exec call) */
   uint32_t *cached_visited;     /* generation-based visited array */
   void *cached_threads[2];      /* curr/next thread lists */
@@ -133,6 +135,23 @@ typedef struct {
   const char *sp;
 } re_thread_cache;
 
+/* A pike_vm step walks a repetition's body once per nesting level, so that a
+   loop's final empty iteration can finish even when the closure resumed
+   inside the body and already marked that iteration's tail (see add_thread).
+   The cap keeps a pathologically nested pattern from growing the thread lists
+   with the square of the program; past it, such a pattern keeps the older,
+   stale-capture behaviour rather than costing memory. */
+#define RE_MAX_PASS 4
+#define RE_PASS_SPAN(depth) \
+  ((uint32_t)((depth) < RE_MAX_PASS ? (depth) : RE_MAX_PASS) + 1)
+
+/* Capacity of one pike_vm thread list, shared by the VM and by the cache the
+   compiler pre-allocates for it so the two cannot drift. An instruction
+   enqueues at most one thread per pass, and threads waiting on a later sp are
+   carried over from the previous step on top of that. */
+#define RE_LIST_CAPA(code_len, depth) \
+  ((int)(code_len) * (int)(RE_PASS_SPAN(depth) + 1) + 16)
+
 /* Compile a pattern string into bytecode */
 mrb_regexp_pattern* mrb_re_compile(mrb_state *mrb, const char *pattern, mrb_int len, uint32_t flags);
 
@@ -143,6 +162,27 @@ void mrb_re_free(mrb_state *mrb, mrb_regexp_pattern *pat);
 int mrb_re_utf8_charlen(const char *s, const char *end);
 uint32_t mrb_re_utf8_decode(const char *s, const char *end, int *len);
 mrb_bool mrb_re_is_word_char(uint32_t c);
+
+#ifdef MRB_REGEXP_UNICODE_CASE
+/* Simple case folding. mrb_re_case_fold() returns the folded codepoint, or cp
+   itself when it folds to nothing else. mrb_re_case_unfold() writes every
+   other codepoint sharing cp's folded form into out, at most max of them, and
+   returns how many it wrote. Both cover ASCII and the 1:1 Unicode foldings; a
+   codepoint whose fold is several codepoints (U+00DF to "ss") is left alone. */
+#define RE_MAX_UNFOLD 4
+uint32_t mrb_re_case_fold(uint32_t cp);
+int mrb_re_case_unfold(uint32_t cp, uint32_t *out, int max);
+
+/* The same two directions over a span rather than one codepoint, reporting
+   what they find by calling add() with each span of it. mrb_re_case_fold_range
+   reports the folds of the sources in [lo, hi], mrb_re_case_unfold_range the
+   sources of the folds in [lo, hi]. Spans may repeat or overlap what the
+   caller already holds; the caller merges. */
+void mrb_re_case_fold_range(uint32_t lo, uint32_t hi,
+                            void (*add)(void *, uint32_t, uint32_t), void *user);
+void mrb_re_case_unfold_range(uint32_t lo, uint32_t hi,
+                              void (*add)(void *, uint32_t, uint32_t), void *user);
+#endif
 
 static inline int
 mrb_re_charlen(const char *s, const char *end, mrb_bool binary)
@@ -160,10 +200,20 @@ mrb_re_decode_char(const char *s, const char *end, int *len, mrb_bool binary)
   return mrb_re_utf8_decode(s, end, len);
 }
 
+/* TRUE when s points into the middle of a character that starts earlier in
+   the string, so it is not a place a match may start at. A byte that looks
+   like a continuation byte but follows no lead byte that reaches it belongs
+   to no character and stands on its own. */
 static inline mrb_bool
-mrb_re_utf8_continuation_p(const char *s)
+mrb_re_utf8_interior_p(const char *str, const char *s, const char *end)
 {
-  return (((uint8_t)*s & 0xC0) == 0x80);
+  if (((uint8_t)*s & 0xC0) != 0x80) return FALSE;
+  for (int back = 1; back <= 3 && back <= s - str; back++) {
+    const char *lead = s - back;
+    if (((uint8_t)*lead & 0xC0) == 0x80) continue;  /* another continuation byte */
+    return mrb_re_utf8_charlen(lead, end) > back;
+  }
+  return FALSE;
 }
 
 /* Execute a match.

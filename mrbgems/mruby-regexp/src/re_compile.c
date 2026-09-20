@@ -14,7 +14,7 @@
 /* Compiler state */
 typedef struct {
   mrb_state *mrb;
-  const char *src;     /* pattern source (preprocessed in extended mode) */
+  const char *src;     /* pattern source, preprocessed (see preprocess_pattern) */
   const char *src_end;
   const char *orig;    /* pattern as written, for error messages */
   const char *orig_end;
@@ -31,7 +31,8 @@ typedef struct {
   uint16_t num_named;
   mrb_bool has_backref;
   mrb_bool needs_backtrack;
-  char *stripped;           /* allocated buffer for x-mode preprocessing */
+  mrb_bool dont_capture;    /* pattern declares a named group: plain (...) does not capture */
+  char *stripped;           /* allocated buffer for pattern preprocessing */
 } re_compiler;
 
 static void compile_alt(re_compiler *c);  /* forward */
@@ -39,11 +40,12 @@ static void compile_alt(re_compiler *c);  /* forward */
 static void
 compile_error(re_compiler *c, const char *msg)
 {
-  /* Quote c->orig, the pattern as written: in extended mode c->src points at
-     the buffer strip_extended() returned, so quoting it would drop the
-     free-spacing and the comments from the message. c->orig is the caller's
-     buffer, which outlives the compile. It is not NUL-terminated, so use %l
-     with the explicit length from c->orig_end. */
+  /* Quote c->orig, the pattern as written: when the pattern is preprocessed
+     c->src points at the buffer preprocess_pattern() returned, so quoting it
+     would drop the free-spacing, the comments and the (?#...) groups from the
+     message. c->orig is the caller's buffer, which outlives the compile. It
+     is not NUL-terminated, so use %l with the explicit length from
+     c->orig_end. */
   mrb_value emsg = mrb_format(c->mrb, "%s: /%l/",
                               msg, c->orig, (size_t)(c->orig_end - c->orig));
 
@@ -68,9 +70,19 @@ compile_error(re_compiler *c, const char *msg)
     mrb_exc_new_str(c->mrb, mrb_exc_get_id(c->mrb, MRB_SYM(RegexpError)), emsg));
 }
 
+/* Maximum number of instructions in a compiled pattern. Every jump target
+   lives in re_inst.offset (uint16_t) and a target may be one past the last
+   instruction, so the whole program has to be addressable by that field.
+   Without the cap the targets wrap on the way in and the engine jumps to an
+   unrelated instruction: no exception, no memory error, just a pattern that
+   stops matching text it describes. The check sits in emit(), the one place
+   code_len grows, so it covers every producer including insert_inst(). */
+#define RE_MAX_CODE_LEN 0xffff
+
 static uint32_t
 emit(re_compiler *c, uint8_t op, uint8_t a, uint16_t offset)
 {
+  if (c->code_len >= RE_MAX_CODE_LEN) compile_error(c, "regexp too large");
   if (c->code_len >= c->code_capa) {
     c->code_capa = c->code_capa ? c->code_capa * 2 : 64;
     c->code = (re_inst*)mrb_realloc(c->mrb, c->code, sizeof(re_inst) * c->code_capa);
@@ -111,7 +123,6 @@ insert_inst(re_compiler *c, uint32_t pos, uint8_t op, uint8_t a, uint16_t offset
     if (i == pos) continue;
     switch (c->code[i].op) {
     case RE_JMP: case RE_SPLIT: case RE_SPLITNG:
-      if (c->code[i].offset >= 0xffff) break;
       if (c->code[i].offset > pos || (c->code[i].offset == pos && i > pos)) {
         c->code[i].offset++;
       }
@@ -216,6 +227,47 @@ class_set_range(re_charclass *cc, uint8_t lo, uint8_t hi)
   }
 }
 
+#ifdef MRB_REGEXP_UNICODE_CASE
+/* Add one codepoint to whichever half of the class can hold it. */
+static void
+class_add_cp(re_compiler *c, re_charclass *cc, uint32_t cp)
+{
+  if (cp < 128) class_set_bit(cc, (uint8_t)cp);
+  else class_add_codepoint(c, cc, cp);
+}
+
+/* Add the case counterparts of cp to a class that already holds cp. Used for
+   the single-literal paths, where the class exists only to express the
+   choice between one character and its other cases. */
+static void
+class_add_fold_counterparts(re_compiler *c, uint16_t id, uint32_t cp)
+{
+  uint32_t alt[RE_MAX_UNFOLD];
+  int n = mrb_re_case_unfold(cp, alt, RE_MAX_UNFOLD);
+  for (int i = 0; i < n; i++) class_add_cp(c, &c->classes[id], alt[i]);
+}
+
+/* Closure for mrb_re_case_unfold_range(), which reports counterpart spans one
+   at a time. A span can straddle 128 (U+017F folds to 's'), so it is split
+   the same way a written range is. */
+typedef struct {
+  re_compiler *c;
+  re_charclass *cc;
+} class_fold_sink;
+
+static void
+class_fold_add(void *user, uint32_t lo, uint32_t hi)
+{
+  class_fold_sink *s = (class_fold_sink*)user;
+  if (lo < 128) {
+    class_set_range(s->cc, (uint8_t)lo, (uint8_t)(hi < 128 ? hi : 127));
+  }
+  if (hi >= 128) {
+    class_add_range(s->c, s->cc, lo < 128 ? 128 : lo, hi);
+  }
+}
+#endif  /* MRB_REGEXP_UNICODE_CASE */
+
 static void
 class_add_shorthand(re_charclass *cc, int ch)
 {
@@ -276,6 +328,16 @@ class_add_shorthand(re_charclass *cc, int ch)
     cc->utf8_any = TRUE;
     break;
   }
+}
+
+/* TRUE when every character the class can match is ASCII, so it always
+   consumes exactly one byte. Non-ASCII codepoint ranges and the utf8_any
+   catch-all (set by \D, \W, \S, \H and [[:^alpha:]]) both admit multibyte
+   characters, whose width is not known until match time. */
+static mrb_bool
+class_is_ascii_only(const re_charclass *cc)
+{
+  return cc->num_ranges == 0 && !cc->utf8_any;
 }
 
 /* Set ASCII bits for a POSIX class name (e.g. "alpha") into a 128-bit map.
@@ -377,7 +439,12 @@ read_class_atom(re_compiler *c)
 {
   if (peek(c) == '\\') {
     next_char(c);
-    return (uint32_t)parse_escape(c);
+    /* A backslash before a multibyte character has no escape meaning, so let
+       the decode below read the whole codepoint: [\Ā] is [Ā]. parse_escape()
+       returns one byte, which left the continuation byte as a class atom of
+       its own. A trailing backslash (peek < 0) still reaches parse_escape(),
+       which reports it. */
+    if (peek(c) < 0xC0) return (uint32_t)parse_escape(c);
   }
   uint8_t b = (uint8_t)*c->p;
   if (b < 0xC0) {
@@ -455,15 +522,14 @@ compile_charclass(re_compiler *c)
     if (peek(c) == '-' && c->p + 1 < c->src_end && c->p[1] != ']') {
       next_char(c);  /* skip '-' */
       uint32_t hi = read_class_atom(c);
-      if (cp < 128 && hi < 128) {
-        class_set_range(cc, (uint8_t)cp, (uint8_t)hi);
-      }
-      else {
-        /* Range that touches non-ASCII: store as codepoint range.
-           Mixed ASCII/non-ASCII ranges are rare; stash the whole span
-           in the codepoint list (the bitmap covers ASCII only, so a
-           non-ASCII upper bound forces the codepoint path). */
-        if (cp <= hi) class_add_range(c, cc, cp, hi);
+      /* A range that straddles the ASCII boundary is split in two: the
+         bitmap takes the half below 128 and the codepoint list the rest.
+         Neither half can hold the other, and class_match() picks the side
+         to read from the codepoint alone, so a span left whole in the
+         codepoint list is unreachable below 128. */
+      if (cp <= hi) {
+        if (cp < 128) class_set_range(cc, (uint8_t)cp, (uint8_t)(hi < 128 ? hi : 127));
+        if (hi >= 128) class_add_range(c, cc, cp < 128 ? 128 : cp, hi);
       }
     }
     else {
@@ -477,13 +543,50 @@ compile_charclass(re_compiler *c)
      single pass covers every form the loop above merges into the bitmap:
      POSIX brackets, shorthands, ranges and single literals. Negation is
      applied at match time against this same bitmap (RE_NCLASS), so folding
-     the positive set also fixes [^a-c] under /i. Non-ASCII case folding is
-     out of scope, so the codepoint range list is left alone. */
+     the positive set also fixes [^a-c] under /i. */
   if (c->flags & RE_FLAG_IGNORECASE) {
     for (int ch = 'a'; ch <= 'z'; ch++) {
       if (class_get_bit(cc, (uint8_t)ch)) class_set_bit(cc, (uint8_t)(ch - 32));
       else if (class_get_bit(cc, (uint8_t)(ch - 32))) class_set_bit(cc, (uint8_t)ch);
     }
+
+#ifdef MRB_REGEXP_UNICODE_CASE
+    /* Then the Unicode foldings, which close the class rather than take one
+       hop from what was written: x belongs to the class whenever some member
+       folds the same way x does. That takes two rounds, because a fold can
+       have more than one source (U+03A3 and U+03C2 both fold to U+03C3), and
+       a class written with one of them reaches the others only through the
+       fold they share. The first round puts that shared fold in the class;
+       the second pulls in everything that folds to it. A third round would
+       find nothing: whatever the second adds folds to something the first
+       already added.
+
+       Each round reads the codepoint list from a snapshot of its length,
+       since the additions append to the same list and an unbounded walk would
+       keep folding what it just added. */
+    class_fold_sink sink = { c, cc };
+    uint32_t nranges = cc->num_ranges;
+    for (uint32_t i = 0; i < nranges; i++) {
+      mrb_re_case_fold_range(cc->ranges[2 * i], cc->ranges[2 * i + 1],
+                             class_fold_add, &sink);
+    }
+
+    nranges = cc->num_ranges;
+    for (uint32_t i = 0; i < nranges; i++) {
+      mrb_re_case_unfold_range(cc->ranges[2 * i], cc->ranges[2 * i + 1],
+                               class_fold_add, &sink);
+    }
+    /* An ASCII member can have a non-ASCII source (U+212A folds to 'k'),
+       which the walk above cannot reach: the bitmap holds no ranges. The
+       bitmap is read upwards, so an upper case letter set here is behind the
+       cursor and is never asked for sources of its own, which is correct:
+       nothing folds to an upper case letter. */
+    for (int ch = 0; ch < 128; ch++) {
+      if (!class_get_bit(cc, (uint8_t)ch)) continue;
+      if (ch >= 'a' && ch <= 'z') class_set_bit(cc, (uint8_t)(ch - 32));
+      mrb_re_case_unfold_range((uint32_t)ch, (uint32_t)ch, class_fold_add, &sink);
+    }
+#endif
   }
 
   cc->negated = negated;
@@ -550,11 +653,23 @@ compute_fixed_len(re_compiler *c, uint32_t start, uint32_t end)
     re_inst inst = c->code[pc];
     switch (inst.op) {
     case RE_CHAR:
-    case RE_CLASS:
-    case RE_NCLASS:
+      /* a multibyte literal is a run of one-byte RE_CHAR instructions,
+         so each one is exactly one byte by construction */
       len += 1;
       pc++;
       break;
+    case RE_CLASS:
+      /* a class that admits a multibyte character has no single byte
+         length: one holding both ASCII and non-ASCII members consumes one
+         byte here and two there. Rewinding by a wrong count lands in the
+         middle of a character, so refuse to measure it. */
+      if (!class_is_ascii_only(&c->classes[inst.a])) return -1;
+      len += 1;
+      pc++;
+      break;
+    case RE_NCLASS:
+      /* the complement of an ASCII bitmap always admits non-ASCII */
+      return -1;
     case RE_ANY:
     case RE_ANY_NL:
       /* . matches one character which can be 1-4 bytes in UTF-8.
@@ -593,7 +708,9 @@ compute_fixed_len(re_compiler *c, uint32_t start, uint32_t end)
    (':' or ')'). `base` is the option set in effect on entry; the resulting
    set is returned. Ruby's inline letters are i (IGNORECASE), m (DOTALL),
    x (EXTENDED). Extended mode is applied by a whole-pattern preprocessing
-   pass, so it cannot be scoped inline and is rejected here. */
+   pass that runs before the parser, so it cannot be scoped inline:
+   enabling it is rejected here, and see the 'x' branch below for why
+   disabling it is not. */
 static uint32_t
 parse_inline_flags(re_compiler *c, uint32_t base)
 {
@@ -605,8 +722,20 @@ parse_inline_flags(re_compiler *c, uint32_t base)
     if (oc == 'i') bit = RE_FLAG_IGNORECASE;
     else if (oc == 'm') bit = RE_FLAG_DOTALL;
     else if (oc == 'x') {
-      compile_error(c, "inline extended mode (?x) is not supported");
-      return base;  /* unreached: compile_error longjmps */
+      if (!negate) {
+        compile_error(c, "inline extended mode (?x) is not supported");
+        return base;  /* unreached: compile_error longjmps */
+      }
+      /* A '-x' is accepted and dropped. Regexp#to_s names every flag that
+         is off, so its result carries one whenever the pattern is not
+         extended, and rejecting it would make interpolation and
+         Regexp.new(re.to_s) raise for such a Regexp. Dropping it is exact
+         there, since the flag is already off. Inside a pattern that is
+         itself extended it is not: the preprocessing pass has removed the
+         whitespace by now and the scope cannot get it back. */
+      seen = TRUE;
+      next_char(c);
+      continue;
     }
     else if (oc == '-' && !negate) { negate = TRUE; next_char(c); continue; }
     else break;
@@ -617,6 +746,55 @@ parse_inline_flags(re_compiler *c, uint32_t base)
   }
   if (!seen) compile_error(c, "undefined (?...) sequence");
   return (base | on) & ~off;
+}
+
+/* Emit every byte of the character whose lead byte `ch` was just consumed, so
+   the whole character is one atom. Leaving the continuation bytes to the parse
+   loop made each of them an atom of its own, and a quantifier binds to the last
+   atom emitted: /Ā+/ compiled as \xC4(\x80)+ and matched one Ā in "ĀĀ". An
+   invalid lead byte has a charlen of 1 and still emits alone. Every atom that
+   consumes a character has to emit all of its bytes before returning, since
+   what compile_quantified() repeats is the bytes that atom emitted. */
+static void
+emit_char_bytes(re_compiler *c, int ch)
+{
+  int len = mrb_re_utf8_charlen(c->p - 1, c->src_end);
+  emit(c, RE_CHAR, (uint8_t)ch, 0);
+  for (int i = 1; i < len; i++) {
+    int b = next_char(c);
+    if (b < 0) break;
+    emit(c, RE_CHAR, (uint8_t)b, 0);
+  }
+}
+
+/* Emit a non-ASCII literal under /i as a class rather than a run of bytes, and
+   report whether it did. A counterpart need not have the same byte length
+   (U+212A folds to 'k'), which a byte-wise RE_CHAR run cannot express, while
+   RE_CLASS decodes one codepoint and compares that whatever its width. A
+   character with no counterpart, which is most of the non-ASCII range and
+   every script without case in it, falls back to the bytes and costs /i
+   nothing. */
+static mrb_bool
+emit_char_folded(re_compiler *c, int ch)
+{
+#ifdef MRB_REGEXP_UNICODE_CASE
+  if (ch < 128 || !(c->flags & RE_FLAG_IGNORECASE)) return FALSE;
+  int len = 0;
+  uint32_t cp = mrb_re_utf8_decode(c->p - 1, c->src_end, &len);
+  uint32_t alt[RE_MAX_UNFOLD];
+  int n = mrb_re_case_unfold(cp, alt, RE_MAX_UNFOLD);
+  if (n == 0) return FALSE;
+  c->p += len - 1;
+  uint16_t id = add_class(c);
+  class_add_cp(c, &c->classes[id], cp);
+  for (int i = 0; i < n; i++) class_add_cp(c, &c->classes[id], alt[i]);
+  emit(c, RE_CLASS, (uint8_t)id, 0);
+  return TRUE;
+#else
+  (void)c;
+  (void)ch;
+  return FALSE;
+#endif
 }
 
 /* Compile a single atom (character, class, group, etc.) */
@@ -719,15 +897,28 @@ compile_atom(re_compiler *c)
             compile_error(c, "undefined (?...) sequence");
           }
         }
+        else if (c->p[1] == '#') {
+          /* preprocess_pattern() removes a terminated comment group before
+             the parser runs, so one reaching here was never closed. */
+          compile_error(c, "unterminated comment group");
+        }
         else {
           /* (?X) with an unsupported X: not one of the recognized (?: (?= (?!
-             (?<= (?<! (?<name> (?imx forms. The absent operator (?~...) and
-             conditionals (?(...)) are not implemented. Raise here rather than
-             falling through to the capturing-group path, which would leave
-             the stray `?` for compile_seq to spin on forever (A1). */
+             (?<= (?<! (?<name> (?imx forms. Comment groups (?#...) never get
+             here either, having been removed by preprocess_pattern(). The
+             absent operator (?~...) and conditionals (?(...)) are not
+             implemented. Raise here rather than falling through to the
+             capturing-group path, which would leave the stray `?` for
+             compile_seq to spin on forever (A1). */
           compile_error(c, "undefined (?...) sequence");
         }
       }
+
+      /* Onigmo's ONIG_OPTION_DONT_CAPTURE_GROUP, which CRuby turns on for a
+         pattern that declares a named group: a plain (...) then groups
+         without capturing, so the numbered side counts only the named
+         groups. The named group itself keeps its number. */
+      if (c->dont_capture && cap_name == NULL) capturing = FALSE;
 
       uint16_t group = 0;
       if (capturing) {
@@ -783,6 +974,9 @@ compile_atom(re_compiler *c)
     next_char(c);
     ch = peek(c);
     if (ch >= '1' && ch <= '9') {
+      if (c->dont_capture) {
+        compile_error(c, "numbered backref/call is not allowed. (use name)");
+      }
       next_char(c);
       emit(c, RE_BACKREF, (uint8_t)(ch - '0'), (c->flags & RE_FLAG_IGNORECASE) ? 1 : 0);
       c->has_backref = TRUE;
@@ -844,6 +1038,14 @@ compile_atom(re_compiler *c)
 
       int group = -1;
       if (name_len > 0 && (name[0] == '-' || (name[0] >= '0' && name[0] <= '9'))) {
+        /* CRuby rejects a numbered backreference in a named pattern whatever
+           its spelling, and it has to be rejected here too: once plain groups
+           stop consuming numbers, both the absolute bound and the relative
+           form's `num_captures - n` below would silently resolve to a
+           different group instead of erroring. */
+        if (c->dont_capture) {
+          compile_error(c, "numbered backref/call is not allowed. (use name)");
+        }
         mrb_bool relative = (name[0] == '-');
         int n = 0;
         for (uint32_t i = (relative ? 1 : 0); i < name_len; i++) {
@@ -868,6 +1070,16 @@ compile_atom(re_compiler *c)
       emit(c, RE_BACKREF, (uint8_t)group, (c->flags & RE_FLAG_IGNORECASE) ? 1 : 0);
       c->has_backref = TRUE;
     }
+    else if (ch >= 0xC0) {
+      /* A backslash before a multibyte character has no escape meaning: \Ā is
+         Ā. parse_escape() returns one byte, which left the continuation bytes
+         to the parse loop as atoms of their own, so emit the whole character
+         here as the unescaped spelling does. The dispatch has to happen before
+         parse_escape() reads the letter, since \xNN and octal \NNN name a byte
+         rather than a character. */
+      next_char(c);
+      if (!emit_char_folded(c, ch)) emit_char_bytes(c, ch);
+    }
     else {
       ch = parse_escape(c);
       if (c->flags & RE_FLAG_IGNORECASE) {
@@ -875,6 +1087,9 @@ compile_atom(re_compiler *c)
           uint16_t id = add_class(c);
           class_set_bit(&c->classes[id], (uint8_t)ch);
           class_set_bit(&c->classes[id], (uint8_t)(ch + 32));
+#ifdef MRB_REGEXP_UNICODE_CASE
+          class_add_fold_counterparts(c, id, (uint32_t)ch);
+#endif
           emit(c, RE_CLASS, (uint8_t)id, 0);
           break;
         }
@@ -882,6 +1097,9 @@ compile_atom(re_compiler *c)
           uint16_t id = add_class(c);
           class_set_bit(&c->classes[id], (uint8_t)ch);
           class_set_bit(&c->classes[id], (uint8_t)(ch - 32));
+#ifdef MRB_REGEXP_UNICODE_CASE
+          class_add_fold_counterparts(c, id, (uint32_t)ch);
+#endif
           emit(c, RE_CLASS, (uint8_t)id, 0);
           break;
         }
@@ -918,6 +1136,9 @@ compile_atom(re_compiler *c)
         uint16_t id = add_class(c);
         class_set_bit(&c->classes[id], (uint8_t)ch);
         class_set_bit(&c->classes[id], (uint8_t)(ch + 32));
+#ifdef MRB_REGEXP_UNICODE_CASE
+        class_add_fold_counterparts(c, id, (uint32_t)ch);
+#endif
         emit(c, RE_CLASS, (uint8_t)id, 0);
         break;
       }
@@ -925,9 +1146,16 @@ compile_atom(re_compiler *c)
         uint16_t id = add_class(c);
         class_set_bit(&c->classes[id], (uint8_t)ch);
         class_set_bit(&c->classes[id], (uint8_t)(ch - 32));
+#ifdef MRB_REGEXP_UNICODE_CASE
+        class_add_fold_counterparts(c, id, (uint32_t)ch);
+#endif
         emit(c, RE_CLASS, (uint8_t)id, 0);
         break;
       }
+    }
+    if (ch >= 128) {
+      if (!emit_char_folded(c, ch)) emit_char_bytes(c, ch);
+      break;
     }
     emit(c, RE_CHAR, (uint8_t)ch, 0);
     break;
@@ -1140,12 +1368,50 @@ compile_alt(re_compiler *c)
 }
 
 /*
- * Strip whitespace and #comments for extended mode (/x flag).
- * Whitespace inside [...] character classes is preserved.
+ * Does the pattern hold a (?# comment group opener? Cheap pre-check so an
+ * ordinary pattern without one skips preprocess_pattern() and its malloc.
+ */
+static mrb_bool
+has_comment_group(const char *src, mrb_int len)
+{
+  const char *p = src, *end = src + len;
+  while (p < end && (p = (const char*)memchr(p, '(', (size_t)(end - p))) != NULL) {
+    if (end - p >= 3 && p[1] == '?' && p[2] == '#') return TRUE;
+    p++;
+  }
+  return FALSE;
+}
+
+/* Inside a character class, is `src` the start of a POSIX bracket [:name:]?
+   Returns the position just past its closing "]", or NULL if it is not one.
+   compile_charclass() consumes such a bracket as a unit, so its ']' does not
+   end the class; a malformed one falls through and the '[' is an ordinary
+   member. Both scans below have to agree with the parser on this. */
+static const char*
+skip_posix_bracket(const char *src, const char *end)
+{
+  if (!(*src == '[' && src + 1 < end && src[1] == ':')) return NULL;
+  const char *q = src + 2;
+  while (q < end && *q != ':' && *q != ']') q++;
+  /* Compare the distance rather than q + 1: the loop above stops with
+     q == end for a bracket the pattern truncates, as in /[[:alpha/, and
+     forming q + 1 from a one-past-the-end pointer is undefined even where
+     the && never reads through it. */
+  if (end - q >= 2 && q[0] == ':' && q[1] == ']') return q + 2;
+  return NULL;
+}
+
+/*
+ * Rewrite the pattern before the parser sees it.
+ * Removes (?#...) comment groups always, and in extended mode (/x) also
+ * whitespace and #comments.
+ * Whitespace inside [...] character classes is preserved, and so is a (?#
+ * written there, which is a literal member rather than a comment group.
  * Escaped characters (\ followed by anything) are preserved.
  */
 static char*
-strip_extended(mrb_state *mrb, const char *src, mrb_int len, mrb_int *out_len)
+preprocess_pattern(mrb_state *mrb, const char *src, mrb_int len,
+                   mrb_bool extended, mrb_int *out_len)
 {
   char *buf = (char*)mrb_malloc(mrb, len);
   mrb_int o = 0;
@@ -1160,18 +1426,11 @@ strip_extended(mrb_state *mrb, const char *src, mrb_int len, mrb_int *out_len)
       continue;
     }
     if (in_class) {
-      /* compile_charclass() consumes a POSIX bracket as a unit, so the ']'
-         of [:name:] does not end the class. Copy it whole and keep the
-         class open; a malformed bracket falls through and the '[' is
-         copied as an ordinary member, which is what the parser does too. */
-      if (ch == '[' && src + 1 < end && src[1] == ':') {
-        const char *q = src + 2;
-        while (q < end && *q != ':' && *q != ']') q++;
-        if (q + 1 < end && *q == ':' && q[1] == ']') {
-          q += 2;
-          while (src < q) buf[o++] = *src++;
-          continue;
-        }
+      /* Copy a POSIX bracket whole and keep the class open. */
+      const char *q = skip_posix_bracket(src, end);
+      if (q) {
+        while (src < q) buf[o++] = *src++;
+        continue;
       }
       if (ch == ']') in_class = FALSE;
       buf[o++] = *src++;
@@ -1186,19 +1445,101 @@ strip_extended(mrb_state *mrb, const char *src, mrb_int len, mrb_int *out_len)
       if (src < end && *src == ']') buf[o++] = *src++;
       continue;
     }
-    if (ch == '#') {
-      /* skip to end of line */
-      while (src < end && *src != '\n') src++;
+    if (ch == '(' && end - src >= 3 && src[1] == '?' && src[2] == '#') {
+      /* Comment group: ends at the first ')' not preceded by a backslash.
+         It does not nest, so (?#a(?#b)) closes at the first ')' and leaves
+         the second one to be reported as unmatched, as CRuby does.
+         Dropping the group here rather than in compile_atom() is what lets
+         it stand where an atom cannot: CRuby compiles "a(?#x)*" as "a*", and
+         an atom that emits no instruction cannot be a quantifier's target.
+         An unterminated group is copied through instead, so that
+         compile_atom() raises on it. */
+      const char *q = src + 3;
+      while (q < end && *q != ')') {
+        if (*q == '\\' && q + 1 < end) q++;
+        q++;
+      }
+      if (q < end) {
+        src = q + 1;
+        continue;
+      }
+      buf[o++] = *src++;
+      buf[o++] = *src++;
+      buf[o++] = *src++;
       continue;
     }
-    if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v') {
-      src++;
-      continue;
+    if (extended) {
+      if (ch == '#') {
+        /* skip to end of line */
+        while (src < end && *src != '\n') src++;
+        continue;
+      }
+      if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v') {
+        src++;
+        continue;
+      }
     }
     buf[o++] = *src++;
   }
   *out_len = o;
   return buf;
+}
+
+/*
+ * Does the pattern declare a named group anywhere? Answering this before the
+ * parser starts is what lets compile_atom() demote a plain (...) that comes
+ * before the named group that causes the demotion.
+ *
+ * (?<name>...) is the only spelling of a definition this gem accepts; the
+ * (?'name'...) form raises "undefined (?...) sequence", so the scan looks for
+ * "(?<" alone. It excludes (?<= and (?<!, which are lookbehind rather than a
+ * definition, and it skips escape pairs and character classes so that /\(?/
+ * and /[(?<]/ are not false positives, with a POSIX bracket and a leading
+ * literal ']' not ending a class, as in preprocess_pattern() above.
+ *
+ * A truncated "(?<" at the end of the pattern is counted as a named group,
+ * which is harmless: the parser reaches the same bytes and raises there.
+ */
+static mrb_bool
+has_named_group(const char *src, mrb_int len)
+{
+  const char *end = src + len;
+  mrb_bool in_class = FALSE;
+
+  while (src < end) {
+    char ch = *src;
+    if (ch == '\\' && src + 1 < end) {
+      src += 2;
+      continue;
+    }
+    if (in_class) {
+      const char *q = skip_posix_bracket(src, end);
+      if (q) {
+        src = q;
+        continue;
+      }
+      if (ch == ']') in_class = FALSE;
+      src++;
+      continue;
+    }
+    if (ch == '[') {
+      in_class = TRUE;
+      src++;
+      if (src < end && *src == '^') src++;
+      if (src < end && *src == ']') src++;
+      continue;
+    }
+    if (ch == '(' && end - src >= 3 && src[1] == '?' && src[2] == '<') {
+      /* src + 3 is at most end here, since the test above leaves three bytes
+         to read, so the one-past-the-end pointer it can form is a position C
+         allows. */
+      if (src + 3 >= end || (src[3] != '=' && src[3] != '!')) return TRUE;
+      src += 3;
+      continue;
+    }
+    src++;
+  }
+  return FALSE;
 }
 
 /*
@@ -1241,8 +1582,7 @@ first_set_walk(const re_inst *code, uint32_t code_len,
     case RE_CLASS: {
       const re_charclass *cc = &classes[code[pc].a];
       for (int i = 0; i < 16; i++) bm[i] |= cc->bitmap[i];
-      if (cc->utf8_any) return FALSE;  /* non-ASCII possible */
-      if (cc->num_ranges > 0) return FALSE;  /* non-ASCII codepoints possible */
+      if (!class_is_ascii_only(cc)) return FALSE;  /* non-ASCII possible */
       return TRUE;
     }
     case RE_NCLASS: {
@@ -1264,6 +1604,70 @@ first_set_walk(const re_inst *code, uint32_t code_len,
   /* Walked off the end without hitting MATCH or a consuming op. Treat as
      empty-matchable, same as RE_MATCH. */
   return FALSE;
+}
+
+/* TRUE when an epsilon-only path runs from pc to goal, so the repetition that
+   goal closes can complete an iteration without consuming. seen[] is marked
+   with `mark` rather than cleared, so one buffer serves every edge. */
+static mrb_bool
+epsilon_path(const re_inst *code, uint32_t pc, uint32_t goal,
+             uint32_t *seen, uint32_t mark)
+{
+  while (pc != goal) {
+    if (pc > goal || seen[pc] == mark) return FALSE;
+    seen[pc] = mark;
+    switch (code[pc].op) {
+    case RE_SAVE:
+    case RE_BOL: case RE_EOL: case RE_BOT: case RE_EOT: case RE_EOTNL:
+    case RE_WBOUND: case RE_NWBOUND:
+      pc++;
+      break;
+    case RE_JMP:
+      pc = code[pc].offset;
+      break;
+    case RE_SPLIT:
+    case RE_SPLITNG:
+      if (epsilon_path(code, code[pc].offset, goal, seen, mark)) return TRUE;
+      pc++;
+      break;
+    default:
+      return FALSE;  /* consumes input, or is an assertion this walk cannot judge */
+    }
+  }
+  return TRUE;
+}
+
+/* Find the repetitions whose body can match empty and mark the backward edge
+   that closes each one, so the Pike VM knows which loops need the empty-
+   iteration handling in add_thread() and which can stay on the cheap path.
+   Returns how deeply those loops nest, which bounds the VM's epsilon passes
+   and the thread lists sized from them; see RE_MAX_PASS and RE_LIST_CAPA. */
+static uint8_t
+mark_empty_loops(mrb_state *mrb, re_inst *code, uint32_t code_len)
+{
+  int32_t *delta = (int32_t*)mrb_calloc(mrb, code_len + 1, sizeof(int32_t));
+  uint32_t *seen = (uint32_t*)mrb_calloc(mrb, code_len + 1, sizeof(uint32_t));
+  uint32_t mark = 0;
+
+  for (uint32_t pc = 0; pc < code_len; pc++) {
+    re_inst in = code[pc];
+    if (in.op != RE_JMP && in.op != RE_SPLIT && in.op != RE_SPLITNG) continue;
+    code[pc].a = 0;                /* this pass owns `a` on the edge opcodes */
+    if (in.offset > pc) continue;  /* forward edge: alternation, not a loop */
+    if (!epsilon_path(code, in.offset, pc, seen, ++mark)) continue;
+    code[pc].a = 1;
+    delta[in.offset]++;
+    delta[pc + 1]--;  /* the closing edge itself still sits inside the loop */
+  }
+
+  int32_t depth = 0, max = 0;
+  for (uint32_t pc = 0; pc < code_len; pc++) {
+    depth += delta[pc];
+    if (depth > max) max = depth;
+  }
+  mrb_free(mrb, seen);
+  mrb_free(mrb, delta);
+  return max > UINT8_MAX ? UINT8_MAX : (uint8_t)max;
 }
 
 static mrb_bool
@@ -1294,9 +1698,10 @@ mrb_re_compile(mrb_state *mrb, const char *pattern, mrb_int len, uint32_t flags)
   c.orig = pattern;
   c.orig_end = pattern + len;
 
-  if (flags & RE_FLAG_EXTENDED) {
+  if ((flags & RE_FLAG_EXTENDED) || has_comment_group(pattern, len)) {
     mrb_int slen;
-    c.stripped = strip_extended(mrb, pattern, len, &slen);
+    c.stripped = preprocess_pattern(mrb, pattern, len,
+                                    (flags & RE_FLAG_EXTENDED) != 0, &slen);
     pattern = c.stripped;
     len = slen;
   }
@@ -1306,6 +1711,10 @@ mrb_re_compile(mrb_state *mrb, const char *pattern, mrb_int len, uint32_t flags)
   c.p = pattern;
   c.flags = flags;
   c.num_captures = 1;  /* group 0 = whole match */
+  /* Scan the same bytes the parser is about to read: preprocess_pattern() has
+     already taken out the /x free-spacing, the #comments and the (?#...)
+     groups. */
+  c.dont_capture = has_named_group(pattern, len);
 
   /* group 0 start */
   emit(&c, RE_SAVE, 0, 0);
@@ -1333,7 +1742,8 @@ mrb_re_compile(mrb_state *mrb, const char *pattern, mrb_int len, uint32_t flags)
 
   /* Copy capture names into an owned arena. Until this point the names
      point into the pattern source (or into c.stripped, which gets freed
-     below in /x mode). After this loop the regexp owns its names. */
+     below when the pattern was preprocessed). After this loop the regexp
+     owns its names. */
   if (c.num_named > 0) {
     size_t total = 0;
     for (uint16_t i = 0; i < c.num_named; i++) total += c.named_captures[i].name_len;
@@ -1401,9 +1811,11 @@ mrb_re_compile(mrb_state *mrb, const char *pattern, mrb_int len, uint32_t flags)
     }
   }
 
+  pat->loop_depth = mark_empty_loops(mrb, pat->code, pat->code_len);
+
   /* Pre-allocate VM state cache for pike_vm */
   {
-    int list_capa = (int)pat->code_len * 2 + 16;
+    int list_capa = RE_LIST_CAPA(pat->code_len, pat->loop_depth);
     pat->cached_visited = (uint32_t*)mrb_calloc(mrb, pat->code_len + 1, sizeof(uint32_t));
     pat->cached_threads[0] = mrb_malloc(mrb, sizeof(re_thread_cache) * list_capa);
     pat->cached_threads[1] = mrb_malloc(mrb, sizeof(re_thread_cache) * list_capa);
