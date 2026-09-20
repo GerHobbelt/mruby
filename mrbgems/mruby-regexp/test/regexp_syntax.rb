@@ -215,6 +215,104 @@ assert("Regexp - a repetition of a lookaround or a backreference stops the same 
   assert_equal "abbc", /(?:(a)b|a(b)|\2)+c/.match("abbc")[0]
 end
 
+assert("Regexp - a backreference reads no group the running iteration reopened") do
+  # A group's pair in captures[] is a span only while the group is closed:
+  # its end slot used to keep the previous iteration's end after a repetition
+  # re-entered the group, so a backreference read the running iteration's
+  # start against it: an empty span where the two coincided, and a negative
+  # one where the start was past it. CRuby reads a group that has not closed
+  # as one that has not matched, so the backreference fails and the branch
+  # holding it is not taken.
+  assert_equal ["x", "x", "x"], /((x|\2b))*/.match("xb").to_a  # was ["xb", "b", "b"]
+  assert_equal ["a", "a", "a"], /((\2|a))*/.match("a").to_a    # was ["a", "", ""]
+  # The negative span left a MatchData whose capture sat outside the match,
+  # and where the repetition had no upper bound it walked the position back
+  # as far as the iteration had come, so the loop made no progress and the
+  # search died at the recursion limit.
+  md = /(?:(.)(\2?)){2}/.match("ab")                # answered ["a", "b", nil]
+  assert_equal ["ab", "b", ""], md.to_a
+  assert_equal [0, 2, 1, 2, 2, 2],
+               [md.begin(0), md.end(0), md.begin(1), md.end(1), md.begin(2), md.end(2)]
+  assert_equal ["xx", ""], /(?:x(\1?))+/.match("xx").to_a          # raised at the limit
+  assert_equal ["abc", "c", ""], /(?:(.)(\2?))+/.match("abc").to_a # raised at the limit
+  assert_equal ["ab", "b", ""], /(?>(.)(\2?))+/.match("ab").to_a   # raised at the limit
+  assert_equal ["xX", ""], /(?:x(\1?))+/i.match("xX").to_a
+  # With text between the group's start and the backreference the two sides
+  # of the negative span part company, and the compare read past the subject
+  # (a negative length as memcmp's size).
+  assert_equal ["xyxy", "y"], /(?:x(y\1?))+/.match("xyxy").to_a
+  assert_equal ["xx", "x"], /(?<g>x(\k<g>?))+/.match("xx").to_a
+  assert_equal ["xxx", ""], /(?:x(\1{0,2}))+/.match("xxx").to_a
+  # A group that never closes is a group that never matches, so a pattern
+  # whose only path runs the backreference inside its own group has no match
+  # at all, not an empty one.
+  assert_nil /(\1)/.match("aa")
+  assert_nil /(a\1)/.match("aa")
+  assert_equal ["", nil, nil], /((\1))*/.match("a").to_a
+  # What the guard now refuses is the open group alone: a closed group that
+  # captured empty still reads, and one closed by an earlier iteration still
+  # reads from a branch that does not reopen it.
+  assert_equal ["", ""], /()\1/.match("x").to_a
+  assert_equal ["y", ""], /(x?)y\1/.match("y").to_a
+  assert_equal ["aba", "a"], /(?:(a)|b\1)+/.match("aba").to_a
+  # Backtracking out of a reopened group restores the pair, so the failed
+  # iteration leaves the previous capture readable rather than half its own.
+  assert_equal ["x", "", "x"], /((x|\2b)?)*/.match("xb").to_a
+end
+
+assert("Regexp - the backtracking engine raises at a limit rather than answer short") do
+  # A frame gives up at MRB_REGEXP_RECURSION_LIMIT or MRB_REGEXP_STEP_LIMIT,
+  # and the frames above it used to read that as the branch having failed and
+  # go on with their other branches: the search answered with a shorter match,
+  # a later one or none, told from the real answer by nothing. A limit is the
+  # search's answer now, and the caller raises on it; the same patterns match
+  # whole on a subject inside the limits, as in CRuby.
+  #
+  # The subjects are sized from the limits, which the build sets and the two
+  # constants read back. A repetition of an atomic group or a lookaround
+  # spends two or three frames per iteration, so a run of `a` as long as the
+  # recursion limit is past it for every pattern here and a quarter of that
+  # run is inside it; a chain of `(?=a)` or `(?>a)` spends two frames per
+  # link; `(a+)+\1b` spends about 2^n steps on a run of n. The n that reaches
+  # the step limit is counted by shifting the limit down rather than 1 up to
+  # it, so that a build setting the limit near the width of `mrb_int` has no
+  # shift of its own to overflow.
+  limit = Regexp::RECURSION_LIMIT
+  over = "a" * limit
+  fits = "a" * (limit / 4)
+  n = 0
+  n += 1 while (Regexp::STEP_LIMIT - 1) >> n > 0
+  steps = "a" * (n + 10)
+  assert_raise(RegexpError) { over.match(/(?:(?>a))*/) }       # answered a third of the run
+  assert_raise(RegexpError) { over.match(/(?:(?=a)a)*/) }      # a third of the run
+  assert_raise(RegexpError) { (over + "b").match(/(a)*?b/) }   # began past the middle
+  assert_raise(RegexpError) { over.match(/(?:(?>a))*\z/) }    # began past the middle
+  assert_raise(RegexpError) { "a".match(Regexp.new("(?=a)" * (limit / 2 + 1) + "a")) }   # was nil
+  assert_raise(RegexpError) { over.match(Regexp.new("(?>a)" * (limit / 2 + 1) + "a")) }  # was nil
+  assert_equal fits, fits.match(/(?:(?>a))*/)[0]
+  assert_equal fits, fits.match(/(?:(?=a)a)*/)[0]
+  assert_equal 0, (fits + "b").match(/(a)*?b/).begin(0)
+  assert_equal 0, fits.match(/(?:(?>a))*\z/).begin(0)
+  assert_equal "a", "a".match(Regexp.new("(?=a)" * (limit / 4) + "a"))[0]
+  assert_equal fits, fits.match(Regexp.new("(?>a)" * (limit / 4 - 1) + "a"))[0]
+  # The message names the limit, so that whoever hits one on a legitimate
+  # subject knows which knob to turn, and the constant says where it stands.
+  assert_raise_with_message(RegexpError, "recursion limit over (MRB_REGEXP_RECURSION_LIMIT)") do
+    over.match(/(?:(?>a))*/)
+  end
+  assert_raise_with_message(RegexpError, "step limit over (MRB_REGEXP_STEP_LIMIT)") do
+    steps.match(/(a+)+\1b/)
+  end
+  assert_kind_of Integer, Regexp::RECURSION_LIMIT
+  assert_kind_of Integer, Regexp::STEP_LIMIT
+  # A limit ends the search at the start position it was hit at: the
+  # positions after it would say where the first match is only once this one
+  # has none. The search that reads no captures raises the same.
+  assert_raise(RegexpError) { ("b" + over + "c").match(/b(?:(?>a))*c|a/) }   # began at 1
+  assert_raise(RegexpError) { over.match?(/(?:(?>a))*\z/) }
+  assert_raise(RegexpError) { /(?:(?>a))*\z/ === over }
+end
+
 assert("Regexp - quantified first alternative does not leak into the next") do
   # A quantifier loops back to its own atom. When the atom starts the first
   # alternative, the alternation SPLIT is inserted in front of it; the
@@ -429,6 +527,36 @@ assert("Regexp - repetition {n,m}") do
   assert_equal "aaa", Regexp.new("a{3}").match("aaaa")[0]
   assert_equal "aa", Regexp.new("a{2,3}").match("aa")[0]
   assert_equal "aaa", Regexp.new("a{2,3}").match("aaaa")[0]
+end
+
+assert("Regexp - an upper bound below the lower one is an error") do
+  # `{n,m}` with m < n names no repeat count, and CRuby raises rather than
+  # compiling it; it used to compile as `{n}` and match exactly n repeats.
+  assert_raise(RegexpError) { Regexp.new("a{2,1}") }
+  assert_raise(RegexpError) { Regexp.new("^a{3,1}$") }
+  # The non-greedy marker comes after the `}`, so it does not save the range.
+  assert_raise(RegexpError) { Regexp.new("a{3,1}?") }
+  # Nor does a group, a class, or a lookaround.
+  assert_raise(RegexpError) { Regexp.new("(ab){2,1}") }
+  assert_raise(RegexpError) { Regexp.new("[a-z]{5,3}") }
+  assert_raise(RegexpError) { Regexp.new("(?=a{2,1})") }
+  # A body that matches empty reads its quantifiers and emits nothing for
+  # them, and the range is read there too.
+  assert_raise(RegexpError) { Regexp.new("a{0}{2,1}") }
+  assert_raise(RegexpError) { Regexp.new("(?:){2,1}") }
+  # Where there is no atom to repeat, the range is what CRuby reports, ahead
+  # of the missing target.
+  assert_raise(RegexpError) { Regexp.new("{2,1}") }
+  # Equal bounds are a repeat of exactly n, and an omitted upper bound is
+  # unlimited: neither is below the lower bound.
+  assert_equal "aa", Regexp.new("a{2,2}").match("aaa")[0]
+  assert_equal "aaa", Regexp.new("a{2,}").match("aaa")[0]
+  assert_equal "", Regexp.new("a{0,0}").match("aaa")[0]
+  # A `{...}` that is no quantifier is still a literal brace rather than a
+  # bad range, whether the `}` is missing or the braces are escaped.
+  assert_equal "a{2,1", "a{2,1".match(/a{2,1/)[0]
+  assert_equal "a{2,1}", "a{2,1}".match(/a\{2,1}/)[0]
+  assert_equal "{2,1}", "a{2,1}".match(/[{]2,1[}]/)[0]
 end
 
 assert("Regexp - repeated group keeps each iteration self-contained") do
@@ -1506,6 +1634,73 @@ assert("Regexp - \\k group reference errors say which failure it was") do
                             "invalid group name <1\0>: /(a)\\k<1\0>/") do
     Regexp.new("(a)\\k<1\0>")
   end
+end
+
+assert("Regexp - a group name may not be a number") do
+  # A definition names a group, it never numbers one: the number spelling
+  # belongs to a reference, and CRuby refuses a leading digit or `-` where a
+  # group is declared. (?<1>x) used to be accepted and left the group
+  # unreachable, since \k<1> reads digits as a number and a named pattern
+  # refuses a numbered backreference.
+  msg = "invalid group name"
+  assert_raise_with_message(RegexpError, "#{msg} <1>: /(?<1>c)/") do
+    Regexp.new("(?<1>c)")
+  end
+  assert_raise_with_message(RegexpError, "#{msg} <1a>: /(?<1a>c)/") do
+    Regexp.new("(?<1a>c)")
+  end
+  assert_raise_with_message(RegexpError, "#{msg} <-a>: /(?<-a>c)/") do
+    Regexp.new("(?<-a>c)")
+  end
+  # both spellings declare, so both refuse, and the message quotes in <>
+  # whichever delimiter wrote the name
+  assert_raise_with_message(RegexpError, "#{msg} <1a>: /(?'1a'c)/") do
+    Regexp.new("(?'1a'c)")
+  end
+  assert_raise_with_message(RegexpError, "#{msg} <-1>: /(?'-1'c)/") do
+    Regexp.new("(?'-1'c)")
+  end
+
+  # only the first byte carries the number spelling: a digit or a `-` further
+  # in is a name character like any other, as a space is
+  assert_equal ["a1"], Regexp.new("(?<a1>c)").names
+  assert_equal ["a-b"], Regexp.new("(?<a-b>c)").names
+  assert_equal ["a b"], Regexp.new("(?<a b>c)").names
+  assert_equal "cc", "cc".match(Regexp.new("(?<a b>c)\\k<a b>"))[0]
+end
+
+assert("Regexp - a group name may not hold a ')'") do
+  # CRuby's fetch_name() ends the name at a ')' and reports a name no
+  # delimiter ended as invalid. mruby took every byte up to the delimiter, so
+  # patterns CRuby rejects compiled here, with a ')' held as a name character
+  # no other engine reads as one.
+  msg = "invalid group name"
+  assert_raise_with_message(RegexpError, "#{msg} <a)b>c)>: /(?<a)b>c)/") do
+    Regexp.new("(?<a)b>c)")
+  end
+  assert_raise_with_message(RegexpError, "#{msg} <a)b'c)>: /(?'a)b'c)/") do
+    Regexp.new("(?'a)b'c)")
+  end
+  # the scan stops at the ')', so the name is quoted to the end of the
+  # pattern and an unterminated one is refused for the ')' rather than for
+  # its missing delimiter
+  assert_raise_with_message(RegexpError, "#{msg} <a)b>: /(?<a)b/") do
+    Regexp.new("(?<a)b")
+  end
+
+  # the reference arm reads a name the same way and stops the same way
+  assert_raise_with_message(RegexpError, "#{msg} <a)b>>: /(?<a>c)\\k<a)b>/") do
+    Regexp.new("(?<a>c)\\k<a)b>")
+  end
+  assert_raise_with_message(RegexpError, "#{msg} <a)b'>: /(?<a>c)\\k'a)b'/") do
+    Regexp.new("(?<a>c)\\k'a)b'")
+  end
+
+  # the first byte is exempt in both arms, as it is in CRuby: a lone ')' is a
+  # name a group can carry and a reference can reach
+  assert_equal [")"], Regexp.new("(?<)>c)").names
+  assert_equal "cc", "cc".match(Regexp.new("(?<)>c)\\k<)>"))[0]
+  assert_equal "cc", "cc".match(Regexp.new("(?')'c)\\k')'"))[0]
 end
 
 assert("Regexp - named captures survive /x preprocessing") do

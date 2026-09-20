@@ -762,6 +762,38 @@ prepare_missing(mrb_state *mrb, mrb_callinfo *ci, mrb_value recv, mrb_sym mid, m
   return m;
 }
 
+mrb_value
+mrb_args_pack_positional(mrb_state *mrb)
+{
+  mrb_callinfo *ci = mrb->c->ci;
+  int argc = ci->n;
+  mrb_value *argv = ci->stack + 1;
+
+  if (argc < CALL_MAXARGS) {
+    mrb_value args = mrb_ary_new_from_values(mrb, argc, argv);
+    /* self, the array, a keyword hash and a block: a frame that carried
+       fewer arguments than that has no room for the slots written below.
+       prepare_missing() makes the same room before writing the same ones. */
+    stack_extend(mrb, 4);
+    argv = ci->stack + 1;       /* maybe reallocated */
+    if (ci->nk == 0) {
+      mrb_value block = argv[argc];
+      argv[1] = block;
+    }
+    else {
+      mrb_assert(ci->nk == CALL_MAXARGS);
+      mrb_value keyword = argv[argc];
+      mrb_value block = argv[argc + 1];
+      argv[1] = keyword;
+      argv[2] = block;
+    }
+    argv[0] = args;
+    ci->n = CALL_MAXARGS;
+  }
+
+  return *argv;
+}
+
 static void
 funcall_args_capture(mrb_state *mrb, int stoff, mrb_int argc, const mrb_value *argv, mrb_value block, mrb_callinfo *ci)
 {
@@ -3101,8 +3133,11 @@ RETRY_TRY_BLOCK:
         mrb_raisef(mrb, E_TYPE_ERROR, "wrong type %T (expected Proc)", regs[a]);
       }
       const struct RProc *p = mrb_proc_ptr(regs[a]);
-      ci = cipush(mrb, a, CINFO_DIRECT, NULL, NULL, NULL, 0, b);
-      ci->cci = CINFO_NONE;  /* mark as VM-to-VM call for proper break handling */
+      /* CINFO_NONE rather than CINFO_DIRECT: the proc runs inside this
+         mrb_vm_exec(), so a break crossing this frame is unwound here. The
+         unwind throws past any frame it finds carrying another cci, out to a
+         C caller that a call from here does not have. */
+      ci = cipush(mrb, a, CINFO_NONE, NULL, NULL, NULL, 0, b);
       int r = vm_call_proc(mrb, p, b+1, &irep, ai);
       ci = mrb->c->ci;
       if (r == VM_RAISE) goto L_RAISE;
@@ -3186,7 +3221,7 @@ RETRY_TRY_BLOCK:
     }
 
     CASE(OP_BREAK, B) {
-      if (MRB_PROC_STRICT_P(ci->proc)) goto NORMAL_RETURN;
+      if (MRB_PROC_STRICT_P(ci->proc)) goto L_OP_RETURN_BODY;
       if (!MRB_PROC_ORPHAN_P(ci->proc) && MRB_PROC_ENV_P(ci->proc) && ci->proc->e.env->cxt == mrb->c) {
         const struct RProc *dst = ci->proc->upper;
         for (ptrdiff_t i = ci - mrb->c->cibase; i > 0; i--, ci--) {
@@ -3200,7 +3235,7 @@ RETRY_TRY_BLOCK:
     }
     CASE(OP_RETURN_BLK, B) {
       if (!MRB_PROC_ENV_P(ci->proc) || MRB_PROC_STRICT_P(ci->proc)) {
-        goto NORMAL_RETURN;
+        goto L_OP_RETURN_BODY;
       }
 
       const struct REnv *env = ci->u.env;
@@ -3219,7 +3254,7 @@ RETRY_TRY_BLOCK:
     }
     CASE(OP_RETSELF, Z) {
       a = 0;
-      goto NORMAL_RETURN;
+      goto L_OP_RETURN_BODY;
     }
     CASE(OP_RETNIL, Z) {
       a = 0;
@@ -3238,7 +3273,6 @@ RETRY_TRY_BLOCK:
       mrb_value v;
       mrb_callinfo *return_ci;
 
-    NORMAL_RETURN:
       v = regs[a];
       goto L_RETURN;
     L_RETURN_NIL:

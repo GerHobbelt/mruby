@@ -641,13 +641,13 @@ lookbehind_start(const mrb_regexp_pattern *pat, const char *str,
    the RE_LOOK_END (see there), so a cut can pass through one; the opener
    absorbs its own number like an RE_ATOMIC and hands any other up.
    The fourth answer, BT_LIMIT, is a frame giving up at the recursion or step
-   limit. A frame that gets it hands it up; a SPLIT takes it as that branch
-   failing and answers with its other branch, as it would with a failure.
-   What no frame does is turn it into a cut or into a lookaround's answer,
-   since a limit says nothing about the text: the frame giving up may be
-   inside an atomic group's body, where a cut would keep the group's exit
-   from being taken, or inside a negative lookaround, where reading the limit
-   as "no match" would make the assertion hold. */
+   limit, and it is the search's answer rather than the frame's: every frame
+   hands it up unchanged, as it does a cut, and backtrack_exec() stops at it
+   (see there). A limit says nothing about the text, so no frame may read it
+   as its branch having failed and answer with its other branch, which would
+   be answering a smaller question with whatever the alternatives inside the
+   limit produce: a shorter, a later or no match, told from the real answer
+   by nothing. */
 #define BT_FAIL 0
 #define BT_MATCH 1
 #define BT_LIMIT 2
@@ -849,18 +849,18 @@ bt_match(bt_state *m, const char *sp, uint32_t pc, int depth)
       if (inst.a) {
         if (inst.offset > pc) {
           int r = bt_iter(m, sp, pc + 1, pc, depth + 1);
-          if (r != BT_FAIL && r != BT_LIMIT) return r;
+          if (r != BT_FAIL) return r;
           pc = inst.offset;
           break;
         }
         if (ITER_EMPTY(m, pc, sp)) { pc++; break; }
         int r = bt_match(m, sp, pc + 1, depth + 1);
-        if (r != BT_FAIL && r != BT_LIMIT) return r;
+        if (r != BT_FAIL) return r;
         return bt_iter(m, sp, inst.offset, pc, depth + 1);
       }
       {
         int r = bt_match(m, sp, pc + 1, depth + 1);
-        if (r != BT_FAIL && r != BT_LIMIT) return r;
+        if (r != BT_FAIL) return r;
       }
       pc = inst.offset;
       break;
@@ -873,18 +873,18 @@ bt_match(bt_state *m, const char *sp, uint32_t pc, int depth)
       if (inst.a) {
         if (inst.offset > pc) {
           int r = bt_match(m, sp, inst.offset, depth + 1);
-          if (r != BT_FAIL && r != BT_LIMIT) return r;
+          if (r != BT_FAIL) return r;
           return bt_iter(m, sp, pc + 1, pc, depth + 1);
         }
         if (ITER_EMPTY(m, pc, sp)) { pc++; break; }
         int r = bt_iter(m, sp, inst.offset, pc, depth + 1);
-        if (r != BT_FAIL && r != BT_LIMIT) return r;
+        if (r != BT_FAIL) return r;
         pc++;
         break;
       }
       {
         int r = bt_match(m, sp, inst.offset, depth + 1);
-        if (r != BT_FAIL && r != BT_LIMIT) return r;
+        if (r != BT_FAIL) return r;
       }
       pc++;
       break;
@@ -900,13 +900,27 @@ bt_match(bt_state *m, const char *sp, uint32_t pc, int depth)
           return BT_FAIL;
         }
         if (slot < ncap) {
+          /* An even slot opens its group, and the pair it heads is a span
+             only while the group is closed: clear the end slot with the
+             start, so that RE_BACKREF reads a group a repetition has just
+             re-entered the way it reads one never entered, instead of
+             pairing this iteration's start with the end of the one before:
+             an empty span where the two coincide, and a negative one where
+             the start is past it, which no closed group holds. CRuby
+             reads an open group as unmatched the same way (Onigmo's
+             STACK_PUSH_MEM_START invalidates the end with the start). The
+             end slot exists whenever the start does, ncap being even. */
+          mrb_bool opens = (slot & 1) == 0;
           int old = captures[slot];
+          int old_end = opens ? captures[slot + 1] : 0;
           captures[slot] = (int)(sp - str);
+          if (opens) captures[slot + 1] = -1;
           int r = bt_match(m, sp, pc + 1, depth + 1);
           if (r == BT_MATCH) return r;
           /* undone for a cut as for a failure: the group the cut fails may
              be the one this slot was written inside */
           captures[slot] = old;
+          if (opens) captures[slot + 1] = old_end;
           return r;
         }
         return BT_FAIL;
@@ -1116,13 +1130,24 @@ backtrack_exec(mrb_state *mrb, const mrb_regexp_pattern *pat,
     memset(caps, -1, sizeof(int) * ncap);
     m.steps = 0;
 
-    if (bt_match(&m, sp, 0, 0) == BT_MATCH) {
+    int r = bt_match(&m, sp, 0, 0);
+    if (r == BT_MATCH) {
       if (captures) {
         int copy = ncap < captures_size ? ncap : captures_size;
         memcpy(captures, caps, sizeof(int) * copy);
       }
       mrb_free(mrb, caps);
       return ncap > 0 ? ncap : 1;
+    }
+    if (r == BT_LIMIT) {
+      /* The search ends here, not this start position's attempt: the
+         positions after it answer where the first match is only once this
+         one has none, which is what the limit left unanswered. Which limit
+         is read off the step count: the depth check runs before a frame
+         counts its step, so the count is over the step limit exactly when
+         the step check gave up. */
+      mrb_free(mrb, caps);
+      return m.steps > MRB_REGEXP_STEP_LIMIT ? RE_OVER_STEP_LIMIT : RE_OVER_RECURSION_LIMIT;
     }
   }
   mrb_free(mrb, caps);
@@ -1239,6 +1264,10 @@ mrb_re_rexec(mrb_state *mrb, const mrb_regexp_pattern *pat,
     if (len - lo > RE_RSEARCH_PROBE_SPAN) break;
     memset(captures, -1, sizeof(int) * captures_size);
     last_n = exec_range(mrb, pat, str, len, lo, limit, captures, captures_size, binary);
+    /* A match or a limit ends the probe. A limit is the answer to the whole
+       question and not to this window's: a window that gave up is not one
+       with no match in it, and widening would only ask the same search
+       again a size up. */
     if (last_n) break;
     /* The window had grown to the whole range, so there is no match to find
        and the search below would only ask again. */
@@ -1250,6 +1279,7 @@ mrb_re_rexec(mrb_state *mrb, const mrb_regexp_pattern *pat,
     last_n = exec_range(mrb, pat, str, len, 0, limit, captures, captures_size, binary);
     if (last_n == 0) return 0;
   }
+  if (last_n < 0) return last_n;
 
   /* Whichever range answered gave its leftmost match; the last one is found
      by walking forward from it. Each step resumes one byte past the match
@@ -1264,6 +1294,7 @@ mrb_re_rexec(mrb_state *mrb, const mrb_regexp_pattern *pat,
     memset(captures, -1, sizeof(int) * captures_size);
     int n = exec_range(mrb, pat, str, len, pos, limit, captures, captures_size, binary);
     if (n == 0) break;
+    if (n < 0) return n;
     last_n = n;
     memcpy(last, captures, sizeof(int) * captures_size);
     pos = captures[0] + 1;
