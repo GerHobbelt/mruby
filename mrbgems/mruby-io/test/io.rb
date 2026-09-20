@@ -3,6 +3,7 @@
 
 MRubyIOTestUtil.io_test_setup
 $cr, $cmd = MRubyIOTestUtil.win? ? [1, "cmd /c "] : [0, ""]
+$cat = MRubyIOTestUtil.win? ? 'findstr "^"' : 'cat'
 
 def assert_io_open(meth)
   assert "assert_io_open" do
@@ -26,8 +27,8 @@ def assert_io_open(meth)
       end
     end
 
-    assert_raise(RuntimeError) { IO.__send__(meth, 1023) } # For Windows
-    assert_raise(RuntimeError) { IO.__send__(meth, 1 << 26) }
+    assert_raise(Errno::EBADF) { IO.__send__(meth, 1023) } # For Windows
+    assert_raise(Errno::EBADF) { IO.__send__(meth, 1 << 26) }
   end
 end
 
@@ -158,13 +159,28 @@ assert('IO#read', '15.2.20.5.14') do
   end
 end
 
+assert('IO.pipe carries what is written to it') do
+  # The test named `IO.pipe` below stops at `FileTest.pipe?`, which Windows
+  # has no answer for, so the one thing a pipe is for goes unasserted on the
+  # platform that has only just been given one.
+  IO.pipe do |r, w|
+    w.write "hello"
+    w.close
+    assert_equal "hello", r.read
+  end
+end
+
 assert "IO#read(n) with n > IO::BUF_SIZE" do
   buf_size = 4096  # copied from io.c
-  skip "pipe is not supported on this platform" if MRubyIOTestUtil.win?
-  IO.pipe do |r,w|
-    n = buf_size+1
-    w.write 'a'*n
-    assert_equal 'a'*n, r.read(n)
+  n = buf_size+1
+  dir = MRubyIOTestUtil.mkdtemp("mruby-io-test.XXXXXX")
+  path = "#{dir}/bufsize"
+  begin
+    File.open(path, "w") { |f| f.write('a'*n) }
+    File.open(path, "r") { |f| assert_equal 'a'*n, f.read(n) }
+  ensure
+    File.delete(path) rescue nil
+    MRubyIOTestUtil.rmdir dir
   end
 end
 
@@ -295,12 +311,7 @@ assert('IO gc check') do
 end
 
 assert('IO.sysopen("./nonexistent")') do
-  if Object.const_defined? :Errno
-    eclass = Errno::ENOENT
-  else
-    eclass = RuntimeError
-  end
-  assert_raise eclass do
+  assert_raise Errno::ENOENT do
     fd = IO.sysopen "./nonexistent"
     IO._sysclose fd
   end
@@ -376,7 +387,6 @@ assert('IO#ungetc') do
 end
 
 assert('IO#ungetc after grow and partial read') do
-  skip "pipe is not supported on this platform" if MRubyIOTestUtil.win?
   # ungetc grows the buffer past MRB_IO_BUF_SIZE, a partial read advances
   # start, then a second ungetc must not read past the reallocated block (#6964)
   IO.pipe do |r, w|
@@ -388,15 +398,16 @@ assert('IO#ungetc after grow and partial read') do
 end
 
 assert('IO#isatty') do
-  skip "isatty is not supported on this platform" if MRubyIOTestUtil.win?
-  begin
-    f = File.open("/dev/tty")
-  rescue RuntimeError => e
-    skip e.message
-  else
-    assert_true f.isatty
-  ensure
-    f&.close
+  unless MRubyIOTestUtil.win?
+    begin
+      f = File.open("/dev/tty")
+    rescue SystemCallError => e
+      skip e.message
+    else
+      assert_true f.isatty
+    ensure
+      f&.close
+    end
   end
   begin
     f = File.open($mrbtest_io_rfname)
@@ -525,9 +536,9 @@ end
 assert('IO.popen with in option') do
   begin
     IO.pipe do |r, w|
-      w.write 'hello'
+      w.write "hello\n"
       w.close
-      assert_equal "hello", IO.popen("cat", "r", in: r) { |i| i.read }
+      assert_equal "hello\n", IO.popen($cat, "r", in: r) { |i| i.read }
       assert_equal "", r.read
     end
     assert_raise(ArgumentError) { IO.popen("hello", "r", in: Object.new) }
@@ -539,9 +550,9 @@ end
 assert('IO.popen with out option') do
   begin
     IO.pipe do |r, w|
-      IO.popen("echo 'hello'", "w", out: w) {}
+      IO.popen(MRubyIOTestUtil.win? ? "echo hello" : "echo 'hello'", "w", out: w) {}
       w.close
-      assert_equal "hello\n", r.read
+      assert_equal MRubyIOTestUtil.win? ? "hello\r\n" : "hello\n", r.read
     end
   rescue NotImplementedError => e
     skip e.message
@@ -551,9 +562,12 @@ end
 assert('IO.popen with err option') do
   begin
     IO.pipe do |r, w|
-      assert_equal "", IO.popen("echo 'hello' 1>&2", "r", err: w) { |i| i.read }
+      cmd = MRubyIOTestUtil.win? ? "echo hello 1>&2" : "echo 'hello' 1>&2"
+      assert_equal "", IO.popen(cmd, "r", err: w) { |i| i.read }
       w.close
-      assert_equal "hello\n", r.read
+      # cmd.exe's `echo` includes the space before the redirection operator
+      # in what it prints, so the Windows side carries a trailing space.
+      assert_equal MRubyIOTestUtil.win? ? "hello \r\n" : "hello\n", r.read
     end
   rescue NotImplementedError => e
     skip e.message
@@ -561,15 +575,83 @@ assert('IO.popen with err option') do
 end
 
 assert('IO#close_write') do
-  skip "no `cat` to talk to on this platform" if MRubyIOTestUtil.win?
   begin
-    io = IO.popen("cat", "r+")
+    io = IO.popen($cat, "r+")
     io.write "mruby-io\n"
     io.close_write
     assert_false io.closed?
     assert_equal "mruby-io\n", io.read
     io.close
     assert_true io.closed?
+  rescue NotImplementedError => e
+    skip e.message
+  end
+end
+
+assert('IO#close_write closes the stream for writing') do
+  begin
+    io = IO.popen($cat, "r+")
+    io.write "mruby-io\n"
+    io.close_write
+    assert_raise(IOError) { io.write "again" }
+    assert_raise(IOError) { io.syswrite "again" }
+    assert_raise(IOError) { io.print "again" }
+    assert_raise(IOError) { io.puts "again" }
+    assert_raise(IOError) { io.putc "a" }
+    assert_raise(IOError) { io << "again" }
+    if MRubyIOTestUtil::MRB_USE_IO_PREAD_PWRITE
+      assert_raise(IOError) { io.pwrite("again", 0) }
+    end
+    assert_equal "mruby-io\n", io.read
+    io.close
+  rescue NotImplementedError => e
+    skip e.message
+  end
+end
+
+assert('IO#close_write on a stream with no write end') do
+  # A stream nothing reads from has only the end being closed.
+  io = IO.new(IO.sysopen($mrbtest_io_wfname, "w"), "w")
+  assert_nil io.close_write
+  assert_true io.closed?
+
+  # A stream something reads from has no write end to give up.
+  io = IO.new(IO.sysopen($mrbtest_io_rfname), "r")
+  assert_raise(IOError) { io.close_write }
+  assert_false io.closed?
+  io.close
+
+  io = IO.new(IO.sysopen($mrbtest_io_wfname, "r+"), "r+")
+  assert_raise(IOError) { io.close_write }
+  assert_false io.closed?
+  io.close
+end
+
+assert('IO#close_write on a pipe end') do
+  begin
+    r, w = IO.pipe
+    assert_nil w.close_write
+    assert_true w.closed?
+    assert_equal "", r.read
+    r.close
+
+    r, w = IO.pipe
+    assert_raise(IOError) { r.close_write }
+    r.close
+    w.close
+  rescue NotImplementedError => e
+    skip e.message
+  end
+end
+
+assert('IO#close_write twice') do
+  begin
+    io = IO.popen($cat, "r+")
+    io.close_write
+    # the write end is already gone, and the stream is still read from
+    assert_raise(IOError) { io.close_write }
+    assert_false io.closed?
+    io.close
   rescue NotImplementedError => e
     skip e.message
   end
@@ -661,7 +743,7 @@ assert('IO#pread') do
     assert_equal 0, io.pos
     assert_equal $mrbtest_io_msg.byteslice(1, 5), io.pread(5, 1)
     assert_equal 0, io.pos
-    assert_raise(RuntimeError) { io.pread(20, -9) }
+    assert_raise(Errno::EINVAL) { io.pread(20, -9) }
   end
 end
 

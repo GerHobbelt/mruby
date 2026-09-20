@@ -2,7 +2,7 @@
 
 # Wrapper for running tests for cross-compiled Windows builds in Wine.
 
-require 'open3'
+require 'tmpdir'
 
 DOSROOT = 'z:'
 
@@ -24,19 +24,45 @@ def clean(output, stderr = false)
   # A limit of -1 keeps the trailing empty fields, so a blank line at the end
   # of the output survives the round trip; a disassembly ends with one.
   results = output.split(/\n/, -1).map do |line|
-    # Fix file paths
-    if line =~ /#{DOSROOT}\\/i
-      line.gsub!(/#{DOSROOT}([^:]*)/i) { |path|
-        path.gsub!(/^#{DOSROOT}/i, '')
-        path.gsub!(%r{\\}, '/')
-        path
-      }
-    end
+    # Fix file paths.  A line that holds one is not all path, so what a path
+    # is has to be said on both ends: `z:` is a root only where a path
+    # follows it, which is what the backslash asks, and a path ends where the
+    # next root begins.  Without the first, a `z:` that is merely text is
+    # taken for a root and the words after it go with it; without the second,
+    # a path that follows another on the same line is swallowed by it.
+    line.gsub!(/#{DOSROOT}(\\(?:(?!#{DOSROOT})[^:])*)/i) { |path|
+      path.sub(/\A#{DOSROOT}/i, '').gsub(%r{\\}, '/')
+    }
 
     line
   end
 
   results.join("\n")
+end
+
+
+# Run a Windows program under Wine and hand back what it wrote and how it
+# ended, the way `Open3.capture3` would.
+#
+# Not the way it would, though.  Wine starts background services on its way
+# up and gives each of them the standard streams it was handed itself, and
+# they outlive the program.  A pipe is at an end when the last writer lets go
+# of it, so reading one here is waiting on those services and not on the
+# program: the wrapper hangs, holding a pipe no one will write to again, long
+# after the program it ran has exited.  A file ends where its contents do,
+# whoever else still holds it open.
+def capture(argv, input)
+  Dir.mktmpdir('wine-runner') do |dir|
+    stdin  = File.join(dir, 'stdin')
+    stdout = File.join(dir, 'stdout')
+    stderr = File.join(dir, 'stderr')
+    File.write(stdin, input)
+
+    pid = Process.spawn('wine', *argv, in: stdin, out: stdout, err: stderr)
+    _, status = Process.waitpid2(pid)
+
+    [File.read(stdout), File.read(stderr), status]
+  end
 end
 
 
@@ -59,7 +85,7 @@ def main
   ENV['WINEDEBUG'] = 'err-all,warn-all,fixme-all,trace-all'
 
   # Run the program in wine and capture the output
-  output, errormsg, status = Open3.capture3('wine', *ARGV, :stdin_data => input)
+  output, errormsg, status = capture(ARGV, input)
 
   # Clean and print the results.
   STDOUT.write clean(output)

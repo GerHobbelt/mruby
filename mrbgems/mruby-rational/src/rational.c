@@ -266,12 +266,24 @@ rational_new_b(mrb_state *mrb, mrb_value n, mrb_value d)
   }
   /* normalize (n/gcd, d/gcd) */
   mrb_bint_reduce(mrb, &n, &d);
+  /* demote halves that now fit mrb_int, the same way bint_norm() would;
+     mrb_bint_reduce() itself hands back bigint objects unconditionally */
+  n = mrb_bint_mul(mrb, n, ONE);
+  d = mrb_bint_mul(mrb, d, ONE);
   struct RClass *c = mrb_class_get_id(mrb, MRB_SYM(Rational));
   struct RBasic *rat;
   struct mrb_rational *p = rat_alloc(mrb, c, &rat);
+  if (!mrb_bigint_p(n) && !mrb_bigint_p(d)) {
+    /* both halves fit mrb_int: store the same layout mrb_rational_new()
+       would, so this value hashes the same as one built from fixnums */
+    p->numerator = mrb_integer(n);
+    p->denominator = mrb_integer(d);
+    rat->frozen = 1;
+    return mrb_obj_value(rat);
+  }
   rat->flags |= RAT_BIGINT;
-  p->b.num = (struct RBasic*)mrb_obj_ptr(n);
-  p->b.den = (struct RBasic*)mrb_obj_ptr(d);
+  p->b.num = (struct RBasic*)mrb_obj_ptr(mrb_as_bint(mrb, n));
+  p->b.den = (struct RBasic*)mrb_obj_ptr(mrb_as_bint(mrb, d));
   rat->frozen = 1;
   return mrb_obj_value(rat);
 }
@@ -717,10 +729,21 @@ rational_eq(mrb_state *mrb, mrb_value x)
       }
       if (mrb_int_mul_overflow(p1->numerator, p2->denominator, &a) ||
           mrb_int_mul_overflow(p2->numerator, p1->denominator, &b)) {
-#ifdef MRB_NO_FLOAT
+        /* Cross-multiply exactly instead of falling to Float: the products
+           are what mrb_bint_mul_n() already holds for the bigint-backed
+           arm above, and a double can round two unequal Rationals equal
+           near its precision limit. */
+#ifdef RAT_BIGINT
+        mrb_value na = mrb_bint_mul_n(mrb, mrb_as_bint(mrb, mrb_int_value(mrb, p1->numerator)),
+                                       mrb_int_value(mrb, p2->denominator));
+        mrb_value nb = mrb_bint_mul_n(mrb, mrb_as_bint(mrb, mrb_int_value(mrb, p2->numerator)),
+                                       mrb_int_value(mrb, p1->denominator));
+        result = mrb_bint_cmp(mrb, na, nb) == 0;
+        break;
+#elif defined(MRB_NO_FLOAT)
         rat_overflow(mrb);
 #else
-        result = (double)p1->numerator*p2->denominator == (double)p2->numerator*p2->denominator;
+        result = (double)p1->numerator*p2->denominator == (double)p2->numerator*p1->denominator;
         break;
 #endif
       }
@@ -1289,9 +1312,13 @@ rational_hash(mrb_state *mrb, mrb_value rat)
 #ifdef RAT_BIGINT
   if (RAT_BIGINT_P(rat)) {
     mrb_value tmp = mrb_bint_hash(mrb, mrb_obj_value(r->b.num));
-    hash = (uint32_t)mrb_integer(tmp);
+    uint32_t num_hash = (uint32_t)mrb_integer(tmp);
     tmp = mrb_bint_hash(mrb, mrb_obj_value(r->b.den));
-    hash ^= (uint32_t)mrb_integer(tmp);
+    uint32_t den_hash = (uint32_t)mrb_integer(tmp);
+    /* chain rather than XOR, so swapping the halves changes the hash the
+       same way the mrb_int path below does */
+    hash = mrb_byte_hash((uint8_t*)&num_hash, sizeof(num_hash));
+    hash = mrb_byte_hash_step((uint8_t*)&den_hash, sizeof(den_hash), hash);
     return mrb_int_value(mrb, hash);
   }
 #endif
