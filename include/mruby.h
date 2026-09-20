@@ -323,6 +323,31 @@ enum mrb_idx_op_slot {
   MRB_IDX_OP_SLOT_COUNT
 };
 
+/**
+ * Operators the arithmetic and comparison opcodes (`OP_ADD`, `OP_LT`, `OP_EQ`
+ * and their kin) answer in C for an Integer, Float or Symbol receiver.  Each
+ * (receiver class, operator) pair owns a bit of `mrb_state.bop_redefined`,
+ * numbered by the macros below.
+ */
+enum mrb_bop {
+  MRB_BOP_ADD,                  /* +  */
+  MRB_BOP_SUB,                  /* -  */
+  MRB_BOP_MUL,                  /* *  */
+  MRB_BOP_DIV,                  /* /  */
+  MRB_BOP_EQ,                   /* == */
+  MRB_BOP_LT,                   /* <  */
+  MRB_BOP_LE,                   /* <= */
+  MRB_BOP_GT,                   /* >  */
+  MRB_BOP_GE,                   /* >= */
+  MRB_BOP_COUNT
+};
+
+#define MRB_BOP_INTEGER(op) (1u << (op))                  /* Integer#op */
+#define MRB_BOP_FLOAT(op)   (1u << (MRB_BOP_COUNT + (op))) /* Float#op   */
+#define MRB_BOP_NUMERIC(op) (MRB_BOP_INTEGER(op) | MRB_BOP_FLOAT(op))
+#define MRB_BOP_SYMBOL_EQ   (1u << (2 * MRB_BOP_COUNT))    /* Symbol#==  */
+#define MRB_BOP_SLOT_COUNT  (2 * MRB_BOP_COUNT + 1)
+
 #ifdef MRB_USE_TASK_SCHEDULER
 struct mrb_task;
 
@@ -389,6 +414,15 @@ struct mrb_state {
 
   mrb_bool bootstrapping;
 
+  /* Set from outside a running mrb_vm_exec() to ask it to stop: from a signal
+     handler, or from another thread.  The VM reads it where a program can
+     spend time without returning, which is a send and the four conditional
+     and unconditional jumps, so a loop or a recursion is interrupted while
+     straight-line code costs nothing.  mrb_vm_exec() raises the interrupt as
+     an exception in the running code and clears the flag; a caller sets it
+     with mrb_vm_interrupt() and reads what happened as an ordinary raise. */
+  volatile mrb_bool vm_interrupt;
+
 #ifndef MRB_NO_METHOD_CACHE
   struct mrb_cache_entry cache[MRB_METHOD_CACHE_SIZE];
 #endif
@@ -449,10 +483,20 @@ struct mrb_state {
      and NULL once it does not, so the class-pointer test the opcodes already
      perform rejects a redefined operator at no extra cost.  NULL is safe as
      the disabled value because no live object has a NULL class pointer.
-     Armed by mrb_idx_op_init(), rechecked by mrb_idx_op_update().  Placed at
+     Armed by mrb_builtin_op_init(), rechecked by mrb_builtin_op_update().  Placed at
      the end of the struct so that adding them moves no existing field. */
   struct RClass *idx_class[MRB_IDX_OP_SLOT_COUNT];
   mrb_method_t idx_builtin[MRB_IDX_OP_SLOT_COUNT];
+
+  /* The arithmetic and comparison opcodes answer `+`, `<`, `==` and their kin
+     from C for an Integer, Float or Symbol receiver.  Those are immediate
+     values whose type tag names the class, so there is no class pointer for a
+     slot to disarm; each (class, operator) pair owns a bit here instead, clear
+     while the operator still resolves to the builtin recorded in
+     `bop_builtin` and set once it does not.  Bit numbers are the `MRB_BOP_*`
+     macros, which also index `bop_builtin`. */
+  uint32_t bop_redefined;
+  mrb_method_t bop_builtin[MRB_BOP_SLOT_COUNT];
 
 #ifdef MRB_USE_TASK_SCHEDULER
   mrb_task_state task;                    /* Task scheduler state */
@@ -1497,6 +1541,20 @@ MRB_API mrb_value mrb_top_run(mrb_state *mrb, const struct RProc *proc, mrb_valu
 
 MRB_API mrb_value mrb_vm_run(mrb_state *mrb, const struct RProc *proc, mrb_value self, mrb_int stack_keep);
 MRB_API mrb_value mrb_vm_exec(mrb_state *mrb, const struct RProc *proc, const mrb_code *iseq);
+
+/**
+ * Ask a running mrb_vm_exec() to stop.
+ *
+ * Safe to call from a signal handler or from another thread: it writes one
+ * flag and reads nothing.  The VM notices at its next send or jump, raises
+ * RuntimeError in the code that was running, and clears the flag, so a caller
+ * handles it as it would any other exception.  A VM that is not running when
+ * this is called stops at the start of the next one.
+ *
+ * Nothing is interrupted between the flag being set and the VM reaching a
+ * send or a jump, so a C function that does not return is not stopped by this.
+ */
+MRB_API void mrb_vm_interrupt(mrb_state *mrb);
 /* compatibility macros */
 #define mrb_toplevel_run_keep(m,p,k) mrb_top_run((m),(p),mrb_top_self(m),(k))
 #define mrb_toplevel_run(m,p) mrb_toplevel_run_keep((m),(p),0)

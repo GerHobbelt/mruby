@@ -465,3 +465,83 @@ assert('next inside rescue continues the loop') do
   end
   assert_equal 300, v
 end
+
+assert('$! names the exception a rescue clause is running') do
+  # `$!` is read where a clause is entered and put back where it is left, so
+  # it names the exception only for as long as a clause of that begin runs.
+  # The restore is also an ensure over the clauses, so `return`, `break` and a
+  # raise of the clause's own leave the name as they found it.
+  assert_equal 'a', (begin; raise 'a'; rescue; $!.message; end)
+  assert_nil $!
+
+  # `rescue => e` names the same object
+  assert_true (begin; raise 'b'; rescue => e; e.equal?($!); end)
+
+  # a nested rescue puts back what the outer one set
+  outer = begin
+            raise 'outer'
+            rescue
+              begin; raise 'inner'; rescue; end
+              $!.message
+            end
+  assert_equal 'outer', outer
+  assert_nil $!
+
+  # the clause that matches is the one that names it
+  assert_equal TypeError, (begin; raise TypeError, 't'; rescue ArgumentError; nil; rescue TypeError; $!.class; end)
+  assert_nil $!
+
+  # a clause left by return or break is left restored
+  def self.__bang_ret; begin; raise 'r'; rescue; return $!.message; end; end
+  assert_equal 'r', __bang_ret
+  assert_nil $!
+
+  # an exception no clause matches carries on with the name untouched
+  assert_equal 'inner', (begin
+                           begin; raise TypeError, 'inner'; rescue ArgumentError; nil; end
+                         rescue TypeError
+                           $!.message
+                         end)
+  assert_nil $!
+end
+
+assert('raise without arguments re-raises the exception being rescued') do
+  # Inside a rescue clause it is that exception, which `$!` names, and so
+  # it works across a method boundary too.
+  e = nil
+  begin
+    begin
+      raise TypeError, "inner"
+    rescue
+      raise
+    end
+  rescue => ex
+    e = ex
+  end
+  assert_equal TypeError, e.class
+  assert_equal "inner", e.message
+
+  def reraise_now
+    raise
+  end
+  begin
+    begin
+      raise ArgumentError, "through a method"
+    rescue
+      reraise_now
+    end
+  rescue => ex
+    e = ex
+  end
+  assert_equal ArgumentError, e.class
+  assert_equal "through a method", e.message
+
+  # Where there is nothing being rescued there is nothing to re-raise, and
+  # that is a RuntimeError: outside any clause, and after one has finished.
+  assert_raise(RuntimeError) { raise }
+  begin
+    raise TypeError, "done with"
+  rescue
+  end
+  assert_raise(RuntimeError) { raise }
+end

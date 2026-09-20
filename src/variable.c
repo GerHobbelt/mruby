@@ -1349,20 +1349,68 @@ mrb_const_get(mrb_state *mrb, mrb_value mod, mrb_sym sym)
   return const_get(mrb, mrb_class_ptr(mod), sym, FALSE);
 }
 
+static struct RClass*
+proc_class(mrb_state *mrb, const struct RProc *proc)
+{
+  struct RClass *c = MRB_PROC_TARGET_CLASS(proc);
+  return c ? c : mrb->object_class;
+}
+
+/* The class a proc looks constants up from, which is its target class except
+   for a method defined with `def self.name`.  That method runs with the
+   singleton class as its target, but CRuby does not push the singleton as a
+   cref there: the name is looked up from the class body around it, so
+   `def self.name; K; end` finds K in a superclass before the top level and
+   does not see a K set inside `class << self`.  `class << self` does push
+   one.  The two leave the same target class on the proc, and the difference
+   is in what opened the run of procs sharing it: walk up while the target
+   stays the singleton, and the topmost proc is either that method body (a
+   scope that is strict) or the `class << self` body (a scope that is not).
+   A block given a class of its own, instance_eval's, is neither and keeps
+   its class, as it did. */
+static struct RClass*
+cref_class(mrb_state *mrb, const struct RProc *proc)
+{
+  struct RClass *c = proc_class(mrb, proc);
+  const struct RProc *p = proc;
+
+  if (c->tt != MRB_TT_SCLASS) return c;
+  while (p->upper && proc_class(mrb, p->upper) == c) p = p->upper;
+  if (MRB_PROC_SCOPE_P(p) && MRB_PROC_STRICT_P(p) && p->upper) {
+    return proc_class(mrb, p->upper);
+  }
+  return c;
+}
+
+/* Whether a proc on the `upper` chain is a lexical scope of its own for
+   the constant walk, the way a cref is in CRuby. A class or method body
+   is one. A block is not: it runs in the class scope of the proc it was
+   written in, so its class is the class around it, and it adds nothing.
+   A proc given a class of its own, an eval string under a receiver,
+   is a scope, as its cref is in CRuby. The caller leaves out the proc
+   with no `upper`, the top level: it is not a scope of its own, and
+   its class is reached through the ancestors after the lexical scopes,
+   so that a superclass wins over a top-level constant. */
+static mrb_bool
+lexical_scope_p(mrb_state *mrb, const struct RProc *proc)
+{
+  if (MRB_PROC_SCOPE_P(proc)) return TRUE;
+  return proc_class(mrb, proc) != proc_class(mrb, proc->upper);
+}
+
 mrb_value
 mrb_vm_const_get(mrb_state *mrb, mrb_sym sym)
 {
   const struct RProc *proc = mrb->c->ci->proc;
-  struct RClass *c = MRB_PROC_TARGET_CLASS(proc), *c2;
+  struct RClass *c = cref_class(mrb, proc), *c2;
   mrb_value v;
 
-  if (!c) c = mrb->object_class;
   if (iv_get(mrb, class_iv_ptr(c), sym, &v)) {
     return v;
   }
-  for (proc = proc->upper; proc; proc = proc->upper) {
-    c2 = MRB_PROC_TARGET_CLASS(proc);
-    if (!c2) c2 = mrb->object_class;
+  for (proc = proc->upper; proc && proc->upper; proc = proc->upper) {
+    if (!lexical_scope_p(mrb, proc)) continue;
+    c2 = cref_class(mrb, proc);
     if (iv_get(mrb, class_iv_ptr(c2), sym, &v)) {
       return v;
     }
@@ -1392,14 +1440,13 @@ mrb_vm_const_get(mrb_state *mrb, mrb_sym sym)
 mrb_value
 mrb_vm_const_get_noraise(mrb_state *mrb, const struct RProc *proc, mrb_sym sym)
 {
-  struct RClass *c = MRB_PROC_TARGET_CLASS(proc), *c2;
+  struct RClass *c = cref_class(mrb, proc), *c2;
   mrb_value v;
 
-  if (!c) c = mrb->object_class;
   if (iv_get(mrb, class_iv_ptr(c), sym, &v)) return v;
-  for (proc = proc->upper; proc; proc = proc->upper) {
-    c2 = MRB_PROC_TARGET_CLASS(proc);
-    if (!c2) c2 = mrb->object_class;
+  for (proc = proc->upper; proc && proc->upper; proc = proc->upper) {
+    if (!lexical_scope_p(mrb, proc)) continue;
+    c2 = cref_class(mrb, proc);
     if (iv_get(mrb, class_iv_ptr(c2), sym, &v)) return v;
   }
   if (c->tt == MRB_TT_SCLASS) {
@@ -1422,6 +1469,16 @@ mrb_bool
 mrb_vm_const_defined_p(mrb_state *mrb, const struct RProc *proc, mrb_sym sym)
 {
   return !mrb_undef_p(mrb_vm_const_get_noraise(mrb, proc, sym));
+}
+
+/* The lookup a constant path read makes from a module, `Mod::NAME`, without
+   its hooks: the value, or undef where the name is missing, with no
+   const_missing call and nothing raised.  A constant Object holds is out of
+   reach from any other module here, as it is for the read. */
+mrb_value
+mrb_const_get_noraise(mrb_state *mrb, struct RClass *mod, mrb_sym sym)
+{
+  return const_get_nohook(mrb, mod, sym, FALSE);
 }
 
 /*

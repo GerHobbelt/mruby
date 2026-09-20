@@ -205,6 +205,29 @@ assert('Module#class_eval with string') do
   assert_equal 55, b.new.b.new.a
 end
 
+assert('Module#class_eval with string opens a constant scope') do
+  Test4EvalConstOrder = :top
+  class Test4EvalConstOrderBase
+    Test4EvalConstOrder = :base
+  end
+  class Test4EvalConstOrderOwner
+    Test4EvalConstOrder = :owner
+  end
+  Test4EvalConstOrderOwner.class_eval <<~CODE
+    class Test4EvalConstOrderSub < Test4EvalConstOrderBase
+      @in_body = Test4EvalConstOrder
+      def in_method; Test4EvalConstOrder; end
+      class << self
+        attr_reader :in_body
+      end
+    end
+  CODE
+
+  # the receiver's scope comes before the superclass, as with `class` nesting
+  assert_equal :owner, Test4EvalConstOrderOwner::Test4EvalConstOrderSub.in_body
+  assert_equal :owner, Test4EvalConstOrderOwner::Test4EvalConstOrderSub.new.in_method
+end
+
 assert 'method visibility with eval' do
   c = Class.new do
     eval <<~CODE
@@ -267,4 +290,53 @@ assert('eval in a scope whose locals are named after a presym literal') do
     results << eval("q")
   }
   assert_equal ['caught', 6, 1], results
+end
+
+assert('a string class_eval leaves the caller\'s scope on its own class') do
+  # The string runs with the receiver as its cref. That cref used to be
+  # written into the env the string shared with the caller's frame, so the
+  # caller's later `def` landed on the receiver and a block made afterwards
+  # started its constant lookup there.
+  c = Class.new
+  c.const_set(:EVAL_CREF_PROBE, :receiver)
+  Object.const_set(:EVAL_CREF_PROBE, :caller) unless Object.const_defined?(:EVAL_CREF_PROBE, false)
+  c.class_eval("def from_string; end")
+  def eval_cref_probe_def; end
+  assert_false c.private_instance_methods(false).include?(:eval_cref_probe_def)
+  assert_true Object.private_instance_methods(false).include?(:eval_cref_probe_def)
+  assert_equal :caller, proc { EVAL_CREF_PROBE }.call
+  assert_true c.method_defined?(:from_string)
+end
+
+assert('a string instance_eval leaves the caller\'s scope on its own class') do
+  o = Object.new
+  o.instance_eval("def from_string; end")
+  Object.instance_eval("1")
+  def eval_cref_probe_def2; end
+  assert_false o.singleton_methods(false).include?(:eval_cref_probe_def2)
+  assert_false Object.singleton_methods(false).include?(:eval_cref_probe_def2)
+  assert_true Object.private_instance_methods(false).include?(:eval_cref_probe_def2)
+  assert_true o.singleton_methods(false).include?(:from_string)
+end
+
+assert('a string class_eval still runs inside the caller\'s scope') do
+  # The string now reaches the caller's frame through a binding of it, so
+  # what a binding carries is what the string keeps: the locals for reading
+  # and writing from any depth, the receiver's constants as its cref, and
+  # the caller's method name.
+  c = Class.new
+  c.const_set(:EVAL_LOCAL_PROBE, :receiver)
+  x = 1
+  assert_equal 2, c.class_eval("x + 1")
+  assert_equal :receiver, c.class_eval("x = 2; EVAL_LOCAL_PROBE")
+  assert_equal 2, x
+  [1].each { c.class_eval("x = 3") }
+  assert_equal 3, x
+  assert_equal :receiver, c.class_eval("proc { EVAL_LOCAL_PROBE }").call
+  k = Class.new { def probe(c); c.class_eval("__method__"); end }
+  assert_equal :probe, k.new.probe(c)
+  # A C function as the caller has no frame to bind; the string still
+  # defines on the receiver.
+  c.method(:class_eval).call("def from_c_caller; end")
+  assert_true c.method_defined?(:from_c_caller)
 end

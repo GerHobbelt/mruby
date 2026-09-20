@@ -32,35 +32,6 @@ providing this feature is not linked in" rather than "mruby does not
 support it." Adding the relevant gem to the build configuration is
 usually enough.
 
-## `Kernel.raise` in rescue clause
-
-`Kernel.raise` without arguments does not raise the current exception within
-a rescue clause.
-
-```ruby
-begin
-  1 / 0
-rescue
-  raise
-end
-```
-
-#### CRuby
-
-`ZeroDivisionError` is raised.
-
-#### mruby
-
-`RuntimeError` is raised instead of `ZeroDivisionError`. To re-raise the exception, you have to do:
-
-```ruby
-begin
-  1 / 0
-rescue => e
-  raise e
-end
-```
-
 ## Fiber execution can't cross C function boundary
 
 mruby's `Fiber` is implemented similarly to Lua's co-routine. This
@@ -91,23 +62,29 @@ p Liste.new "foobar"
 
 ## `defined?`
 
-The `defined?` keyword is considered too complex to be fully
-implemented. It is recommended to use `const_defined?` and
-other reflection methods instead.
+The answer is not the same object each time, and a constant path of
+more than 32 names is answered `nil`. A name mruby does not have, such
+as `$PROGRAM_NAME` or `__dir__`, is answered `nil` as well, since it is
+absent rather than undefined differently.
 
 ```ruby
-defined?(Foo)
+defined?(self).equal?(defined?(self))
+defined?(A::B::C::D::E::F::G::H::I::J::K::L::M::N::O::P::Q::R::S::T::U::V::W::X::Y::Z::A::B::C::D::E::F::G)
 ```
 
 #### CRuby
 
 ```
-nil
+true
+"constant"
 ```
 
 #### mruby
 
-`NameError` is raised.
+```
+false
+nil
+```
 
 ## `alias` on global variables
 
@@ -163,36 +140,6 @@ puts(a.nil? ? "truthy" : "falsy")
 ```
 
 Ruby outputs `truthy`. mruby outputs `falsy`.
-
-## Argument Destructuring
-
-```ruby
-def m(a,(b,c),d); p [a,b,c,d]; end
-m(1,[2,3],4)  # => [1,2,3,4]
-```
-
-Destructured arguments (`b` and `c` in above example) cannot be accessed
-from the default expression of optional arguments and keyword arguments,
-since actual assignment is done after the evaluation of those default
-expressions. Thus:
-
-```ruby
-def f(a,(b,c),d=b)
-  p [a,b,c,d]
-end
-f(1,[2,3])
-```
-
-CRuby gives `[1,2,3,nil]`. mruby raises `NoMethodError` for `b`.
-
-Keyword argument expansion has similar restrictions. The following example, gives `[1, 1]` for CRuby, mruby raises `NoMethodError` for `b`.
-
-```ruby
-def g(a: 1, b: a)
-  p [a,b]
-end
-g(a:1)
-```
 
 ## No Double Dispatch in Module Loading
 

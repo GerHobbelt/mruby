@@ -65,9 +65,10 @@ size_t mrb_class_mt_memsize(mrb_state*, struct RClass*);
 mrb_value mrb_obj_extend(mrb_state*, mrb_value obj);
 #endif
 
-/* inline index opcode guards (class.c); see `idx_class` in `struct mrb_state` */
-void mrb_idx_op_init(mrb_state *mrb);
-void mrb_idx_op_update(mrb_state *mrb, mrb_sym mid);
+/* builtin operator guards (class.c); see `idx_class` and `bop_redefined` in
+   `struct mrb_state` */
+void mrb_builtin_op_init(mrb_state *mrb);
+void mrb_builtin_op_update(mrb_state *mrb, mrb_sym mid);
 void mrb_idx_op_rearm(mrb_state *mrb, enum mrb_idx_op_slot slot);
 
 mrb_value mrb_obj_equal_m(mrb_state *mrb, mrb_value);
@@ -651,6 +652,7 @@ void mrb_vm_cv_set(mrb_state*, mrb_sym, mrb_value);
 mrb_value mrb_vm_const_get(mrb_state*, mrb_sym);
 mrb_bool mrb_vm_const_defined_p(mrb_state *mrb, const struct RProc *proc, mrb_sym sym);
 mrb_value mrb_vm_const_get_noraise(mrb_state *mrb, const struct RProc *proc, mrb_sym sym);
+mrb_value mrb_const_get_noraise(mrb_state *mrb, struct RClass *mod, mrb_sym sym);
 mrb_bool mrb_vm_cv_defined_p(mrb_state *mrb, const struct RProc *proc, mrb_sym sym);
 mrb_bool mrb_gv_defined(mrb_state *mrb, mrb_sym sym);
 #ifdef MRUBY_VARIABLE_H
