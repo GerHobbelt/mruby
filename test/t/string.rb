@@ -152,12 +152,15 @@ assert('String#[] with Range') do
   assert_equal 'xyz', k2
 end
 
-assert('String#[] redefined on String itself is bypassed by the index opcodes') do
+assert('String#[] redefined on String itself reaches the redefinition') do
   # `OP_GETIDX` answers `s[1]` from C, and `OP_GETIDX0` answers `s[0]` the same
-  # way, whenever the receiver's class is exactly `String`. Both therefore
-  # bypass a redefinition installed on `String` itself, the same way the Array
-  # and Hash branches of those opcodes do. A subclass receiver fails the class
-  # guard and keeps reaching the redefinition.
+  # way, whenever the receiver's class is exactly `String`. Answering from C is
+  # allowed only while `String#[]` is still the builtin those opcodes
+  # reimplement, so both test the receiver against `mrb->idx_class[]`, which
+  # the method table drops the moment `String#[]` is replaced. A redefinition
+  # installed on `String` itself is therefore honored, as in CRuby, and not
+  # only the subclass and singleton receivers that already failed the class
+  # test for the other reason.
   String.class_eval do
     alias_method :__aref_before_test, :[]
     def [](*args)
@@ -167,8 +170,8 @@ assert('String#[] redefined on String itself is bypassed by the index opcodes') 
   begin
     s = 'hello'
     sub = Class.new(String).new('hello')
-    assert_equal 'h', s[0]
-    assert_equal 'e', s[1]
+    assert_equal :overridden, s[0]
+    assert_equal :overridden, s[1]
     assert_equal :overridden, sub[0]
   ensure
     String.class_eval do
@@ -178,6 +181,90 @@ assert('String#[] redefined on String itself is bypassed by the index opcodes') 
       remove_method :__aref_before_test if respond_to?(:remove_method, true)
     end
   end
+  # Aliasing the original implementation back makes `String#[]` resolve to it
+  # again, which re-arms the opcodes.
+  assert_equal 'h', 'hello'[0]
+  assert_equal 'e', 'hello'[1]
+end
+
+assert('String#[]= redefined on String itself reaches the redefinition') do
+  # `OP_SETIDX` answers `s[0] = 'X'` from C whenever the receiver's class is
+  # exactly `String`, on the same terms as the `[]` test above: it tests the
+  # receiver against `mrb->idx_class[]`, which the method table drops the
+  # moment `String#[]=` is replaced. A redefinition that stores nothing makes
+  # the difference visible in the receiver as well as in the return value.
+  String.class_eval do
+    alias_method :__aset_before_test, :[]=
+    def []=(*args)
+      $string_aset_redefinition_args = args
+    end
+  end
+  begin
+    s = 'hello'
+    s[0] = 'X'
+    seen = $string_aset_redefinition_args
+    untouched = s.dup
+    sub = Class.new(String).new('hello')
+    sub[0] = 'X'
+    seen_sub = $string_aset_redefinition_args
+  ensure
+    String.class_eval do
+      alias_method :[]=, :__aset_before_test
+      # `remove_method` comes from mruby-metaprog, which the core test build
+      # does not have; the saved alias is harmless where it is missing.
+      remove_method :__aset_before_test if respond_to?(:remove_method, true)
+    end
+    $string_aset_redefinition_args = nil
+  end
+  assert_equal [0, 'X'], seen
+  assert_equal 'hello', untouched
+  assert_equal [0, 'X'], seen_sub
+  # Aliasing the original implementation back re-arms the opcode.
+  s = 'hello'
+  s[0] = 'X'
+  assert_equal 'Xello', s
+end
+
+assert('String#[]= answers the same through the opcode and through a send') do
+  # `s[x] = repl` is answered by `OP_SETIDX` in C, without a method lookup,
+  # while `s.[]=(x, repl)` reaches `String#[]=` itself. The opcode
+  # answers an Integer, String or Range index and a String replacement, and
+  # leaves every other form to the method, so ask both ways and compare the
+  # receiver each left behind.
+  [0, 1, 4, -1, -5].each do |i|
+    a = 'hello'; b = 'hello'
+    a[i] = 'X'
+    b.[]=(i, 'X')
+    assert_equal b, a, "s[#{i}] = 'X'"
+  end
+  ['h', 'll', 'hello', ''].each do |sub|
+    a = 'hello'; b = 'hello'
+    a[sub] = 'X'
+    b.[]=(sub, 'X')
+    assert_equal b, a, "s[#{sub.inspect}] = 'X'"
+  end
+  [0..2, 1...3, -3..-1, 0..-1, 2..99, 3..1].each do |r|
+    a = 'hello'; b = 'hello'
+    a[r] = 'X'
+    b.[]=(r, 'X')
+    assert_equal b, a, "s[#{r.inspect}] = 'X'"
+  end
+  # Each loop above compares the two forms with each other, so anchor one case
+  # of every index type to the result itself: a defect that made both forms
+  # store nothing would agree with itself.
+  a = 'hello'; a[1] = 'X'
+  assert_equal 'hXllo', a
+  a = 'hello'; a['ll'] = 'X'
+  assert_equal 'heXo', a
+  a = 'hello'; a[1..3] = 'X'
+  assert_equal 'hXo', a
+  # The forms the opcode leaves to the method raise what the method raises.
+  assert_raise(IndexError) { 'hello'[99] = 'X' }
+  assert_raise(IndexError) { 'hello'['zz'] = 'X' }
+  assert_raise(IndexError) { 'hello'[99..100] = 'X' }
+  assert_raise(TypeError) { 'hello'[0] = :sym }
+  assert_raise(TypeError) { 'hello'[nil] = 'X' }
+  assert_raise(FrozenError) { 'hello'.freeze[0] = 'X' }
 end
 
 assert('String#[]=') do
@@ -393,6 +480,42 @@ assert('String#upcase - Unicode') do
   assert_equal '日本', '日本'.upcase
   assert_nil '日本'.upcase!
 end if UNICODECASE
+
+assert('String#upcase - an answer that outgrows an embedded buffer') do
+  # U+0390 is two bytes and upper cases to six, so a string short enough to
+  # live inside its own object converts to one that cannot. The answer is
+  # built beside the string, and a buffer that leaves an object carries over
+  # what the object says it holds: the walk has to say how much it has
+  # written, or the bytes written so far are dropped where the buffer moves.
+  assert_equal "Ϊ́" * 4, ("ΐ" * 4).upcase
+  assert_equal 24, ("ΐ" * 4).upcase.bytesize
+  # The same crossing one character at a time, so wherever the boundary of an
+  # embedded string falls, some length below walks over it.
+  1.upto(12) do |n|
+    assert_equal "Ϊ́" * n, ("ΐ" * n).upcase
+  end
+end if UNICODECASE
+
+assert('String case conversion - ASCII only') do
+  # The other reading of case: a build that converts by ASCII, whether by
+  # MRB_USE_ASCII_CASE or by reading its strings as bytes, has no mapping above
+  # ASCII, so a character that has one on the Unicode side stands as it was
+  # while the ASCII beside it still converts.
+  assert_equal 'Ä', 'Ä'.downcase
+  assert_equal 'ä', 'ä'.upcase
+  assert_equal 'Ä', 'Ä'.capitalize
+  assert_equal 'äb', 'äB'.downcase
+  assert_equal 'ÄB', 'Äb'.upcase
+  assert_equal 'Äb', 'ÄB'.capitalize
+  # A conversion that maps nothing is one that changed nothing.
+  assert_nil 'Ä'.downcase!
+  assert_nil 'ä'.upcase!
+  assert_nil 'Ä'.capitalize!
+  # Refusing a run of bytes that spells no character belongs to the walk over
+  # characters; a walk that only knows ASCII hands the bytes back untouched.
+  assert_equal [195, 97, 98, 99], "\xC3ABC".downcase.bytes
+  assert_equal [195, 65, 66, 67], "\xC3ABC".upcase.bytes
+end unless UNICODECASE
 
 assert('String#chomp', '15.2.10.5.9') do
   a = 'abc'.chomp

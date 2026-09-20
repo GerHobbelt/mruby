@@ -29,6 +29,11 @@ size_t mrb_class_mt_memsize(mrb_state*, struct RClass*);
 mrb_value mrb_obj_extend(mrb_state*, mrb_value obj);
 #endif
 
+/* inline index opcode guards (class.c); see `idx_class` in `struct mrb_state` */
+void mrb_idx_op_init(mrb_state *mrb);
+void mrb_idx_op_update(mrb_state *mrb, mrb_sym mid);
+void mrb_idx_op_rearm(mrb_state *mrb, enum mrb_idx_op_slot slot);
+
 mrb_value mrb_obj_equal_m(mrb_state *mrb, mrb_value);
 
 /* debug */
@@ -110,6 +115,7 @@ mrb_noreturn void mrb_int_zerodiv(mrb_state *mrb);
 mrb_noreturn void mrb_int_overflow(mrb_state *mrb, const char *reason);
 #ifndef MRB_NO_FLOAT
 void mrb_check_num_exact(mrb_state *mrb, mrb_float num);
+mrb_int mrb_int_float_cmp(mrb_int x, mrb_float y);
 #endif
 
 #ifdef MRB_USE_COMPLEX
@@ -230,6 +236,7 @@ mrb_value mrb_str_inspect(mrb_state *mrb, mrb_value str);
 mrb_bool mrb_str_beg_len(mrb_int str_len, mrb_int *begp, mrb_int *lenp);
 mrb_value mrb_str_byte_subseq(mrb_state *mrb, mrb_value str, mrb_int beg, mrb_int len);
 mrb_value mrb_str_aref(mrb_state *mrb, mrb_value str, mrb_value idx, mrb_value len);
+void mrb_str_aset(mrb_state *mrb, mrb_value str, mrb_value idx, mrb_value len, mrb_value replace);
 mrb_bool mrb_strcasecmp_p(const char *s1, mrb_int len1, const char *s2, mrb_int len2);
 #define MRB_STR_CASECMP_P(str, lit) \
   mrb_strcasecmp_p(RSTRING_PTR(str), RSTRING_LEN(str), lit, sizeof(lit"")-1)
@@ -381,7 +388,7 @@ enum mrb_case_mode {
    which is what every build without the tables answers to every string.
    `swapcase` lives in mruby-string-ext and reaches the tables through this, so
    they are asked about in one place. */
-#ifdef MRB_UTF8_STRING
+#if defined(MRB_UTF8_STRING) && !defined(MRB_USE_ASCII_CASE)
 int mrb_str_case_convert_unicode(mrb_state *mrb, mrb_value str, enum mrb_case_mode mode);
 #else
 #define mrb_str_case_convert_unicode(mrb, str, mode) (-1)

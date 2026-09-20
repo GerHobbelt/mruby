@@ -2043,8 +2043,10 @@ vm_op_getidx(mrb_state *mrb, uint32_t a, mrb_sym *midp)
   /* Array case is most common - check first with branch hint */
   if (mrb_likely(tt == MRB_TT_ARRAY)) {
     struct RArray *ary = mrb_ary_ptr(va);
-    /* optimize only for Array class; subclasses/singleton may override [] */
-    if (mrb_unlikely(ary->c != mrb->array_class)) goto getidx_fallback;
+    /* optimize only for Array itself; a subclass or singleton may override [],
+       and mrb->idx_class[] is NULL while Array#[] is overridden, so the same
+       comparison rejects that too */
+    if (mrb_unlikely(ary->c != mrb->idx_class[MRB_IDX_OP_ARY_AREF])) goto getidx_fallback;
     if (mrb_likely(mrb_integer_p(vb))) {
       mrb_int idx = mrb_integer(vb);
       mrb_int len;
@@ -2075,8 +2077,8 @@ vm_op_getidx(mrb_state *mrb, uint32_t a, mrb_sym *midp)
     goto getidx_fallback;
   }
   else if (tt == MRB_TT_HASH) {
-    /* optimize only for Hash class; subclasses/singleton may override [] */
-    if (mrb_obj_ptr(va)->c != mrb->hash_class) goto getidx_fallback;
+    /* optimize only for Hash itself; see the Array branch above */
+    if (mrb_obj_ptr(va)->c != mrb->idx_class[MRB_IDX_OP_HASH_AREF]) goto getidx_fallback;
     int ai = mrb_gc_arena_save(mrb);
     va = mrb_hash_get(mrb, va, vb);
     ci = mrb->c->ci;
@@ -2085,8 +2087,8 @@ vm_op_getidx(mrb_state *mrb, uint32_t a, mrb_sym *midp)
     return VM_NEXT;
   }
   else if (tt == MRB_TT_STRING) {
-    /* optimize only for String class; subclasses/singleton may override [] */
-    if (mrb_obj_ptr(va)->c != mrb->string_class) goto getidx_fallback;
+    /* optimize only for String itself; see the Array branch above */
+    if (mrb_obj_ptr(va)->c != mrb->idx_class[MRB_IDX_OP_STR_AREF]) goto getidx_fallback;
     switch (mrb_type(vb)) {
     case MRB_TT_INTEGER:
     case MRB_TT_STRING:
@@ -2116,7 +2118,7 @@ vm_op_getidx0(mrb_state *mrb, uint32_t a, uint16_t b, mrb_sym *midp)
 
   if (mrb_likely(tt == MRB_TT_ARRAY)) {
     struct RArray *ary = mrb_ary_ptr(recv);
-    if (mrb_unlikely(ary->c != mrb->array_class)) goto getidx0_fallback;
+    if (mrb_unlikely(ary->c != mrb->idx_class[MRB_IDX_OP_ARY_AREF])) goto getidx0_fallback;
 #ifndef MRB_ARY_NO_EMBED
     if (ARY_EMBED_P(ary)) {
       regs[a] = ARY_EMBED_LEN(ary) > 0 ? ary->as.ary[0] : mrb_nil_value();
@@ -2129,7 +2131,7 @@ vm_op_getidx0(mrb_state *mrb, uint32_t a, uint16_t b, mrb_sym *midp)
     return VM_NEXT;
   }
   else if (tt == MRB_TT_HASH) {
-    if (mrb_obj_ptr(recv)->c != mrb->hash_class) goto getidx0_fallback;
+    if (mrb_obj_ptr(recv)->c != mrb->idx_class[MRB_IDX_OP_HASH_AREF]) goto getidx0_fallback;
     {
       /* same as the Hash branch of vm_op_getidx(): mrb_hash_get() can run a
          default proc and move the stack, so take the result first and store
@@ -2144,8 +2146,8 @@ vm_op_getidx0(mrb_state *mrb, uint32_t a, uint16_t b, mrb_sym *midp)
     return VM_NEXT;
   }
   else if (tt == MRB_TT_STRING) {
-    /* optimize only for String class; subclasses/singleton may override [] */
-    if (mrb_obj_ptr(recv)->c != mrb->string_class) goto getidx0_fallback;
+    /* optimize only for String itself; see vm_op_getidx() */
+    if (mrb_obj_ptr(recv)->c != mrb->idx_class[MRB_IDX_OP_STR_AREF]) goto getidx0_fallback;
     {
       /* mrb_str_aref() allocates, and an inline opcode never runs the cfunc
          epilogue that would shrink the arena, so save and restore it here.
@@ -2172,16 +2174,16 @@ vm_op_setidx(mrb_state *mrb, uint32_t a, mrb_sym *midp)
   mrb_value va = regs[a], vb = regs[a+1], vc = regs[a+2];
   switch (mrb_type(va)) {
   case MRB_TT_ARRAY:
-    /* optimize only for Array class; subclasses/singleton may override []= */
-    if (mrb_obj_ptr(va)->c != mrb->array_class) goto setidx_fallback;
+    /* optimize only for Array itself; see vm_op_getidx() */
+    if (mrb_obj_ptr(va)->c != mrb->idx_class[MRB_IDX_OP_ARY_ASET]) goto setidx_fallback;
     if (!mrb_integer_p(vb)) goto setidx_fallback;
     mrb_ary_set(mrb, va, mrb_integer(vb), vc);
     ci = mrb->c->ci;
     regs[a] = vc;
     return VM_NEXT;
   case MRB_TT_HASH:
-    /* optimize only for Hash class; subclasses/singleton may override []= */
-    if (mrb_obj_ptr(va)->c != mrb->hash_class) goto setidx_fallback;
+    /* optimize only for Hash itself; see vm_op_getidx() */
+    if (mrb_obj_ptr(va)->c != mrb->idx_class[MRB_IDX_OP_HASH_ASET]) goto setidx_fallback;
     {
       int ai = mrb_gc_arena_save(mrb);
       mrb_hash_set(mrb, va, vb, vc);
@@ -2190,6 +2192,33 @@ vm_op_setidx(mrb_state *mrb, uint32_t a, mrb_sym *midp)
       mrb_gc_arena_restore(mrb, ai);
     }
     return VM_NEXT;
+  case MRB_TT_STRING:
+    /* optimize only for String itself; see vm_op_getidx() */
+    if (mrb_obj_ptr(va)->c != mrb->idx_class[MRB_IDX_OP_STR_ASET]) goto setidx_fallback;
+    /* A replacement that is not a String is a TypeError rather than a store,
+       and the method is where it is raised: leaving it to the send keeps the
+       `String#[]=` frame the backtrace has always shown for it. */
+    if (!mrb_string_p(vc)) goto setidx_fallback;
+    switch (mrb_type(vb)) {
+    case MRB_TT_INTEGER:
+    case MRB_TT_STRING:
+    case MRB_TT_RANGE:
+      {
+        /* mrb_str_aset() allocates, and an inline opcode never runs the cfunc
+           epilogue that would shrink the arena, so save and restore it here.
+           As in the String branch of vm_op_getidx(), `ci` needs no refresh:
+           none of the three index types reaches a conversion that runs Ruby
+           code, so the call cannot move the stack. */
+        int ai = mrb_gc_arena_save(mrb);
+        mrb_str_aset(mrb, va, vb, mrb_undef_value(), vc);
+        regs[a] = vc;
+        mrb_gc_arena_restore(mrb, ai);
+      }
+      return VM_NEXT;
+    default:
+      break;
+    }
+    goto setidx_fallback;
   default:
   setidx_fallback:
     SET_NIL_VALUE(regs[a+3]);
@@ -3506,6 +3535,19 @@ RETRY_TRY_BLOCK:
   }\
 } while(0)
 #else
+/* The usual arithmetic conversions would round an `mrb_int` wider than the
+   significand onto a neighbouring Float, so a mixed pair asks
+   `mrb_int_float_cmp()` for the order of the two values themselves. It answers
+   -2 for a NaN operand, which stands in no order with anything: every operator
+   is false against it, as comparing the two as Floats would have been. */
+#define OP_CMP_INT_FLOAT(op) do {\
+  mrb_int c = mrb_int_float_cmp(mrb_integer(regs[a]), mrb_float(regs[a+1]));\
+  result = c != -2 && (c op 0);\
+} while (0)
+#define OP_CMP_FLOAT_INT(op) do {\
+  mrb_int c = mrb_int_float_cmp(mrb_integer(regs[a+1]), mrb_float(regs[a]));\
+  result = c != -2 && (0 op c);\
+} while (0)
 #define OP_CMP(op, sym) do {\
   int result;\
   /* need to check if op is overridden */\
@@ -3515,10 +3557,10 @@ RETRY_TRY_BLOCK:
   }\
   else switch (tt) {\
   case TYPES2(MRB_TT_INTEGER,MRB_TT_FLOAT):\
-    result = OP_CMP_BODY(op,mrb_integer,mrb_float);\
+    OP_CMP_INT_FLOAT(op);\
     break;\
   case TYPES2(MRB_TT_FLOAT,MRB_TT_INTEGER):\
-    result = OP_CMP_BODY(op,mrb_float,mrb_integer);\
+    OP_CMP_FLOAT_INT(op);\
     break;\
   case TYPES2(MRB_TT_FLOAT,MRB_TT_FLOAT):\
     result = OP_CMP_BODY(op,mrb_float,mrb_float);\

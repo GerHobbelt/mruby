@@ -53,6 +53,45 @@ mrb_int_noconv(mrb_state *mrb, mrb_value y)
   mrb_raisef(mrb, E_TYPE_ERROR, "can't convert %Y into Integer", y);
 }
 
+#ifndef MRB_NO_FLOAT
+/**
+ * Compares an integer with a Float without rounding either operand.
+ *
+ * The usual arithmetic conversions turn the integer into an `mrb_float`, and a
+ * Float holds fewer significant bits than an `mrb_int` does. Every integer past
+ * the significand lands on a neighbouring Float, so it answers equal to a Float
+ * it is not equal to. Compare the integer parts as integers instead, and let
+ * what the Float carries below them break the tie.
+ *
+ * @param x The integer operand.
+ * @param y The Float operand.
+ * @return 1, 0 or -1 as `x` is greater than, equal to or less than `y`, and -2
+ *         when `y` is NaN, which stands in no order with anything.
+ */
+mrb_int
+mrb_int_float_cmp(mrb_int x, mrb_float y)
+{
+  if (isnan(y)) return -2;
+  /* Outside the `mrb_int` range the sign of `y` settles the comparison, and
+     the infinities are answered here as well. Both bounds are built from
+     `MRB_INT_MIN`, whose magnitude is a power of two and so is exact as a
+     Float; `MRB_INT_MAX` cast to a Float would have been rounded up to a value
+     no `mrb_int` reaches. */
+  if (y < (mrb_float)MRB_INT_MIN) return 1;
+  if (y >= -(mrb_float)MRB_INT_MIN) return -1;
+
+  mrb_int yi = (mrb_int)y;      /* truncates toward zero, and exactly */
+  if (x > yi) return 1;
+  if (x < yi) return -1;
+  /* The integer parts are equal, so what the truncation dropped decides.
+     `(mrb_float)yi` is exact: either `yi` fits the significand, or `y` was too
+     large to carry a fraction and `yi` is the value of `y` itself. */
+  if (y > (mrb_float)yi) return -1;
+  if (y < (mrb_float)yi) return 1;
+  return 0;
+}
+#endif
+
 /**
  * Calculates x raised to the power of y, where x is an integer.
  * y can be an integer or float. The result type can be Integer,
@@ -654,6 +693,10 @@ num_eql(mrb_state *mrb, mrb_value x)
     if (!mrb_integer_p(y)) return mrb_false_value();
     return mrb_bool_value(mrb_integer(x) == mrb_integer(y));
   }
+  /* Numeric subclasses such as Rational and Complex land here. Their `==`
+     converts the argument, so `Rational(2,1) == 2` is true; `eql?` must not,
+     because `#hash` does not treat them as the same key either. */
+  if (mrb_type(x) != mrb_type(y)) return mrb_false_value();
   return mrb_bool_value(mrb_equal(mrb, x, y));
 }
 
@@ -678,9 +721,16 @@ flo_eq(mrb_state *mrb, mrb_value x)
 
   switch (mrb_type(y)) {
   case MRB_TT_INTEGER:
-    return mrb_bool_value(mrb_float(x) == (mrb_float)mrb_integer(y));
+    return mrb_bool_value(mrb_int_float_cmp(mrb_integer(y), mrb_float(x)) == 0);
   case MRB_TT_FLOAT:
     return mrb_bool_value(mrb_float(x) == mrb_float(y));
+#ifdef MRB_USE_BIGINT
+  case MRB_TT_BIGINT:
+    /* `mrb_bint_cmp()` takes the big integer first and compares a Float
+       argument exactly; `int_equal()` makes the same call for the mirror
+       image of this comparison. */
+    return mrb_bool_value(mrb_bint_cmp(mrb, y, x) == 0);
+#endif
 #ifdef MRB_USE_RATIONAL
   case MRB_TT_RATIONAL:
     return mrb_bool_value(mrb_float(x) == mrb_as_float(mrb, y));
@@ -1320,7 +1370,7 @@ int_equal(mrb_state *mrb, mrb_value x)
     return mrb_bool_value(mrb_integer(x) == mrb_integer(y));
 #ifndef MRB_NO_FLOAT
   case MRB_TT_FLOAT:
-    return mrb_bool_value((mrb_float)mrb_integer(x) == mrb_float(y));
+    return mrb_bool_value(mrb_int_float_cmp(mrb_integer(x), mrb_float(y)) == 0);
 #endif
 #ifdef MRB_USE_BIGINT
   case MRB_TT_BIGINT:
@@ -2075,6 +2125,22 @@ int_to_s(mrb_state *mrb, mrb_value self)
   return mrb_integer_to_str(mrb, self, base);
 }
 
+#ifndef MRB_NO_FLOAT
+/* An integer wider than the significand rounds when it is cast to `mrb_float`,
+   so a mixed pair is compared exactly rather than as two Floats further down.
+   `mrb_int_float_cmp()` answers -2 for a NaN operand; keep the 0 that
+   comparing the two as Floats produced, because -2 is what `num_lt()` and its
+   neighbours raise on while a Float comparison against NaN is false rather
+   than an error. The 0 also leaves the answer safe to negate, which is how the
+   caller that holds the Float first reads it. */
+static mrb_int
+cmpnum_int_float(mrb_int x, mrb_float y)
+{
+  mrb_int c = mrb_int_float_cmp(x, y);
+  return c == -2 ? 0 : c;
+}
+#endif
+
 /* compare two numbers: (1:0:-1; -2 for error) */
 static mrb_int
 cmpnum(mrb_state *mrb, mrb_value v1, mrb_value v2)
@@ -2098,6 +2164,13 @@ cmpnum(mrb_state *mrb, mrb_value v1, mrb_value v2)
 
   mrb_float x, y;
 
+  if (mrb_integer_p(v1) && mrb_float_p(v2)) {
+    return cmpnum_int_float(mrb_integer(v1), mrb_float(v2));
+  }
+  if (mrb_float_p(v1) && mrb_integer_p(v2)) {
+    return -cmpnum_int_float(mrb_integer(v2), mrb_float(v1));
+  }
+
   if (mrb_fixnum_p(v1)) {
     if (mrb_fixnum_p(v2)) {
       mrb_int x = mrb_integer(v1);
@@ -2116,7 +2189,7 @@ cmpnum(mrb_state *mrb, mrb_value v1, mrb_value v2)
   }
 #ifdef MRB_USE_BIGINT
   else if (mrb_bigint_p(v1)) {
-    if (mrb_integer_p(v2) || mrb_bigint_p(v2)) {
+    if (mrb_integer_p(v2) || mrb_bigint_p(v2) || mrb_float_p(v2)) {
       return mrb_bint_cmp(mrb, v1, v2);
     }
     x = mrb_as_float(mrb, v1);
@@ -2126,12 +2199,20 @@ cmpnum(mrb_state *mrb, mrb_value v1, mrb_value v2)
     x = mrb_as_float(mrb, v1);
   }
 
+#ifdef MRB_USE_BIGINT
+  if (mrb_bigint_p(v2)) {
+    /* The switch below would convert `v2` with `mrb_as_float()` and lose the
+       low bits of a big integer. `mrb_bint_cmp()` keeps it exact. Negate the
+       result rather than the operands; -2 means incomparable, which has no
+       opposite. */
+    mrb_int c = mrb_bint_cmp(mrb, v2, mrb_float_value(mrb, x));
+    return c == -2 ? -2 : -c;
+  }
+#endif
+
   switch (mrb_type(v2)) {
 #ifdef MRB_USE_RATIONAL
   case MRB_TT_RATIONAL:
-#endif
-#ifdef MRB_USE_BIGINT
-  case MRB_TT_BIGINT:
 #endif
   case MRB_TT_INTEGER:
     if (mrb_fixnum_p(v2)) {

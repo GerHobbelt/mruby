@@ -215,6 +215,42 @@ assert('String#reverse! on a binary string reverses bytes') do
   end
 end
 
+assert('String#reverse! leaves what the bytes read as standing') do
+  # Reversing puts the same bytes back with every character whole, so a string
+  # that read as UTF-8 still does. A string that did not is the one case the
+  # reversal can settle either way, since bytes that spell nothing where they
+  # stood can spell a character once they are turned around. The reversal is
+  # where all of that is decided; asking afterwards is how it is seen.
+  if UTF8STRING
+    a = "あいうz"
+    a.reverse!
+    assert_equal "zういあ", a
+    assert_equal 4, a.length
+    assert_true a.valid_encoding?
+    a.reverse!
+    assert_equal "あいうz", a
+    assert_equal 4, a.length
+    assert_true a.valid_encoding?
+
+    b = "abc"
+    b.reverse!
+    assert_equal 3, b.length
+    assert_true b.valid_encoding?
+
+    c = "a\xE3\x81"
+    c.reverse!
+    assert_equal "\x81\xE3a".b, c.b
+    assert_false c.valid_encoding?
+
+    d = "\x80\xC2"   # a trailing byte and then a lead byte, spelling nothing
+    assert_false d.valid_encoding?   # asked here, so the answer is on the string
+    d.reverse!                       # and the same bytes now spell U+0080
+    assert_equal "\xC2\x80".b, d.b
+    assert_equal 1, d.length
+    assert_true d.valid_encoding?
+  end
+end
+
 assert('String#encoding') do
   if UTF8STRING
     a = "あ"
@@ -480,14 +516,20 @@ end
 assert('a byte-read string converted case') do
   # Bytes read as bytes spell no characters, so a case conversion has nothing
   # above ASCII to map and hands back the bytes it was given, still read as
-  # bytes. The same bytes read as UTF-8 spell "Ä", which does map.
+  # bytes. The same bytes read as UTF-8 spell "Ä", which maps where the
+  # build holds a table for it; where case follows ASCII there is nothing to
+  # map and the two readings answer alike.
   if UTF8STRING
     s = "\xC3\x84B".b
     assert_equal [195, 132, 98], s.downcase.bytes
     assert_equal [195, 132, 66], s.upcase.bytes
     assert_equal [195, 132, 98], s.capitalize.bytes
     assert_equal Encoding::BINARY, s.downcase.encoding
-    assert_equal [195, 164, 98], "\xC3\x84B".downcase.bytes if UNICODECASE
+    if UNICODECASE
+      assert_equal [195, 164, 98], "\xC3\x84B".downcase.bytes
+    else
+      assert_equal [195, 132, 98], "\xC3\x84B".downcase.bytes
+    end
   end
 end
 

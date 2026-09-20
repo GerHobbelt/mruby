@@ -1066,7 +1066,10 @@ mrb_define_method_raw(mrb_state *mrb, struct RClass *c, mrb_sym mid, mrb_method_
     }
   }
   mt_put(mrb, h, mid, flags, ptr);
-  if (!mrb->bootstrapping) mc_clear_by_id(mrb, mid);
+  if (!mrb->bootstrapping) {
+    mc_clear_by_id(mrb, mid);
+    mrb_idx_op_update(mrb, mid);
+  }
   if (modfunc) {
     /* module_function scope: also define a public method on the singleton
        class, so the module method (M.foo) mirrors the private instance one */
@@ -2106,7 +2109,12 @@ include_module_at(mrb_state *mrb, struct RClass *c, struct RClass *ins_pos, stru
   skip:
     m = m->super;
   }
-  if (!mrb->bootstrapping) mrb_method_cache_clear(mrb);
+  if (!mrb->bootstrapping) {
+    mrb_method_cache_clear(mrb);
+    /* An included or prepended module can carry both operators, and it is not
+       one method name that changed, so recheck every slot. */
+    mrb_idx_op_update(mrb, 0);
+  }
   return 0;
 }
 
@@ -2486,6 +2494,7 @@ mrb_mod_visibility(mrb_state *mrb, mrb_value mod, int vis)
       }
       mt_put(mrb, h, mid, m.flags, ptr);
       mc_clear_by_id(mrb, mid);
+      mrb_idx_op_update(mrb, mid);
     }
   }
 }
@@ -2797,6 +2806,122 @@ mc_clear_by_id(mrb_state *mrb, mrb_sym id)
   }
 }
 #endif // MRB_NO_METHOD_CACHE
+
+/*
+ * Guards for the inline index opcodes.
+ *
+ * `OP_GETIDX`, `OP_GETIDX0` and `OP_SETIDX` implement `[]` and `[]=` for an
+ * Array, Hash or String receiver in C, without a method lookup.  They may only
+ * do so while those classes still carry the builtin the opcode reimplements,
+ * so each (class, operator) pair keeps a slot in `mrb->idx_class` that holds
+ * the class while that is true and NULL once it is not.  The opcodes compare
+ * the receiver's class against the slot instead of against the core class, so
+ * a disarmed slot sends the operator like any other method and the check costs
+ * nothing while nothing is redefined.
+ *
+ * Validity is the resolved method itself, not merely "was `[]` assigned to":
+ * a slot is armed while `mid` resolves, from the core class, to exactly the
+ * `mrb_method_t` recorded at startup.  That covers `def`, `alias_method`,
+ * `undef_method`, `remove_method`, visibility changes and `prepend` without
+ * enumerating them, re-arms when an override is aliased back away, and stays
+ * armed when an unrelated module is included.
+ */
+
+static struct RClass*
+idx_op_class(mrb_state *mrb, int slot)
+{
+  switch (slot) {
+  case MRB_IDX_OP_ARY_AREF:  case MRB_IDX_OP_ARY_ASET:  return mrb->array_class;
+  case MRB_IDX_OP_HASH_AREF: case MRB_IDX_OP_HASH_ASET: return mrb->hash_class;
+  default:                                              return mrb->string_class;
+  }
+}
+
+static mrb_sym
+idx_op_mid(int slot)
+{
+  return slot < MRB_IDX_OP_ARY_ASET ? MRB_OPSYM(aref) : MRB_OPSYM(aset);
+}
+
+static void
+idx_op_refresh(mrb_state *mrb, int slot)
+{
+  /* A slot that startup never armed (the builtin was already gone, or the
+     state failed to initialize) stays off; there is nothing to compare to. */
+  if (mrb->idx_builtin[slot].as.func == NULL) return;
+
+  struct RClass *c = idx_op_class(mrb, slot);
+  struct RClass *base = c;
+  mrb_method_t m = mrb_vm_find_method(mrb, c, &c, idx_op_mid(slot));
+  mrb->idx_class[slot] =
+    (m.flags == mrb->idx_builtin[slot].flags &&
+     m.as.func == mrb->idx_builtin[slot].as.func) ? base : NULL;
+}
+
+/* Records what the operator resolves to now as the implementation the opcode
+   may answer for, and arms the slot.  Only a C function qualifies: anything
+   else means the operator was replaced by something the opcode cannot stand
+   in for. */
+static void
+idx_op_arm(mrb_state *mrb, int slot)
+{
+  struct RClass *c = idx_op_class(mrb, slot);
+  struct RClass *base = c;
+  mrb_method_t m = mrb_vm_find_method(mrb, c, &c, idx_op_mid(slot));
+
+  if (MRB_METHOD_UNDEF_P(m) || !MRB_METHOD_FUNC_P(m)) return;
+  mrb->idx_builtin[slot] = m;
+  mrb->idx_class[slot] = base;
+}
+
+/* Records the builtin `[]` / `[]=` of each core class and arms its slot.
+   Called once, after core initialization has installed them. */
+void
+mrb_idx_op_init(mrb_state *mrb)
+{
+  for (int slot = 0; slot < MRB_IDX_OP_SLOT_COUNT; slot++) {
+    idx_op_arm(mrb, slot);
+  }
+}
+
+/* Arms `slot` for an implementation installed over the builtin.
+ *
+ * CALLER'S PROMISE: for every argument form the opcode answers itself, the
+ * method now holding the name produces what the builtin produced.  The opcode
+ * will not consult it, so a form where the two disagree would be answered by
+ * the builtin and the override silently skipped, which is the defect the slots
+ * exist to prevent.  A method that only widens the operator to an argument
+ * type the opcode does not answer -- `String#[]` taking a Regexp, which
+ * `vm_op_getidx()` sends rather than answering -- can make the promise; one
+ * that changes an answer for an Integer, String or Range index cannot.
+ *
+ * Only the method standing now is recorded, so a later redefinition disarms
+ * the slot as it always did.
+ */
+void
+mrb_idx_op_rearm(mrb_state *mrb, enum mrb_idx_op_slot slot)
+{
+  idx_op_arm(mrb, (int)slot);
+}
+
+/* Rechecks the slots that `mid` can affect.  Call after any change to a method
+   table that could change what `[]` or `[]=` resolves to; pass 0 for `mid` when
+   the change is not tied to one name, as module inclusion is not. */
+void
+mrb_idx_op_update(mrb_state *mrb, mrb_sym mid)
+{
+  if (mrb->bootstrapping) return;
+  if (mid == 0 || mid == MRB_OPSYM(aref)) {
+    idx_op_refresh(mrb, MRB_IDX_OP_ARY_AREF);
+    idx_op_refresh(mrb, MRB_IDX_OP_HASH_AREF);
+    idx_op_refresh(mrb, MRB_IDX_OP_STR_AREF);
+  }
+  if (mid == 0 || mid == MRB_OPSYM(aset)) {
+    idx_op_refresh(mrb, MRB_IDX_OP_ARY_ASET);
+    idx_op_refresh(mrb, MRB_IDX_OP_HASH_ASET);
+    idx_op_refresh(mrb, MRB_IDX_OP_STR_ASET);
+  }
+}
 
 mrb_method_t
 mrb_vm_find_method(mrb_state *mrb, struct RClass *c, struct RClass **cp, mrb_sym mid)
@@ -3780,6 +3905,7 @@ mrb_remove_method(mrb_state *mrb, struct RClass *c0, mrb_sym mid)
     mrb_name_error(mrb, mid, "method '%n' not defined in %C", mid, c);
   }
   mc_clear_by_id(mrb, mid);
+  mrb_idx_op_update(mrb, mid);
   if (c0->tt == MRB_TT_SCLASS) {
     mrb_sym cb = MRB_SYM(singleton_method_removed);
     mrb_value recv = mrb_iv_get(mrb, mrb_obj_value(c0), MRB_SYM(__attached__));
