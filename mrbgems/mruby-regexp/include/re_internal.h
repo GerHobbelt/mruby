@@ -32,8 +32,12 @@ enum re_opcode {
   RE_BACKREF,    /* backreference: a = group number, offset = 1 if case-insensitive */
   RE_LOOKAHEAD,  /* positive lookahead: offset = end of sub-pattern */
   RE_NEG_LOOKAHEAD, /* negative lookahead: offset = end of sub-pattern */
-  RE_LOOKBEHIND,     /* positive lookbehind: a = byte length, offset = end */
-  RE_NEG_LOOKBEHIND, /* negative lookbehind: a = byte length, offset = end */
+  RE_LOOKBEHIND,     /* positive lookbehind: a = byte count, offset = end */
+  RE_NEG_LOOKBEHIND, /* negative lookbehind: a = byte count, offset = end */
+  RE_LB_WIDTH,       /* carrier after either lookbehind: a = character count.
+                        The executor rewinds by bytes against a binary subject
+                        and by characters otherwise, and the sub-pattern body
+                        starts past this instruction, at pc + 2. */
 };
 
 /* Bytecode instruction (4 bytes each for alignment) */
@@ -45,11 +49,21 @@ typedef struct {
 
 /* Character class bitmap (ASCII range) */
 #define RE_CLASS_BITMAP_SIZE 16  /* 128 bits = 16 bytes for ASCII */
+
+/* A class member that is a byte rather than a codepoint, held in the same
+   range list with this bit set. A pattern byte that starts no whole character
+   is a byte, and the two spaces collide over U+0080 to U+00FF: the byte 0xB5
+   and the character U+00B5 both arrive as the number 0xB5, so the number alone
+   cannot say which was written. The tag sits above every codepoint, so a
+   tagged range can never overlap an untagged one. */
+#define RE_CLASS_BYTE 0x80000000u
+
 typedef struct {
   uint8_t bitmap[RE_CLASS_BITMAP_SIZE];  /* bitmap for 0-127 */
-  /* Non-ASCII codepoint ranges. Stored as flat (lo, hi) pairs:
-     ranges[2k] = lo, ranges[2k+1] = hi (inclusive). NULL when the
-     class has no non-ASCII members (the common case). */
+  /* Non-ASCII codepoint ranges, and byte ranges tagged with RE_CLASS_BYTE.
+     Stored as flat (lo, hi) pairs: ranges[2k] = lo, ranges[2k+1] = hi
+     (inclusive). NULL when the class has no non-ASCII members (the common
+     case). */
   uint32_t *ranges;
   uint32_t num_ranges;
   uint32_t range_capa;
@@ -161,23 +175,55 @@ void mrb_re_free(mrb_state *mrb, mrb_regexp_pattern *pat);
 /* UTF-8 helpers */
 int mrb_re_utf8_charlen(const char *s, const char *end);
 uint32_t mrb_re_utf8_decode(const char *s, const char *end, int *len);
+int mrb_re_utf8_encode(uint32_t cp, char *buf);
 mrb_bool mrb_re_is_word_char(uint32_t c);
 
-#ifdef MRB_REGEXP_UNICODE_CASE
-/* Simple case folding. mrb_re_case_fold() returns the folded codepoint, or cp
-   itself when it folds to nothing else. mrb_re_case_unfold() writes every
-   other codepoint sharing cp's folded form into out, at most max of them, and
-   returns how many it wrote. Both cover ASCII and the 1:1 Unicode foldings; a
-   codepoint whose fold is several codepoints (U+00DF to "ss") is left alone. */
-#define RE_MAX_UNFOLD 4
-uint32_t mrb_re_case_fold(uint32_t cp);
-int mrb_re_case_unfold(uint32_t cp, uint32_t *out, int max);
+/* The two foldings whose result is an ASCII letter. Every build carries them,
+   whether or not it has the Unicode table, so that folding "ASCII only" covers
+   the whole of the equivalence class an ASCII letter belongs to rather than
+   the part of it that is ASCII: without them /k/i would miss U+212A and, the
+   sign flipped, [^k] under /i would accept it. */
+#define RE_FOLD_LONG_S 0x017F  /* to 's' */
+#define RE_FOLD_KELVIN 0x212A  /* to 'k' */
 
-/* The same two directions over a span rather than one codepoint, reporting
-   what they find by calling add() with each span of it. mrb_re_case_fold_range
-   reports the folds of the sources in [lo, hi], mrb_re_case_unfold_range the
-   sources of the folds in [lo, hi]. Spans may repeat or overlap what the
-   caller already holds; the caller merges. */
+/* Simple case folding: the folded codepoint, or cp itself when it folds to
+   nothing else. With MRB_REGEXP_UNICODE_CASE that is ASCII plus every 1:1
+   Unicode folding; without it, ASCII plus the two above. Neither build folds a
+   codepoint that has no single counterpart to fold to (U+FB00 to "ff"). */
+uint32_t mrb_re_case_fold(uint32_t cp);
+
+/* True when [lo, hi] holds a codepoint that carries case folding data this
+   build does not have. A pattern reaching one of those under /i is refused at
+   compile time, since folding ASCII and carrying on would answer wrongly: the
+   missing fold shows up as a missed match in `[X]` and, with the sign flipped,
+   as a false accept in `[^X]`. The test is having the data rather than being
+   foldable, so two kinds fall inside it that no build folds: a source whose
+   fold expands into several codepoints (U+FB00 to "ff"), and the uncased
+   neighbours the coarse ranges close over. A build with the table compiles
+   both and matches them literally, so what the two builds differ in there is
+   what they refuse rather than what they answer. A build with the data has
+   nothing to refuse, so the test compiles away there. The arguments are
+   evaluated at most once, but only by the definition that uses them, so pass
+   plain values. */
+#ifdef MRB_REGEXP_UNICODE_CASE
+#define mrb_re_needs_case_data(lo, hi) FALSE
+#else
+mrb_bool mrb_re_needs_case_data(uint32_t lo, uint32_t hi);
+#endif
+
+#ifdef MRB_REGEXP_UNICODE_CASE
+/* Walking the table takes data only this build has. Without it the compiler
+   reaches the same two foldings directly, since there are only two.
+
+   mrb_re_case_unfold() writes every other codepoint sharing cp's folded form
+   into out, at most max of them, and returns how many it wrote. The two range
+   forms do the same two directions over a span rather than one codepoint,
+   reporting what they find by calling add() with each span of it:
+   mrb_re_case_fold_range the folds of the sources in [lo, hi],
+   mrb_re_case_unfold_range the sources of the folds in [lo, hi]. Spans may
+   repeat or overlap what the caller already holds; the caller merges. */
+#define RE_MAX_UNFOLD 4
+int mrb_re_case_unfold(uint32_t cp, uint32_t *out, int max);
 void mrb_re_case_fold_range(uint32_t lo, uint32_t hi,
                             void (*add)(void *, uint32_t, uint32_t), void *user);
 void mrb_re_case_unfold_range(uint32_t lo, uint32_t hi,

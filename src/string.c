@@ -532,6 +532,19 @@ utf8_strlen(mrb_value str)
   struct RString *s = mrb_str_ptr(str);
   mrb_int byte_len = RSTR_LEN(s);
 
+  /* A byte-indexed string has one position per byte, which is what
+     chars2bytes() and bytes2chars() already answer for it. Asked here only
+     about the single-byte flag, the same string was measured as UTF-8 and
+     reported a length its own indexing did not agree with.
+
+     The flag below is deliberately not set on the way out: it says the bytes
+     hold nothing multi-byte, while this returns early because of how the
+     string is read. force_encoding() can take MRB_STR_BINARY away again, and
+     a flag set here would outlive the reason for it. */
+  if (RSTR_BINARY_P(s)) {
+    return byte_len;
+  }
+
   if (RSTR_SINGLE_BYTE_P(s)) {
     return byte_len;
   }
@@ -894,6 +907,7 @@ str_replace(mrb_state *mrb, struct RString *s1, struct RString *s2)
   mrb_check_frozen(mrb, s1);
   if (s1 == s2) return mrb_obj_value(s1);
   RSTR_COPY_SINGLE_BYTE_FLAG(s1, s2);
+  RSTR_COPY_BINARY_FLAG(s1, s2);
   if (RSTR_SHARED_P(s1)) {
     str_decref(mrb, s1->as.heap.aux.shared);
   }
@@ -1575,6 +1589,12 @@ str_escape(mrb_state *mrb, mrb_value str, mrb_bool inspect)
 #endif
 
   p = RSTRING_PTR(str); pend = RSTRING_END(str);
+#ifdef MRB_UTF8_STRING
+  /* `inspect` passes a whole character through unescaped so it stays readable.
+     A byte-indexed string holds no characters to keep readable, so it escapes
+     byte by byte, which is what `dump` on the same string already did. */
+  if (RSTR_BINARY_P(mrb_str_ptr(str))) inspect = FALSE;
+#endif
   for (;p < pend; p++) {
     unsigned char c, cc;
 #ifdef MRB_UTF8_STRING
@@ -1867,14 +1887,20 @@ mrb_str_chop_bang(mrb_state *mrb, mrb_value str)
   if (RSTR_LEN(s) > 0) {
     mrb_int len;
 #ifdef MRB_UTF8_STRING
-    const char* t = RSTR_PTR(s), *p = t;
-    const char* e = p + RSTR_LEN(s);
-    while (p<e) {
-      mrb_int clen = mrb_utf8len(p, e);
-      if (p + clen>=e) break;
-      p += clen;
+    if (RSTR_BINARY_P(s)) {
+      /* The last position of a byte-indexed string is its last byte. */
+      len = RSTR_LEN(s) - 1;
     }
-    len = p - t;
+    else {
+      const char* t = RSTR_PTR(s), *p = t;
+      const char* e = p + RSTR_LEN(s);
+      while (p<e) {
+        mrb_int clen = mrb_utf8len(p, e);
+        if (p + clen>=e) break;
+        p += clen;
+      }
+      len = p - t;
+    }
 #else
     len = RSTR_LEN(s) - 1;
 #endif

@@ -38,15 +38,24 @@ skip_to_prefix(const mrb_regexp_pattern *pat, const char *sp, const char *str_en
 #define FIRST_BYTE_OK(pat, ch) \
   ((ch) >= 128 || ((pat)->first_bytes[(ch) >> 3] & (1 << ((ch) & 7))))
 
-/* Check if a codepoint matches a character class. ASCII (cp < 128) hits
-   the bitmap; non-ASCII falls back to the inclusive (lo, hi) range list,
-   then to the utf8_any catch-all (used by negated shorthand like \D). */
+/* Check if the current input character matches a character class. ASCII
+   (cp < 128) hits the bitmap; non-ASCII falls back to the inclusive (lo, hi)
+   range list, then to the utf8_any catch-all (used by negated shorthand like
+   \D).
+
+   `raw` says the input is a byte rather than a character: a byte-indexed
+   subject, or one whose byte at this position starts no whole character. It
+   picks which half of the range list to read, since a byte member and a
+   codepoint member of the same number are different members and arrive here as
+   the same number. utf8_any is the answer for either, being about the byte
+   being non-ASCII at all. */
 static mrb_bool
-class_match(const re_charclass *cc, uint32_t cp)
+class_match(const re_charclass *cc, uint32_t cp, mrb_bool raw)
 {
   if (cp < 128) {
     return (cc->bitmap[cp >> 3] >> (cp & 7)) & 1;
   }
+  if (raw) cp |= RE_CLASS_BYTE;
   for (uint32_t i = 0; i < cc->num_ranges; i++) {
     if (cp >= cc->ranges[2*i] && cp <= cc->ranges[2*i + 1]) return TRUE;
   }
@@ -62,7 +71,6 @@ static int
 memcmp_ci(const char *a, const char *a_end, const char *b, const char *b_end,
           mrb_bool binary)
 {
-#ifdef MRB_REGEXP_UNICODE_CASE
   const char *a0 = a;
   while (b < b_end) {
     if (a >= a_end) return -1;
@@ -70,23 +78,10 @@ memcmp_ci(const char *a, const char *a_end, const char *b, const char *b_end,
     uint32_t ca = mrb_re_decode_char(a, a_end, &alen, binary);
     uint32_t cb = mrb_re_decode_char(b, b_end, &blen, binary);
     if (mrb_re_case_fold(ca) != mrb_re_case_fold(cb)) return -1;
-    a += mrb_re_charlen(a, a_end, binary);
-    b += mrb_re_charlen(b, b_end, binary);
+    a += alen;
+    b += blen;
   }
   return (int)(a - a0);
-#else
-  /* Folding stops at ASCII, so the two spans always hold the same bytes. */
-  (void)binary;
-  int len = (int)(b_end - b);
-  if (a + len > a_end) return -1;
-  for (int i = 0; i < len; i++) {
-    uint8_t ca = (uint8_t)a[i], cb = (uint8_t)b[i];
-    if (ca >= 'A' && ca <= 'Z') ca += 32;
-    if (cb >= 'A' && cb <= 'Z') cb += 32;
-    if (ca != cb) return -1;
-  }
-  return len;
-#endif
 }
 
 /*
@@ -152,6 +147,24 @@ pool_copy(pike_state *s, int src_slot)
 
 #define CAP(s, slot) (&(s)->cap_pool[(slot) * (s)->ncap])
 
+/* Hand this step's closure a fresh block of visited keys. A step reserves one
+   key per epsilon pass, so the counter climbs faster than the single step it
+   used to; on a long enough subject it would wrap, leaving marks from earlier
+   steps outranking every fresh key and the closure adding nothing. Clear the
+   marks and start the keys over when that comes into reach, which also keeps
+   a live key below RE_LOOP_STOP. */
+static void
+advance_gen(pike_state *s)
+{
+  if (s->key_max > UINT32_MAX - 2 * s->pass_span) {
+    memset(s->visited, 0, sizeof(uint32_t) * (s->pat->code_len + 1));
+    s->gen = 0;
+    s->key_max = s->pass_span - 1;
+  }
+  s->gen += s->pass_span;
+  s->key_max += s->pass_span;
+}
+
 /* TRUE once this step's closure has walked the loop head at pc, which means
    the body just ran without consuming: an empty iteration. */
 static mrb_bool
@@ -165,7 +178,8 @@ loop_head_seen(pike_state *s, uint32_t pc)
    target's branch walks under, or RE_LOOP_STOP when the body matched empty
    and the repetition therefore has to stop. An ordinary fork, or one closing
    a loop whose body always consumes (`a` is 0, see mark_empty_loops()), has
-   no empty iteration to account for and keeps the current key. */
+   no empty iteration to account for and keeps the current key. advance_gen()
+   holds every live key below the sentinel. */
 #define RE_LOOP_STOP UINT32_MAX
 
 static uint32_t
@@ -368,8 +382,8 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
   s.binary = binary;
   s.cut = FALSE;
   s.pass_span = RE_PASS_SPAN(pat->loop_depth);
-  s.gen = s.pass_span;
-  s.key_max = s.gen + s.pass_span - 1;
+  s.gen = 0;
+  s.key_max = s.pass_span - 1;
   if (match_only) {
     s.pool_capa = 1;
     s.pool_next = 0;
@@ -425,8 +439,7 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
           !mrb_re_utf8_interior_p(str, sp, str_end)) {
         int slot = match_only ? 0 : pool_alloc(&s);
         if (!match_only) memset(CAP(&s, slot), -1, sizeof(int) * ncap);
-        s.gen += s.pass_span;
-        s.key_max += s.pass_span;
+        advance_gen(&s);
         s.cut = FALSE;
         add_thread(&s, &curr, 0, slot, sp, s.gen);
         if (s.matched && curr.count == 0) break;
@@ -456,8 +469,7 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
       s.pool_next = curr.count;
     }
 
-    s.gen += s.pass_span;
-    s.key_max += s.pass_span;
+    advance_gen(&s);
     s.cut = FALSE;
     next.count = 0;
 
@@ -470,6 +482,10 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
       int dlen = 0;
       curr_cp = mrb_re_decode_char(sp, str_end, &dlen, s.binary);
     }
+    /* A non-ASCII byte that stands alone is a byte, not the character its
+       number spells: every byte of a byte-indexed subject, and a byte that
+       starts no whole character in a decoded one. */
+    mrb_bool curr_raw = (advance == 1 && ch >= 0x80);
 
     for (int i = 0; i < curr.count; i++) {
       re_thread *th = &curr.threads[i];
@@ -509,14 +525,14 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
         break;
 
       case RE_CLASS:
-        if (class_match(&pat->classes[inst.a], curr_cp)) {
+        if (class_match(&pat->classes[inst.a], curr_cp, curr_raw)) {
           int cp = match_only ? 0 : pool_copy(&s, th->cap_slot);
           add_thread(&s, &next, th->pc + 1, cp, sp + advance, s.gen);
         }
         break;
 
       case RE_NCLASS:
-        if (!class_match(&pat->classes[inst.a], curr_cp)) {
+        if (!class_match(&pat->classes[inst.a], curr_cp, curr_raw)) {
           int cp = match_only ? 0 : pool_copy(&s, th->cap_slot);
           add_thread(&s, &next, th->pc + 1, cp, sp + advance, s.gen);
         }
@@ -565,6 +581,33 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
 }
 
 /*
+ * Where the lookbehind at pc starts matching from: sp rewound by the byte
+ * count in the opcode for a binary subject, and otherwise by the character
+ * count in the RE_LB_WIDTH that follows it. The backward walk steps over
+ * continuation bytes with mrb_re_utf8_interior_p(), which keeps it on the
+ * boundaries the forward decode uses, broken input included. Returns NULL
+ * when the text before sp runs out first.
+ */
+static const char*
+lookbehind_start(const mrb_regexp_pattern *pat, const char *str,
+                 const char *str_end, const char *sp, uint32_t pc,
+                 mrb_bool binary)
+{
+  if (binary) {
+    int lb_len = pat->code[pc].a;
+    return (sp - str < lb_len) ? NULL : sp - lb_len;
+  }
+  int nchars = pat->code[pc + 1].a;
+  while (nchars > 0) {
+    if (sp <= str) return NULL;
+    sp--;
+    while (sp > str && mrb_re_utf8_interior_p(str, sp, str_end)) sp--;
+    nchars--;
+  }
+  return sp;
+}
+
+/*
  * Backtracking engine for patterns with backreferences.
  * Step-limited to prevent ReDoS.
  */
@@ -599,7 +642,8 @@ bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
       {
         int dlen = 0;
         uint32_t cp_ = mrb_re_decode_char(sp, str_end, &dlen, binary);
-        if (!class_match(&pat->classes[inst.a], cp_)) return FALSE;
+        mrb_bool raw = (dlen == 1 && (uint8_t)*sp >= 0x80);
+        if (!class_match(&pat->classes[inst.a], cp_, raw)) return FALSE;
         sp += mrb_re_charlen(sp, str_end, binary);
       }
       pc++;
@@ -610,7 +654,8 @@ bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
       {
         int dlen = 0;
         uint32_t cp_ = mrb_re_decode_char(sp, str_end, &dlen, binary);
-        if (class_match(&pat->classes[inst.a], cp_)) return FALSE;
+        mrb_bool raw = (dlen == 1 && (uint8_t)*sp >= 0x80);
+        if (class_match(&pat->classes[inst.a], cp_, raw)) return FALSE;
         sp += mrb_re_charlen(sp, str_end, binary);
       }
       pc++;
@@ -731,9 +776,9 @@ bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
 
     case RE_LOOKBEHIND:
       {
-        int lb_len = inst.a;
-        if (sp - str < lb_len) return FALSE;  /* not enough text before */
-        if (!bt_match(pat, str, str_end, sp - lb_len, pc + 1, captures, ncap, steps, depth + 1, binary))
+        const char *back = lookbehind_start(pat, str, str_end, sp, pc, binary);
+        if (!back) return FALSE;  /* not enough text before */
+        if (!bt_match(pat, str, str_end, back, pc + 2, captures, ncap, steps, depth + 1, binary))
           return FALSE;
         pc = inst.offset;
       }
@@ -741,11 +786,10 @@ bt_match(const mrb_regexp_pattern *pat, const char *str, const char *str_end,
 
     case RE_NEG_LOOKBEHIND:
       {
-        int lb_len = inst.a;
-        if (sp - str >= lb_len) {
-          if (bt_match(pat, str, str_end, sp - lb_len, pc + 1, captures, ncap, steps, depth + 1, binary))
-            return FALSE;
-        }
+        const char *back = lookbehind_start(pat, str, str_end, sp, pc, binary);
+        if (back &&
+            bt_match(pat, str, str_end, back, pc + 2, captures, ncap, steps, depth + 1, binary))
+          return FALSE;
         /* if not enough text before, negative lookbehind succeeds */
         pc = inst.offset;
       }

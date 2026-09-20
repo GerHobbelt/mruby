@@ -26,6 +26,21 @@ simulation) with backtracking fallback.
 - `(?<=...)` positive lookbehind (fixed-length only)
 - `(?<!...)` negative lookbehind (fixed-length only)
 
+### Character Escapes
+
+- `\n`, `\t`, `\r`, `\f`, `\v`, `\a`, `\e` control characters
+- `\NNN` octal, one to three digits
+- `\xHH` hex, one or two digits
+- `\uXXXX` Unicode codepoint, exactly four hex digits
+- `\u{...}` Unicode codepoints, one to six hex digits each, several of
+  them separated by spaces: `/\u{61 62}/` is `ab`
+
+Outside a character class the list form is a sequence rather than one
+atom, so a quantifier after it repeats the last codepoint only:
+`/\u{61 62}+/` is `ab+`. Inside a class every codepoint is a member of
+its own, and the last one can still open a range: `/[\u{61 62}-z]/` is
+`a` plus `b-z`.
+
 ### Anchors
 
 - `^` beginning of line
@@ -86,6 +101,10 @@ str.sub(re, replacement)          # replace first occurrence
 str.sub(re) { |m| ... }           # replace with block
 str.gsub(re, replacement)         # replace all occurrences
 str.gsub(re) { |m| ... }          # replace all with block
+str.sub!(re, replacement)         # => self, or nil if no match
+str.sub!(re) { |m| ... }          # same, replacing with the block result
+str.gsub!(re, replacement)        # => self, or nil if no match
+str.gsub!(re) { |m| ... }         # same, replacing with the block result
 str.scan(re)                      # => array of matches
 str.split(re)                     # => array of parts
 str[re]                           # => matched substring or nil
@@ -95,6 +114,17 @@ str[re] = repl                    # replace the match
 str[re, capture] = repl           # replace a capture by index or name
 str.slice!(re)                    # remove and return the match, or nil
 str.slice!(re, capture)           # same, for a capture by index or name
+str.index(re)                     # => match start, or nil
+str.index(re, pos)                # => same, searching from pos
+str.rindex(re)                    # => last match start, or nil
+str.rindex(re, pos)               # => last match starting at or before pos
+str.byteindex(re)                 # => match start in bytes, or nil
+str.byteindex(re, pos)            # => same, searching from byte pos
+str.byterindex(re)                # => last match start in bytes, or nil
+str.byterindex(re, pos)           # => same, at or before byte pos
+str.partition(re)                 # => [before, match, after]
+str.rpartition(re)                # => [before, last match, after]
+str.start_with?(re)               # => true/false (anchored at the start)
 
 # Symbol methods (the String methods applied to the symbol's name)
 sym.match(re)                     # => MatchData or nil
@@ -133,12 +163,33 @@ pattern analysis.
   Maximum 255 bytes.
 - **No Unicode properties**: `\p{Alpha}`, `\p{L}`, etc. are not
   supported.
+- **No `\x{...}` hex escape**: the hex escape is `\xHH`, so it reaches
+  `0xff` at most. Write `\u{...}` for a codepoint above that.
+- **No encodings**: a pattern is a byte string read as UTF-8, and there is no
+  encoding to consult about a byte that starts no whole character. Such a byte
+  is that byte, inside a character class as much as outside one: `[\xB5]` and
+  `\xB5` both hold the byte `0xB5`, and neither matches `µ`, which is `C2 B5`.
+  CRuby settles the same question with the pattern's encoding and raises
+  `RegexpError` for either spelling. A range whose ends are a byte and a
+  character (`[\x80-µ]`) names neither and raises `RegexpError`.
 - **ASCII case folding by default**: The `i` flag handles ASCII letters
   only unless the build defines `MRB_REGEXP_UNICODE_CASE`, which adds the
-  Unicode foldings that map one codepoint to one other. A codepoint whose
-  fold is several codepoints (`ß` to `ss`) is never folded.
+  Unicode foldings that pair one codepoint with one other. Without the
+  option, a pattern holding a character that needs one of those raises
+  `RegexpError` rather than answering as if the character had no case; see
+  Configuration. A codepoint with no single counterpart to fold to (`ﬀ` to
+  `ff`) is never folded by either build.
+- **Case-insensitive backreferences match a superset**: `\1` under `i`
+  folds each side and compares, so it matches where the capture and the
+  repeat hold the same characters in different widths (`k` and `K`).
+  CRuby declines to fold across a width change there.
 - **Step limit on backtracking**: Patterns that require the
   backtracking engine are subject to a step limit.
+- **Backward search walks forward**: the engine searches forward only,
+  so `rindex`, `byterindex` and `rpartition` walk the subject from the
+  start and keep the last match that qualifies. The cost grows with the
+  number of positions a match starts at, where CRuby hands the search to
+  Onig.
 - **No inline extended mode**: `(?x)` and `(?x:...)` raise a
   `RegexpError`, because extended mode is applied to the whole pattern
   before it is parsed. A `-x` is accepted and ignored, so inside a
@@ -184,9 +235,27 @@ foldings. Define `MRB_REGEXP_UNICODE_CASE` to enable it:
 conf.cc.defines << 'MRB_REGEXP_UNICODE_CASE'
 ```
 
-It costs about 6KB of text, of which roughly 2.4KB is the table itself. With
+It costs about 4KB of text, of which roughly 2.5KB is the table itself. With
 it, `/Ā/i` matches `"ā"`, `/Σ/i` matches `"σ"`, and `[^Ā]` under `/i` stops
-accepting `"ā"`. Without it those all behave as they always have.
+accepting `"ā"`.
+
+Without it, those same patterns do not compile:
+
+```ruby
+/Ā/i     # RegexpError: /i needs MRB_REGEXP_UNICODE_CASE for this character
+```
+
+The test is whether a character has a case folding, not whether it is
+non-ASCII, so a script without case is unaffected and `/日本/i`, `/العربية/i`
+and `/😀/i` go on working. Patterns like `/Ā/i` were answering wrongly rather
+than narrowly before this: `[Ā]` under `/i` missed `"ā"`, and `[^Ā]` accepted
+it. Reaching this error means the option is what you want.
+
+`/k/i` matching `"K"` (U+212A) and `/s/i` matching `"ſ"` need no option.
+Those two are the only foldings whose result is an ASCII letter, and both
+builds carry them, so that folding "ASCII only" covers the whole of the
+equivalence class an ASCII letter belongs to rather than the part of it that
+is ASCII.
 
 ## License
 

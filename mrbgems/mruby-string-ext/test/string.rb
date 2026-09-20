@@ -16,6 +16,17 @@ assert('String#dump') do
   assert_nothing_raised { ("\1" * 100).dump }   # regress #1210
 end
 
+assert('String#inspect of a binary string escapes every byte') do
+  # `inspect` passes a whole character through unescaped so it stays readable,
+  # which a string holding no characters has nothing to gain from. `dump` on
+  # the same string escaped every byte already, so the two agree there.
+  if UTF8STRING
+    assert_equal('"る"', "る".inspect)
+    assert_equal('"\xe3\x82\x8b"', "る".b.inspect)
+    assert_equal("る".b.dump, "る".b.inspect)
+  end
+end
+
 assert('String#strip') do
   s = "  abc  "
   assert_equal("abc", s.strip)
@@ -77,6 +88,26 @@ assert('String#rstrip!') do
   assert_equal("  abc", s)
   assert_nil(t.rstrip!)
   assert_equal("  abc", t)
+end
+
+assert('String#strip! family on a shared buffer') do
+  # A substring shares the parent's heap buffer, so the strip family must read
+  # the buffer pointer after mrb_str_modify unshares it. Reading it before means
+  # the copy and the terminator land in the parent's buffer instead.
+  base = ".        abcdefghijklmnopqrstuvwxyz0123456789"
+  view = base[1..-1]
+  assert_equal("abcdefghijklmnopqrstuvwxyz0123456789", view.lstrip!)
+  assert_equal(".        abcdefghijklmnopqrstuvwxyz0123456789", base)
+
+  base = "abcdefghijklmnopqrstuvwxyz0123456789        ."
+  view = base[0..-2]
+  assert_equal("abcdefghijklmnopqrstuvwxyz0123456789", view.rstrip!)
+  assert_equal("abcdefghijklmnopqrstuvwxyz0123456789        .", base)
+
+  base = ".        abcdefghijklmnopqrstuvwxyz0123456789        ."
+  view = base[1..-2]
+  assert_equal("abcdefghijklmnopqrstuvwxyz0123456789", view.strip!)
+  assert_equal(".        abcdefghijklmnopqrstuvwxyz0123456789        .", base)
 end
 
 assert('String#swapcase') do
@@ -796,6 +827,28 @@ assert('String#each_char(UTF-8)') do
   end
   assert_equal ["こ", "ん", "に", "ち", "は", "世", "界", "!"], chars
 end if UTF8STRING
+
+assert('String#chop! on a binary string removes one byte') do
+  # `chop!` walks to the last character, and a byte-indexed string ends in a
+  # byte rather than in a character. Walking it as UTF-8 took the whole of a
+  # multi-byte sequence off, or all of a string that held only one.
+  if UTF8STRING
+    s = "\u{1F600}".b   # F0 9F 98 80: four bytes, one character
+    s.chop!
+    assert_equal "\xF0\x9F\x98".b, s
+    t = "a\u{1F600}".b
+    t.chop!
+    assert_equal "a\xF0\x9F\x98".b, t
+    # a string read as UTF-8 still loses the whole character
+    u = "\u{1F600}"
+    u.chop!
+    assert_equal "", u
+    # and the \r\n pair is still taken together
+    v = "a\r\n".b
+    v.chop!
+    assert_equal "a", v
+  end
+end
 
 assert('String#codepoints') do
   expect = [104, 101, 108, 108, 111, 33]

@@ -74,6 +74,34 @@ mrb_re_utf8_decode(const char *s, const char *end, int *len)
   }
 }
 
+/* Encode a codepoint as UTF-8 into buf and return the byte length, at most 4.
+   Callers reject a surrogate and anything above U+10FFFF before they get
+   here, so every input has an encoding. */
+int
+mrb_re_utf8_encode(uint32_t cp, char *buf)
+{
+  if (cp < 0x80) {
+    buf[0] = (char)cp;
+    return 1;
+  }
+  if (cp < 0x800) {
+    buf[0] = (char)(0xc0 | (cp >> 6));
+    buf[1] = (char)(0x80 | (cp & 0x3f));
+    return 2;
+  }
+  if (cp < 0x10000) {
+    buf[0] = (char)(0xe0 | (cp >> 12));
+    buf[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+    buf[2] = (char)(0x80 | (cp & 0x3f));
+    return 3;
+  }
+  buf[0] = (char)(0xf0 | (cp >> 18));
+  buf[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
+  buf[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
+  buf[3] = (char)(0x80 | (cp & 0x3f));
+  return 4;
+}
+
 /* Check if character is a "word" character (\w): [a-zA-Z0-9_] */
 mrb_bool
 mrb_re_is_word_char(uint32_t c)
@@ -110,14 +138,37 @@ fold_run_for(uint32_t cp)
   return NULL;
 }
 
+#else  /* !MRB_REGEXP_UNICODE_CASE */
+
+#include "re_cased.h"
+
+mrb_bool
+mrb_re_needs_case_data(uint32_t lo, uint32_t hi)
+{
+  if (hi < RE_CASED_MIN || lo > RE_CASED_MAX) return FALSE;
+  for (size_t i = 0; i < RE_CASED_RANGE_COUNT; i++) {
+    if (lo <= re_cased_ranges[i][1] && re_cased_ranges[i][0] <= hi) return TRUE;
+  }
+  return FALSE;
+}
+
+#endif  /* MRB_REGEXP_UNICODE_CASE */
+
 uint32_t
 mrb_re_case_fold(uint32_t cp)
 {
   if (cp < 128) return (cp >= 'A' && cp <= 'Z') ? cp + 32 : cp;
+#ifdef MRB_REGEXP_UNICODE_CASE
   const re_fold_run *r = fold_run_for(cp);
   return r ? (uint32_t)((int32_t)cp + r->delta) : cp;
+#else
+  if (cp == RE_FOLD_LONG_S) return 's';
+  if (cp == RE_FOLD_KELVIN) return 'k';
+  return cp;
+#endif
 }
 
+#ifdef MRB_REGEXP_UNICODE_CASE
 int
 mrb_re_case_unfold(uint32_t cp, uint32_t *out, int max)
 {
@@ -127,14 +178,14 @@ mrb_re_case_unfold(uint32_t cp, uint32_t *out, int max)
   /* The folded form is itself a member of the class. */
   if (folded != cp && n < max) out[n++] = folded;
 
-  /* ASCII sources are not in the table, so the upper case letter that folds
-     into a lower case one is added here. A non-ASCII source folding into
-     ASCII (U+017F into 's') is in the table and is found by the scan below
-     like any other. */
+  /* ASCII sources are in no table, so the upper case letter that folds into a
+     lower case one is added here. */
   if (folded >= 'a' && folded <= 'z' && folded - 32 != cp && n < max) {
     out[n++] = folded - 32;
   }
 
+  /* A non-ASCII source folding into ASCII (U+017F into 's') is in the table
+     and is found by this scan like any other. */
   for (size_t i = 0; i < RE_FOLD_RUN_COUNT && n < max; i++) {
     const re_fold_run *r = &re_fold_runs[i];
     int32_t src = (int32_t)folded - r->delta;
