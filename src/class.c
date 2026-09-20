@@ -1305,9 +1305,169 @@ mrb_block_given_p(mrb_state *mrb)
 
 #define GET_ARG(_type) (ptr ? ((_type)(*ptr++)) : va_arg((*ap), _type))
 
+/*
+ * Per-character validation for the mrb_get_args fast path.
+ * Written as a switch rather than an array-designator lookup table so
+ * that the file can be compiled as C++ (array-index designators are a
+ * C99-only feature).  Modern compilers typically lower this to a jump
+ * table, giving the same effective O(1) behavior as the original table.
+ * Returns 1 for a valid arg specifier, 2 for the separator, 0 otherwise.
+ */
+static inline uint8_t
+fast_fmt_ok(char c)
+{
+  switch (c) {
+  case 'o': case 'S': case 'A': case 'H': case 'i': case 'b':
+  case 'f': case 'n': case 'z': case 'c': case 's': case 'a':
+    return 1;
+  case '|':
+    return 2;
+  default:
+    return 0;
+  }
+}
+
+/*
+ * Fast path for simple format strings (no *, :, !, +, &, ?).
+ * Handles the most common patterns directly in one pass,
+ * skipping the two-pass format scanning of the general path.
+ *
+ * Returns -1 if the format is not eligible for fast path.
+ */
+static mrb_int
+get_args_fast(mrb_state *mrb, const char *format, void** ptr, va_list *ap)
+{
+  mrb_callinfo *ci = mrb->c->ci;
+  mrb_int argc = ci->n;
+  const mrb_value *argv;
+  mrb_int i = 0;
+
+  /* fast path only for non-packed, non-keyword args */
+  if (argc >= 15 || ci->nk > 0) return -1;
+  argv = ci->stack + 1;
+
+  /* validate format and count args in one scan (table lookup, no switch) */
+  const char *p = format;
+  int req = 0, opt = 0;
+  mrb_bool in_opt = FALSE;
+  while (*p) {
+    uint8_t v = fast_fmt_ok(*p);
+    if (v == 0) return -1;  /* unsupported specifier */
+    if (v == 2) { in_opt = TRUE; p++; continue; }
+    if (in_opt) opt++; else req++;
+    p++;
+  }
+  if (argc < req || argc > req + opt) {
+    mrb_argnum_error(mrb, argc, req, req + opt);
+  }
+
+  /* all specifiers validated — safe to consume GET_ARG now */
+  p = format;
+  while (*p) {
+    char c = *p++;
+    if (c == '|') continue;
+    if (i >= argc) {
+      /* skip remaining optional args (just consume GET_ARG pointers) */
+      switch (c) {
+      case 's': case 'a':
+        (void)GET_ARG(void*);
+        (void)GET_ARG(void*);
+        break;
+      default:
+        (void)GET_ARG(void*);
+        break;
+      }
+      continue;
+    }
+    switch (c) {
+    case 'o': {
+      mrb_value *vp = GET_ARG(mrb_value*);
+      *vp = argv[i++];
+      break;
+    }
+    case 'S': {
+      mrb_value *vp = GET_ARG(mrb_value*);
+      mrb_ensure_string_type(mrb, argv[i]);
+      *vp = argv[i++];
+      break;
+    }
+    case 'A': {
+      mrb_value *vp = GET_ARG(mrb_value*);
+      mrb_ensure_array_type(mrb, argv[i]);
+      *vp = argv[i++];
+      break;
+    }
+    case 'H': {
+      mrb_value *vp = GET_ARG(mrb_value*);
+      mrb_ensure_hash_type(mrb, argv[i]);
+      *vp = argv[i++];
+      break;
+    }
+    case 'i': {
+      mrb_int *ip = GET_ARG(mrb_int*);
+      *ip = mrb_as_int(mrb, argv[i++]);
+      break;
+    }
+    case 'b': {
+      mrb_bool *bp = GET_ARG(mrb_bool*);
+      *bp = mrb_test(argv[i++]);
+      break;
+    }
+    case 'f': {
+      mrb_float *fp = GET_ARG(mrb_float*);
+      *fp = mrb_as_float(mrb, argv[i++]);
+      break;
+    }
+    case 'n': {
+      mrb_sym *np = GET_ARG(mrb_sym*);
+      *np = to_sym(mrb, argv[i++]);
+      break;
+    }
+    case 'z': {
+      const char **zp = GET_ARG(const char**);
+      mrb_ensure_string_type(mrb, argv[i]);
+      *zp = RSTRING_CSTR(mrb, argv[i++]);
+      break;
+    }
+    case 's': {
+      const char **sp = GET_ARG(const char**);
+      mrb_int *lp = GET_ARG(mrb_int*);
+      mrb_ensure_string_type(mrb, argv[i]);
+      *sp = RSTRING_PTR(argv[i]);
+      *lp = RSTRING_LEN(argv[i]);
+      i++;
+      break;
+    }
+    case 'a': {
+      const mrb_value **pb = GET_ARG(const mrb_value**);
+      mrb_int *pl = GET_ARG(mrb_int*);
+      mrb_ensure_array_type(mrb, argv[i]);
+      struct RArray *a = mrb_ary_ptr(argv[i]);
+      *pb = ARY_PTR(a);
+      *pl = ARY_LEN(a);
+      i++;
+      break;
+    }
+    case 'c': {
+      struct RClass **cp = GET_ARG(struct RClass**);
+      ensure_class_type(mrb, argv[i]);
+      *cp = mrb_class_ptr(argv[i++]);
+      break;
+    }
+    default:
+      return -1;  /* unknown specifier, fall back to slow path */
+    }
+  }
+  return i;
+}
+
 static mrb_int
 get_args_v(mrb_state *mrb, mrb_args_format format, void** ptr, va_list *ap)
 {
+  /* try fast path first */
+  mrb_int fast = get_args_fast(mrb, format, ptr, ap);
+  if (fast >= 0) return fast;
+
   const char *fmt = format;
   char c;
   mrb_int i = 0;

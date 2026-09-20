@@ -30,6 +30,10 @@ enum re_opcode {
   RE_WBOUND,     /* assert word boundary (\b) */
   RE_NWBOUND,    /* assert non-word boundary (\B) */
   RE_BACKREF,    /* backreference: operand = group number */
+  RE_LOOKAHEAD,  /* positive lookahead: offset = end of sub-pattern */
+  RE_NEG_LOOKAHEAD, /* negative lookahead: offset = end of sub-pattern */
+  RE_LOOKBEHIND,     /* positive lookbehind: a = byte length, offset = end */
+  RE_NEG_LOOKBEHIND, /* negative lookbehind: a = byte length, offset = end */
 };
 
 /* Bytecode instruction (4 bytes each for alignment) */
@@ -47,6 +51,13 @@ typedef struct {
   mrb_bool utf8_any;  /* match any non-ASCII byte if true */
 } re_charclass;
 
+/* Named capture entry */
+typedef struct {
+  const char *name;
+  uint16_t name_len;
+  uint16_t group;
+} re_named_capture;
+
 /* Compiled regexp pattern */
 typedef struct mrb_regexp_pattern {
   re_inst *code;          /* bytecode array */
@@ -55,16 +66,30 @@ typedef struct mrb_regexp_pattern {
   uint16_t num_classes;
   uint16_t num_captures;   /* number of capture groups (including group 0) */
   uint32_t flags;
+  re_named_capture *named_captures;
+  uint16_t num_named;
   mrb_bool has_backref;    /* true if pattern uses \1-\9 */
+  mrb_bool needs_backtrack; /* true if pattern needs backtracking engine */
+  uint8_t *prefix;         /* literal prefix bytes for fast skip (or NULL) */
+  uint8_t prefix_len;      /* length of prefix (0 = no prefix) */
+  uint8_t first_bytes[16]; /* bitmap of possible first bytes (128-bit, ASCII) */
+  mrb_bool has_first_bytes; /* true if first_bytes is usable for skipping */
+  mrb_bool is_literal;     /* true if pattern is pure literal (no metacharacters) */
+  /* Cached VM state for pike_vm (avoids malloc per re_exec call) */
+  uint32_t *cached_visited;     /* generation-based visited array */
+  void *cached_threads[2];      /* curr/next thread lists */
+  int cached_list_capa;         /* capacity of cached thread lists */
+  mrb_bool cache_in_use;        /* re-entrancy guard */
 } mrb_regexp_pattern;
 
 /* Regexp flags */
 #define RE_FLAG_IGNORECASE  1
 #define RE_FLAG_MULTILINE   2  /* ^ and $ match at \n boundaries */
 #define RE_FLAG_DOTALL      4  /* . matches \n (Ruby's /m for dot behavior) */
+#define RE_FLAG_EXTENDED    8  /* ignore whitespace and #comments in pattern */
 
 /* Note: Ruby's /m flag means BOTH multiline anchors AND dotall.
-   Ruby's /i flag is ignorecase. */
+   Ruby's /i flag is ignorecase.  Ruby's /x flag is extended. */
 
 /* Step limit for ReDoS protection */
 #ifndef MRB_REGEXP_STEP_LIMIT
@@ -73,6 +98,12 @@ typedef struct mrb_regexp_pattern {
 
 /* Maximum captures */
 #define RE_MAX_CAPTURES 32
+
+/* Thread struct for Pike VM (also used for cache sizing) */
+typedef struct {
+  uint32_t pc;
+  int cap_slot;
+} re_thread_cache;
 
 /* Compile a pattern string into bytecode */
 mrb_regexp_pattern* re_compile(mrb_state *mrb, const char *pattern, mrb_int len, uint32_t flags);

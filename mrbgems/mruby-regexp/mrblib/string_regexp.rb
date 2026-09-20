@@ -15,68 +15,42 @@ class String
 
   def sub(pattern, replacement = nil, &block)
     pattern = Regexp.new(Regexp.escape(pattern)) if pattern.is_a?(String)
+    unless block
+      return pattern.__sub_str(self, replacement.to_s)
+    end
     md = pattern.match(self)
     return self.dup unless md
-
-    pre = md.pre_match
-    post = md.post_match
-    if block
-      rep = block.call(md[0]).to_s
-    else
-      rep = replacement.to_s
-      # handle \0, \1, etc. in replacement string
-      rep = rep.gsub(/\\(\d)/) { md[$1.to_i] || "" } if rep.include?("\\")
-    end
-    pre + rep + post
+    md.pre_match + block.call(md[0]).to_s + md.post_match
   end
 
   def gsub(pattern, replacement = nil, &block)
     pattern = Regexp.new(Regexp.escape(pattern)) if pattern.is_a?(String)
-    result = ""
+    unless block
+      return pattern.__gsub_str(self, replacement.to_s)
+    end
+    # block case: keep in Ruby to avoid VM callback from C
+    parts = []
     rest = self
     while rest.length > 0
       md = pattern.match(rest)
       break unless md
-      result += md.pre_match
-      if block
-        result += block.call(md[0]).to_s
-      else
-        rep = replacement.to_s
-        rep = rep.gsub(/\\(\d)/) { md[$1.to_i] || "" } if rep.include?("\\")
-        result += rep
-      end
+      parts << md.pre_match
+      parts << block.call(md[0]).to_s
       matched_len = md[0].length
       if matched_len == 0
-        # avoid infinite loop on zero-length match
-        result += rest[0] if rest.length > 0
+        parts << rest[0] if rest.length > 0
         rest = rest[1..-1] || ""
       else
         rest = md.post_match
       end
     end
-    result + rest
+    parts << rest
+    parts.join
   end
 
   def scan(pattern)
     pattern = Regexp.new(Regexp.escape(pattern)) if pattern.is_a?(String)
-    result = []
-    pos = 0
-    while pos <= self.length
-      md = pattern.match(self, pos)
-      break unless md
-      if md.captures.empty?
-        result << md[0]
-      elsif md.captures.length == 1
-        result << md.captures[0]
-      else
-        result << md.captures
-      end
-      if md[0].length == 0
-        pos = md.end(0) + 1
-      else
-        pos = md.end(0)
-      end
-    end
+    result = pattern.__scan(self)
     if block_given?
       result.each { |m| yield m }
       self
