@@ -95,5 +95,60 @@ MRuby::Build.new('ascii-ctype') do |conf|
   # depth a pattern may nest is not what ASCII classification is about.
   conf.cc.defines << 'MRB_REGEXP_PARSE_DEPTH_LIMIT=512'
 
+  # mruby-process reads CPU time through getrusage(2) wherever the header
+  # probe finds <sys/resource.h>, which is every host this matrix runs on, so
+  # its times(2) fallback would otherwise compile nowhere in CI. Answering the
+  # probe no by hand is the override the port documents as standing on its
+  # own. It rides along here for the reason the depth limit above does: no
+  # extra pass, and CPU time accounting is not what ASCII classification is
+  # about.
+  conf.cc.defines << 'MRB_PROCESS_HAVE_GETRUSAGE=0'
+
   conf.enable_test
+end
+
+# The two builds below are left off an emulated runner for the accounting at
+# the top of this file, and neither is about an ABI: one takes Float out of
+# the numeric tower, the other stops Integer at mrb_int, so what they cover
+# reads the same wherever it is compiled. On a runner that executes its own
+# instructions the pair costs the second each of their suites takes, which is
+# why the native runners are the ones asked for them.
+if ENV['MRUBY_CI_EMULATED'].to_s.empty?
+MRuby::Build.new('no-float') do |conf|
+  conf.toolchain
+
+  # The one build here without Float. MRB_NO_FLOAT takes the type out of the
+  # numeric tower, and what is written for its absence compiles nowhere else
+  # in CI: the integer arms of Time, Rational and sleep, the %f that String#%
+  # refuses, and the codegen that reads a float literal as Integer 0 rather
+  # than a pool entry. The gems that refuse the define say so with #error and
+  # leave full-core here, Math, Complex and CMath; mruby-benchmark leaves it
+  # too, its Tms being fractional seconds its README documents as Float and
+  # its to_s formatting them with %f.
+  # Tests only, for the reason byte-string gives above.
+  conf.gembox 'full-core'
+  %w(mruby-math mruby-complex mruby-cmath mruby-benchmark).each do |g|
+    conf.gems.delete g
+  end
+  conf.compilers.each do |c|
+    c.defines << 'MRB_NO_FLOAT'
+  end
+
+  conf.enable_test
+end
+
+MRuby::Build.new('no-bigint') do |conf|
+  conf.toolchain
+
+  # The one build here whose Integer ends at mrb_int. Every other build in
+  # CI carries mruby-bigint, so the RangeError that arithmetic raises where
+  # mrb_int overflows, the literal the compiler refuses for the same reason,
+  # and the half of each width-dependent test written for the gem's absence
+  # run nowhere else; on the i686 runner that edge is 32 bits wide.
+  # Tests only, for the reason byte-string gives above.
+  conf.gembox 'full-core'
+  conf.gems.delete 'mruby-bigint'
+
+  conf.enable_test
+end
 end

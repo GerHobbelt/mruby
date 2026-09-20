@@ -56,6 +56,15 @@ A source no build in the tree compiled, one of a gem the configuration leaves
 out for instance, has no entry; `compile_flags.txt` and `.clangd` at the
 source root are what answer for those.
 
+Every target also leaves a `size.json` in its build directory: the byte
+counts of `libmruby.a` and the executables, text, data and bss sections and
+all, each with the object files it is made of, so that two builds can be
+subtracted down to the object that grew. The file names the commit it was
+built from, and `rake size.json` is the build asked for by that name. The
+`size` program is found by the C compiler's prefix, or named with
+`conf.size = "arm-none-eabi-size"`; a build whose objects none can read
+keeps its file sizes and carries `null` sections.
+
 You can specify your own configuration file by the `MRUBY_CONFIG` environment
 variable (you can use `CONFIG` for shorthand for `MRUBY_CONFIG`). If the path
 doesn't exist, `build_config/${MRUBY_CONFIG}.rb` is used. The default
@@ -282,6 +291,36 @@ An answer holds for the compiler that gave it. `rake amalgam` embeds the
 defines a gem writes to its own `cc` into the generated `mruby.h`, so an
 amalgam carries the answers the build that generated it got, the way it
 already carries every other define a gem writes.
+
+#### The define log
+
+`rake defines` prints, one table per target, every define the build will
+compile with and the file and line that wrote it:
+
+```console
+Defines of 'host':
+  HAVE_SYS_RESOURCE_H  mruby-process cc    mrbgems/mruby-process/mrbgem.rake:37
+  MRB_DEBUG            compilers internal  build_config/host-debug.rb:5 (via enable_debug)
+  MRB_USE_BIGINT       conf                mrbgems/mruby-bigint/mrbgem.rake:5
+```
+
+The middle column says who carries the define: `conf` is `conf.defines`, a
+compiler name is that compiler's own list (`compilers` when every compiler
+carries it, `internal` for what the build added from one of its own
+switches), and a gem name is the gem's own compiler. An add made through a
+switch such as `enable_debug` is charged to the configuration line that asked
+for it. The mechanical `MRBGEM_*_VERSION` defines are left out.
+
+When one name is held with two values, the losing rows are marked with what
+beats them: the last `-D` of a name on a compile line is the one in effect,
+and `conf.defines` comes after the compilers' lists. An unmarked row is what
+its objects compile with; `[FOO=1 wins]` on a row says `FOO=1` is in effect
+wherever that row would apply, and `[FOO=1 wins for mruby-x cc]` says the row
+loses only there, the gem's own compiler having redefined a build-wide name.
+
+A build says nothing of this by default, mruby being built from inside other
+projects' builds. A configuration that says `conf.define_log` opens its build
+output with the same tables.
 
 ### Linker
 

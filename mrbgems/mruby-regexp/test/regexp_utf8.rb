@@ -405,6 +405,25 @@ assert("Regexp - a capture spans whole characters") do
   assert_equal [0x81], bm[2].bytes
 end
 
+assert("Regexp - a lookbehind branch counts its own width in both units") do
+  need_backtracking_stack
+  # A rewind is counted in characters against a subject read as characters and
+  # in bytes against one read as bytes, so a branch carries both counts. With
+  # one width per branch there is a pair per branch, and the two branches here
+  # disagree in each unit on its own: `ā` is one character and two bytes, `bc`
+  # two characters and two bytes, so a rewind that had only the byte count
+  # could not tell them apart.
+  skip unless __ENCODING__ == "UTF-8"
+  assert_equal 1, ("ābx" =~ /(?<=ā|bc)b/)
+  assert_equal 2, ("bcbx" =~ /(?<=ā|bc)b/)
+  assert_nil ("abx" =~ /(?<=ā|bc)b/)
+  # the same pattern against a byte-indexed subject rewinds by the bytes, so
+  # both branches step back two of them
+  bin = "ābx".b
+  assert_equal 2, (bin =~ /(?<=ā|bc)b/)
+  assert_nil ("abx".b =~ /(?<=ā|bc)b/)
+end
+
 assert("Regexp - a lookaround holds where its sub-pattern matches") do
   # A lookaround consumes nothing, so where its sub-pattern stopped was not the
   # end of a match and nothing held it to a character. It could therefore
@@ -470,6 +489,13 @@ assert("Regexp - multibyte (UTF-8) match extraction") do
   assert_equal 3, //.match("あいあ", 3).begin(0)
   assert_true /あ/.match?("あいあ", 2)
   assert_false /い/.match?("あいあ", 2)
+end
+
+assert("MatchData#inspect spells the groups by string mode") do
+  # The values go through String#inspect, which keeps a UTF-8 character
+  # whole only on a build that reads them
+  skip unless __ENCODING__ == "UTF-8"
+  assert_equal %(#<MatchData "あ" 1:"あ" 2:nil>), /(あ)(x)?/.match("あ").inspect
 end
 
 assert("Regexp - UTF-8 codepoints in character class") do
@@ -867,6 +893,7 @@ assert("Regexp - a subject whose bytes are not UTF-8 is refused") do
   broken.sub("b", "!")
   assert_equal broken.index("b"), $~.begin(0)
   assert_raise(ArgumentError) { broken.scan("b") }
+  assert_raise(ArgumentError) { broken.scan("b") {} }
 
   # `split` is the other exception, and it takes every pattern with it: CRuby
   # refuses a String, a nil and the awk form as well as a Regexp. A String
@@ -1008,5 +1035,26 @@ assert('Regexp - a word boundary sits beside any script') do
     byte = "\xB5".force_encoding("ASCII-8BIT")
     assert_nil (byte =~ /\A\b/)
     assert_equal 0, (byte =~ /\A\B/)
+  end
+end
+
+assert("Regexp - an absent repeater's run stops on a character boundary") do
+  skip unless __ENCODING__ == "UTF-8"
+
+  # The run may not hold the body's match, so it stops before the first byte
+  # of the character the match begins at, not one byte back from its end.
+  assert_equal "い", /(?~あ)/.match("いあう")[0]
+  assert_equal "", /(?~い)/.match("いあう")[0]
+  assert_equal "いあ", /(?~う)/.match("いあう")[0]
+  assert_equal "いあう", /(?~x)/.match("いあう")[0]
+  # and it gives the characters back one at a time, not the bytes
+  assert_equal "いあう", /(?~x)う/.match("いあう")[0]
+
+  # A binary subject is bytes, so the same pattern stops one byte into the
+  # character the match begins at.
+  if "".respond_to?(:force_encoding)
+    bin = "いあう".dup.force_encoding("ASCII-8BIT")
+    pat = Regexp.new("(?~\xE3\x81\x82".dup.force_encoding("ASCII-8BIT") + ")")
+    assert_equal 5, pat.match(bin)[0].bytesize
   end
 end

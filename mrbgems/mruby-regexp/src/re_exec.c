@@ -10,28 +10,104 @@
 #include "re_internal.h"
 #include <string.h>
 
+/* Whether the rest of a prefix of two bytes or more stands at `p`, whose
+   first byte is already known to. The last byte is tested before the ones
+   between it and the first, so that a position the scan below is about to
+   leave is left on one comparison. */
+static inline mrb_bool
+prefix_rest_at(const uint8_t *prefix, mrb_int plen, const char *p)
+{
+  return (uint8_t)p[plen - 1] == prefix[plen - 1] &&
+         (plen == 2 || memcmp(p + 1, prefix + 1, (size_t)(plen - 2)) == 0);
+}
+
+/*
+ * The first position at or after `sp` where a prefix of two bytes or more
+ * stands, or NULL when the subject holds none before `str_end`.
+ *
+ * A scan on the first byte alone proposes a position per occurrence of it, and
+ * a subject made mostly of that byte -- /aaaaab/ over a run of `a` -- then
+ * costs a rejected comparison per position. The prefix's last byte is scanned
+ * for too, at the offset it stands at: where it is not there, the next place
+ * it is names the next position worth proposing, and getting there is one
+ * scan rather than the occurrences of the first byte one at a time.
+ *
+ * The second scan runs only where the first byte was found and the last was
+ * not, so a subject that holds the first byte nowhere costs what it costs with
+ * one scan. Every round leaves `sp` past where it entered, so the two get
+ * through the subject once between them whichever of the bytes is the one that
+ * keeps being found.
+ *
+ * It earns its place by skipping positions the first scan would have proposed
+ * one at a time, and a subject can be built where it skips none: both bytes
+ * all through it, never at the distance the prefix puts them. It is dropped
+ * where that shows, leaving the walk the one scan it had before, so no subject
+ * pays for it twice over.
+ */
+static const char*
+find_prefix_ends(const uint8_t *prefix, mrb_int plen, const char *sp, const char *str_end)
+{
+  if (str_end - sp < plen) return NULL;
+  /* The last position a match can start at, so the first scan never proposes
+     one the subject is too short to hold. */
+  const char *limit = str_end - plen;
+  mrb_int last = plen - 1;
+  mrb_bool scan_last = TRUE;
+
+  while (sp <= limit) {
+    const char *base = sp;
+    const char *p0 = (const char*)memchr(sp, prefix[0], (size_t)(limit - sp) + 1);
+    if (!p0) return NULL;
+    if (prefix_rest_at(prefix, plen, p0)) return p0;
+    if (!scan_last || (uint8_t)p0[last] == prefix[last]) {
+      /* Nothing to scan for: either the last byte is here too and only the
+         bytes between the ends disagree, which says nothing about where the
+         next position is, or the scan has been dropped. */
+      sp = p0 + 1;
+      continue;
+    }
+    /* Where the last byte stands next names the position a match holding it
+       would start at, which is past the one the first byte just named. */
+    const char *p1 = (const char*)memchr(p0 + last + 1, prefix[last],
+                                         (size_t)(str_end - (p0 + last + 1)));
+    if (!p1) return NULL;
+    const char *cand = p1 - last;
+    /* Reaching no further than the first scan had just reached is the second
+       one proposing the positions it is supposed to be skipping. */
+    if (cand - p0 <= p0 - base) scan_last = FALSE;
+    sp = cand;
+  }
+  return NULL;
+}
+
+/* The first position at or after `sp` where a prefix of `plen` bytes stands,
+   or NULL when the subject holds none. The first scan, and the comparison at
+   the position it names, are here rather than behind the walk above: they are
+   the whole of the question for a prefix of one byte, and the whole of it
+   again wherever the position the scan names is the answer, which is what a
+   pattern that matches often asks over and over. The walk is entered only
+   where that answer was no. */
+static inline const char*
+find_prefix(const uint8_t *prefix, mrb_int plen, const char *sp, const char *str_end)
+{
+  const char *p = (const char*)memchr(sp, prefix[0], (size_t)(str_end - sp));
+  if (!p || plen == 1) return p;
+  /* A first occurrence of the first byte too near the end settles the whole
+     subject, since every later one stands nearer still. */
+  if (str_end - p < plen) return NULL;
+  if (prefix_rest_at(prefix, plen, p)) return p;
+  return find_prefix_ends(prefix, plen, p, str_end);
+}
+
 /*
  * Skip to the next position where the pattern's literal prefix could match.
- * Uses memchr on the first byte for fast scanning, then verifies the rest.
  * Returns the found position, or NULL if no match is possible.
  */
 static const char*
 skip_to_prefix(const mrb_regexp_pattern *pat, const char *sp, const char *str_end)
 {
   if (pat->prefix_len == 0) return sp;
-
-  uint8_t first = pat->prefix[0];
-  int plen = pat->prefix_len;
-
-  while (sp + plen <= str_end) {
-    const char *found = (const char*)memchr(sp, first, str_end - sp);
-    if (!found || found + plen > str_end) return NULL;
-    if (plen == 1 || memcmp(found + 1, pat->prefix + 1, plen - 1) == 0) {
-      return found;
-    }
-    sp = found + 1;
-  }
-  return NULL;
+  return find_prefix(pat->prefix, pat->prefix_len, sp, str_end);
 }
 
 /* Check if a byte is in the first-byte bitmap */
@@ -79,6 +155,24 @@ skip_to_first_byte(const mrb_regexp_pattern *pat, const char *sp, const char *st
     }
   }
   return found;
+}
+
+/*
+ * Skip to the next position a line-anchored match could start at: the string
+ * start, or just after a \n. Everything between fails RE_BOL on its first
+ * step, so those positions are gone as candidates, found by memchr rather
+ * than proposed one at a time. The tests here are RE_BOL's own: the very end
+ * is no line start (a trailing \n opens no final line), except when the
+ * string is empty and the end is the start. Returns NULL when no candidate
+ * remains.
+ */
+static const char*
+skip_to_line_start(const char *str, const char *sp, const char *str_end)
+{
+  if (sp == str || (sp != str_end && sp[-1] == '\n')) return sp;
+  const char *nl = (const char*)memchr(sp, '\n', (size_t)(str_end - sp));
+  if (!nl || nl + 1 == str_end) return NULL;
+  return nl + 1;
 }
 
 /* Check if the current input character matches a character class. ASCII
@@ -444,6 +538,9 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
   const char *start_cap = str + start_limit;
   const char *sp = str + start;
   const char *str_end = str + len;
+  /* \A: no position past the string start can begin a match, which is what
+     start_cap already bounds, so the anchor costs the scan loop nothing. */
+  if (pat->anchor == RE_ANCHOR_BOT) start_cap = str;
   int ncap = pat->num_captures * 2;
   if (ncap == 0) ncap = 2;
 
@@ -540,6 +637,15 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
     if (!s.matched && sp <= start_cap) {
       /* Skip ahead when no active threads */
       if (curr.count == 0) {
+        /* ^: every branch asserts a line start first, so only those are
+           candidates. \A was folded into start_cap on entry; such a pattern
+           reaches here at the start alone, where the line-start answer is
+           the position unchanged. */
+        if (pat->anchor != RE_ANCHOR_NONE) {
+          const char *skip = skip_to_line_start(str, sp, str_end);
+          if (!skip) break;
+          sp = skip;
+        }
         if (pat->prefix_len > 0) {
           const char *skip = skip_to_prefix(pat, sp, str_end);
           if (!skip) break;
@@ -748,23 +854,22 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
 }
 
 /*
- * Where the lookbehind at pc starts matching from: sp rewound by the byte
- * count in the opcode for a binary subject, and otherwise by the character
- * count in the RE_LB_WIDTH that follows it. The backward walk steps over
+ * Where a lookbehind branch starts matching from: sp rewound by the byte
+ * count the RE_LB_WIDTH at its head carries for a binary subject, and
+ * otherwise by the character count beside it. The backward walk steps over
  * continuation bytes with mrb_re_char_interior_p(), which keeps it on the
  * boundaries the forward decode uses, broken input included. Returns NULL
  * when the text before sp runs out first.
  */
 static const char*
-lookbehind_start(const mrb_regexp_pattern *pat, const char *str,
-                 const char *str_end, const char *sp, uint32_t pc,
-                 mrb_bool binary)
+lookbehind_start(const char *str, const char *str_end, const char *sp,
+                 uint16_t width, mrb_bool binary)
 {
   if (binary) {
-    int lb_len = pat->code[pc].a;
+    int lb_len = RE_LB_BYTES(width);
     return (sp - str < lb_len) ? NULL : sp - lb_len;
   }
-  int nchars = pat->code[pc + 1].a;
+  int nchars = RE_LB_CHARS(width);
   while (nchars > 0) {
     if (sp <= str) return NULL;
     sp--;
@@ -821,6 +926,30 @@ enum re_cp_kind {
                    back past the call pops the frame with everything above
                    it, and MRB_REGEXP_STACK_LIMIT bounds the call depth by
                    bounding the frames. */
+  RE_CP_ABSENT, /* not a branch: the state one absent repeater's scan runs
+                   on. `sp` is where the absent began. `pc` is how far it may
+                   still reach as an offset into the subject: the whole of
+                   what stands after it until a match of the body says
+                   otherwise, and below `sp` once the body has matched empty
+                   where the absent began, which is the absent matching
+                   nothing anywhere. `group` is the end of the subject the
+                   text around it runs against, put back when the scan ends.
+                   RE_ABSENT pops it at the head of each round and pushes it
+                   back for the next, so the scan's state is backtracking
+                   state like any other and a failure that goes back past the
+                   absent drops it. Reaching it while backtracking resumes
+                   nothing: there is no round left to try. */
+  RE_CP_ABSENT_ITER, /* the round after the one now running, pushed directly
+                        above the state it belongs to: the body failing at
+                        this position is the scan going on at the next.
+                        RE_ABSENT_END takes it by hand once the body has
+                        matched, which is what drops the alternatives the
+                        body left rather than trying them. */
+  RE_CP_ABSENT_BACK, /* the ends an absent repeater has not answered with
+                        yet: `sp` is the next one and `group` is where the
+                        absent began, which is the last. Taking one pushes
+                        the one below it, so a scan of any length leaves one
+                        choice point behind rather than one per position. */
   RE_CP_RET     /* not a branch either: the mark RE_RETURN leaves in place of
                    popping the frame it answered, which backtracking may
                    still need. The next RE_RETURN's downward scan counts
@@ -1071,6 +1200,15 @@ bt_match(bt_state *m, const char *sp, uint32_t pc)
 {
   const mrb_regexp_pattern *pat = m->pat;
   const char *str = m->str;
+  /* Where the subject ends, which is where it really ends except while the
+     body of an absent repeater runs: there it is the furthest the absent may
+     still reach, since a run of text the absent could never take is one the
+     body has no business reading. The whole of the search reads it, an
+     assertion as much as a literal, so `\z` inside such a body holds where
+     the scan stops rather than where the string does, which is CRuby's
+     answer: Onigmo keeps the reach in the same `end` the rest of its
+     executor measures against. RE_ABSENT puts it back at the head of every
+     round. */
   const char *str_end = m->str_end;
   int *captures = m->captures;
   int ncap = m->ncap;
@@ -1294,41 +1432,58 @@ bt_match(bt_state *m, const char *sp, uint32_t pc)
       break;
 
     case RE_LOOKAHEAD:
-    case RE_LOOKBEHIND:
     case RE_NEG_LOOKAHEAD:
+    case RE_LOOKBEHIND:
     case RE_NEG_LOOKBEHIND:
       {
         /* The lookaround is entered: a barrier stands where it began, and
-           the sub-pattern goes on from here, from sp for a lookahead, from
-           the rewound start for a lookbehind. What the barrier holds is
-           where the text after the lookaround goes on from and the pass to
-           go on in; for a negative one that is what taking the barrier
-           resumes, its sub-pattern running out of alternatives being the
-           assertion holding. The sub-pattern runs as a pass of its own, one
-           no run before it had, so the records of the loops inside it that
-           an earlier run may have left live are not taken for this run's
-           (see bt_state). */
+           the sub-pattern goes on from here. What the barrier holds is where
+           the text after the lookaround goes on from and the pass to go on
+           in; for a negative one that is what taking the barrier resumes,
+           its sub-pattern running out of alternatives being the assertion
+           holding. The sub-pattern runs as a pass of its own, one no run
+           before it had, so the records of the loops inside it that an
+           earlier run may have left live are not taken for this run's (see
+           bt_state).
+
+           A lookbehind is entered at the same position as a lookahead: the
+           rewind belongs to the branch, not to the opener, so that the
+           branches of a body whose widths differ each look back their own
+           way and are tried in the order the alternation gives them. The
+           RE_LB_WIDTH at the head of the branch does it (see there). */
         mrb_bool negated = (inst.op == RE_NEG_LOOKAHEAD || inst.op == RE_NEG_LOOKBEHIND);
-        const char *from = sp;
-        uint32_t body = pc + 1;
-        if (inst.op == RE_LOOKBEHIND || inst.op == RE_NEG_LOOKBEHIND) {
-          from = lookbehind_start(pat, str, str_end, sp, pc, binary);
-          if (!from) {
-            /* not enough text before: a positive lookbehind cannot hold and
-               a negative one holds without a sub-pattern to run */
-            if (!negated) goto fail;
-            pc = inst.offset;
-            break;
-          }
-          body = pc + 2;
-        }
         if ((r = bt_push(m, sp, inst.offset, negated ? RE_CP_NEG : RE_CP_BARRIER,
                          pat->code[inst.offset - 1].offset)) != BT_OK) {
           return r;
         }
         m->pass = ++m->pass_seq;
+        pc++;
+        /* A lookbehind whose body takes one width begins with that rewind,
+           and taking it here rather than through another turn of the loop is
+           what leaves such a lookbehind, every one this engine compiled
+           before a branch could have a width of its own, costing what it
+           did. A body whose branches differ begins with the fork that picks
+           between them, and each branch rewinds when it is reached.
+
+           The opcode alone tells the two apart for a lookahead as well: a
+           rewind stands at the head of a lookbehind branch and nowhere
+           else, so a lookahead's body never begins with one. */
+        if (pat->code[pc].op != RE_LB_WIDTH) break;
+        inst = pat->code[pc];
+      }
+      /* fall through */
+
+    case RE_LB_WIDTH:
+      {
+        /* The branch this heads looks back by the width it carries. Too
+           little text before is this branch failing and nothing more: what
+           the search tries next is the branch after it, and with none left
+           the barrier below answers, a positive lookbehind not holding and
+           a negative one holding with no sub-pattern having run. */
+        const char *from = lookbehind_start(str, str_end, sp, inst.offset, binary);
+        if (!from) goto fail;
         sp = from;
-        pc = body;
+        pc++;
       }
       break;
 
@@ -1349,12 +1504,22 @@ bt_match(bt_state *m, const char *sp, uint32_t pc)
         uint32_t idx;
         if (!bt_barrier_find(m, inst.offset, &idx)) goto fail;
         re_cpoint c = m->cp[idx];
-        /* No boundary test either: a sub-pattern reaches the same
+        /* Where the sub-pattern is one whose branches rewind by different
+           widths, it has to have landed back where the lookaround was
+           entered: `(?<=c|ab)` rewound the two characters `ab` asks for can
+           still match `c` and stop a character short, which is a match of
+           the text before the wrong position. The test comes before the cut
+           below, so that a branch that lands short leaves the search the
+           alternatives it has not tried, which are the branches after it,
+           each with its own rewind. Every other lookaround lands where it
+           must by construction and carries no such bit; see RE_LOOK_LANDING.
+           No boundary test either: a sub-pattern reaches the same
            positions as the rest of the search, so an assertion that used to
            hold on half a character has no half to hold on. */
+        if ((inst.a & RE_LOOK_LANDING) && sp != c.sp) goto fail;
         m->cp_top = idx;
         m->pass = c.pass;
-        if (inst.a) {
+        if (inst.a & RE_LOOK_NEGATED) {
           bt_undo_to(m, c.undo_top);
           goto fail;
         }
@@ -1448,6 +1613,108 @@ bt_match(bt_state *m, const char *sp, uint32_t pc)
       }
       break;
 
+    case RE_ABSENT_START:
+      /* The absent repeater is entered. Its scan runs on the state pushed
+         here: it began at sp, it may reach as far as the subject reaches
+         around it, and that same end is what the scan puts back when it is
+         done. The subject an absent inside the body of another one runs
+         against is the one that one has narrowed. */
+      if ((r = bt_push(m, sp, (uint32_t)(str_end - str), RE_CP_ABSENT,
+                       (uint32_t)(str_end - str))) != BT_OK) {
+        return r;
+      }
+      pc++;
+      break;
+
+    case RE_ABSENT:
+      {
+        /* One round of the scan, at the position the round before left.
+           Every position from where the absent began to the end it may still
+           reach is an end the absent can take, so the round either takes the
+           furthest of them, leaving the shorter ones to backtracking under
+           one choice point for all of them, or runs the body once here and
+           goes on at the next position.
+
+           The state is popped and pushed back rather than read in place: the
+           round runs the body above it, and a body that fails has to land on
+           the choice point that begins the next round and not inside a state
+           the next round is about to read. */
+        if (m->cp_top == 0 || m->cp[m->cp_top - 1].kind != RE_CP_ABSENT) goto fail;
+        re_cpoint st = m->cp[--m->cp_top];
+        m->pass = st.pass;
+        str_end = str + st.group;
+        int begun = (int)(st.sp - str);
+        int reach = (int32_t)st.pc;
+        /* The body matched empty where the absent began, so every run of
+           text from here holds a match of it, the empty one included. */
+        if (reach < begun) goto fail;
+        if ((int)(sp - str) >= reach) {
+          if (reach > begun) {
+            const char *prev = lookbehind_start(str, str_end, str + reach,
+                                                RE_LB_PACK(1, 1), binary);
+            if (prev && (r = bt_push(m, prev, inst.offset, RE_CP_ABSENT_BACK,
+                                     (uint32_t)begun)) != BT_OK) {
+              return r;
+            }
+          }
+          sp = str + reach;
+          pc = inst.offset;
+          break;
+        }
+        {
+          const char *next = sp + mrb_re_charlen(sp, str_end, binary);
+          if ((r = bt_push(m, st.sp, st.pc, RE_CP_ABSENT, st.group)) != BT_OK) return r;
+          if ((r = bt_push(m, next, pc, RE_CP_ABSENT_ITER, 0)) != BT_OK) return r;
+        }
+        /* The body runs against a subject that ends where the absent may
+           still reach, and as a pass of its own, as a lookaround's
+           sub-pattern does, so that the records of the loops inside it are
+           read only by the round that wrote them. */
+        str_end = str + reach;
+        m->pass = ++m->pass_seq;
+        pc++;
+      }
+      break;
+
+    case RE_ABSENT_END:
+      {
+        /* The body has matched, which says how far the absent may still
+           reach: not past the text the body just read, so it stops at the
+           last character of that text, or, where the body matched empty, at
+           the position the body ran at, which the empty match stands after
+           rather than inside. An empty match where the absent began leaves
+           it nothing at all, recorded as a reach below that position and
+           answered at the head of the next round.
+
+           The alternatives the body left are dropped: the scan asks whether
+           the body matches here, and one match is the whole of the answer.
+           So is what it captured. The body is a test the scan runs and no
+           part of the match, so a group inside one is left as the match
+           found it, whether the run of the body matched or failed. */
+        uint32_t idx = m->cp_top;
+        while (idx > 0 && m->cp[idx - 1].kind != RE_CP_ABSENT_ITER) idx--;
+        if (idx == 0) goto fail;
+        idx--;
+        re_cpoint it = m->cp[idx];
+        if (idx == 0 || m->cp[idx - 1].kind != RE_CP_ABSENT) goto fail;
+        re_cpoint *st = &m->cp[idx - 1];
+        int reach;
+        if (sp < it.sp) {
+          reach = (sp == st->sp) ? -1 : (int)(sp - str);
+        }
+        else {
+          const char *prev = lookbehind_start(str, str_end, sp, RE_LB_PACK(1, 1), binary);
+          reach = prev ? (int)(prev - str) : -1;
+        }
+        if (reach < (int32_t)st->pc) st->pc = (uint32_t)reach;
+        m->cp_top = idx;
+        bt_undo_to(m, it.undo_top);
+        m->pass = it.pass;
+        sp = it.sp;
+        pc = it.pc;
+      }
+      break;
+
     default:
       goto fail;
     }
@@ -1473,6 +1740,18 @@ bt_match(bt_state *m, const char *sp, uint32_t pc)
          either: backtracking past a call is just the call unwinding, and
          what is left to try is below them. */
       if (c.kind == RE_CP_BARRIER || c.kind == RE_CP_CALL || c.kind == RE_CP_RET) continue;
+      /* An absent repeater's state is not a branch either: reaching it is
+         the scan having no round left, and the subject the text around it
+         runs against comes back with it. */
+      if (c.kind == RE_CP_ABSENT) { str_end = str + c.group; continue; }
+      /* The ends of an absent repeater are answered longest first, and the
+         one below the end being taken is what is left to try after it. */
+      if (c.kind == RE_CP_ABSENT_BACK && c.sp > str + c.group) {
+        const char *prev = lookbehind_start(str, str_end, c.sp, RE_LB_PACK(1, 1), binary);
+        if (prev && (r = bt_push(m, prev, c.pc, RE_CP_ABSENT_BACK, c.group)) != BT_OK) {
+          return r;
+        }
+      }
       sp = c.sp;
       pc = c.pc;
       if (c.kind == RE_CP_ITER && (r = bt_iter_begin(m, c.group, sp)) != BT_OK) return r;
@@ -1488,6 +1767,8 @@ backtrack_exec(mrb_state *mrb, const mrb_regexp_pattern *pat,
 {
   const char *start_cap = str + start_limit;
   const char *str_end = str + len;
+  /* \A bounds the start positions the way pike_vm's clamp does. */
+  if (pat->anchor == RE_ANCHOR_BOT) start_cap = str;
   int ncap = pat->num_captures * 2;
   if (ncap == 0) ncap = 2;
 
@@ -1528,7 +1809,13 @@ backtrack_exec(mrb_state *mrb, const mrb_regexp_pattern *pat,
   memset(m.entered_in, 0, sizeof(int) * pat->code_len);
 
   for (const char *sp = str + start; sp <= str_end && sp <= start_cap; sp++) {
-    /* Skip ahead using literal prefix or first-byte bitmap */
+    /* Skip ahead using the anchor, the literal prefix or the first-byte
+       bitmap; the same composition as pike_vm's. */
+    if (pat->anchor != RE_ANCHOR_NONE) {
+      const char *skip = skip_to_line_start(str, sp, str_end);
+      if (!skip) break;
+      sp = skip;
+    }
     if (pat->prefix_len > 0) {
       const char *skip = skip_to_prefix(pat, sp, str_end);
       if (!skip) break;
@@ -1594,7 +1881,8 @@ backtrack_exec(mrb_state *mrb, const mrb_regexp_pattern *pat,
   return ret;
 }
 
-/* Fast path for pure literal patterns: use memchr+memcmp, no NFA needed */
+/* Fast path for pure literal patterns: the whole pattern is the prefix, so
+   the search is the prefix skip itself and there is no NFA to run. */
 static int
 literal_exec(const mrb_regexp_pattern *pat,
              const char *str, mrb_int len, mrb_int start, mrb_int start_limit,
@@ -1603,28 +1891,24 @@ literal_exec(const mrb_regexp_pattern *pat,
   const char *start_cap = str + start_limit;
   const char *sp = str + start;
   const char *str_end = str + len;
-  int plen = pat->prefix_len;
+  mrb_int plen = pat->prefix_len;
 
   while (sp + plen <= str_end && sp <= start_cap) {
-    const char *found = (const char*)memchr(sp, pat->prefix[0], str_end - sp);
-    if (!found || found + plen > str_end || found > start_cap) return 0;
+    const char *found = find_prefix(pat->prefix, plen, sp, str_end);
+    if (!found || found > start_cap) return 0;
     if (!binary && mrb_re_char_interior_p(str, found, str_end)) {
       sp = found + 1;  /* not a char boundary, same rule as the other engines */
       continue;
     }
-    if (plen == 1 || memcmp(found + 1, pat->prefix + 1, plen - 1) == 0) {
-      /* No test that the end is a character boundary: a byte that spells no
-         character is RE_BYTE, which this path never holds (the prefix is
-         RE_CHAR only), so the literal is whole characters and a lead byte
-         that matched fixed the length of the one it starts. */
-      /* match found */
-      if (captures && captures_size >= 2) {
-        captures[0] = (int)(found - str);
-        captures[1] = (int)(found - str) + plen;
-      }
-      return 2;  /* group 0 start/end */
+    /* No test that the end is a character boundary: a byte that spells no
+       character is RE_BYTE, which this path never holds (the prefix is
+       RE_CHAR only), so the literal is whole characters and a lead byte
+       that matched fixed the length of the one it starts. */
+    if (captures && captures_size >= 2) {
+      captures[0] = (int)(found - str);
+      captures[1] = (int)(found - str) + plen;
     }
-    sp = found + 1;
+    return 2;  /* group 0 start/end */
   }
   return 0;
 }

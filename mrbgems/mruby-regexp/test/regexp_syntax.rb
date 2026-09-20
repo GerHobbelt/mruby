@@ -1010,9 +1010,8 @@ assert("Regexp - patterns that used to hang the compiler now raise (A1)") do
   # Regexp.new is used so the pattern reaches the regexp compiler directly,
   # bypassing the literal validation the parser performs on /.../ literals.
 
-  # (?X) with an unsupported X: the absent operator (?~...) and conditionals
-  # (?(...)) are not implemented (inline options (?i)/(?i:...) now are).
-  assert_raise(RegexpError) { Regexp.new("(?~foo)") }
+  # (?X) with an unsupported X: conditionals (?(...)) are not implemented
+  # (inline options (?i)/(?i:...) and the absent repeater (?~...) now are).
   assert_raise(RegexpError) { Regexp.new("(?(<x>)a|b)") }
   assert_raise(RegexpError) { Regexp.new("(?") }
   assert_raise(RegexpError) { Regexp.new("(?<") }
@@ -1705,6 +1704,72 @@ assert("Regexp - an atomic group the parser refuses") do
   assert_raise(RegexpError) { Regexp.new("(?<=(?>a))b") }
 end
 
+assert("Regexp - absent repeater (?~...)") do
+  need_backtracking_stack
+  # The longest run of text from where it stands that holds no match of the
+  # body. A match of the body that begins inside the run and ends past it is
+  # not one the run holds, which is why `bar` starting at index 3 still
+  # leaves `fooba`.
+  assert_equal "a", /(?~b)/.match("abc")[0]
+  assert_equal "fooba", /(?~bar)/.match("foobarbaz")[0]
+  assert_equal "xyz", /(?~b)/.match("xyz")[0]
+  assert_equal ["a", "", "b", "", "c", ""], "aXbXc".scan(/(?~X)/)
+  # It gives text back as a greedy repeat does, one character at a time.
+  assert_equal "abcd", /a(?~x)d/.match("abcd")[0]
+  assert_equal "a", /(?~a)a/.match("aa")[0]
+  assert_nil /\A(?~b)\z/ =~ "xbz"
+  assert_equal 0, /\A(?~b)\z/ =~ "xyz"
+
+  # The body is matched where the scan stands, with the branches tried in
+  # the order the pattern gives them: the run stops before the last
+  # character of the match that is found, not of the shortest one there is.
+  assert_equal "fooba", /(?~bar|ba)/.match("foobarbaz")[0]
+  assert_equal "foob", /(?~ba|bar)/.match("foobarbaz")[0]
+
+  # A body that matches empty where the absent began leaves it nothing
+  # anywhere, so the earliest position it can match at is the end of the
+  # subject, where the body is not run at all.
+  assert_equal 3, /(?~)/.match("abc").begin(0)
+  assert_equal 3, /(?~x?)/.match("abc").begin(0)
+  assert_equal "", /(?~)/.match("")[0]
+  # One that matches empty further along stops the run there.
+  assert_equal "bcdefg", /(?~\b)/.match("abcdefg")[0]
+  assert_equal "a", /(?~$)/.match("a\nb")[0]
+  assert_equal "bc", /(?~\A)/.match("abc")[0]
+
+  # The body runs against a subject ending where the absent may still reach,
+  # so a greedy body is cut down by the run it is testing.
+  assert_equal "a", /(?~a+)/.match("aaa")[0]
+  assert_equal "aa", /(?~a+)/.match("aaaa")[0]
+  assert_equal "ab", /(?~b+)/.match("abbbc")[0]
+  assert_equal "aba", /(?~(?:ab)+)/.match("ababab")[0]
+
+  # Quantified, it repeats as any atom does, and its own empty iteration
+  # ends the repeat.
+  assert_equal "bc", /(?~a)*/.match("bcad")[0]
+  assert_equal "bc", /(?~a)+/.match("bcad")[0]
+  assert_equal "bc", /(?~a){2}/.match("bcad")[0]
+  assert_equal "", /(?~a)??/.match("bcad")[0]
+
+  # The body is a test and no part of the match, so a group inside it is
+  # left as the match found it.
+  assert_nil /(?~(b))/.match("abc")[1]
+  assert_equal "a", /(a)(?~\1)/.match("xaay")[1]
+
+  # It reads back through to_s, and free-spacing applies to its body.
+  assert_equal "a", Regexp.new(/(?~b)/.to_s).match("abc")[0]
+  assert_equal "a", Regexp.new("(?~ b )", Regexp::EXTENDED).match("abc")[0]
+  # /i folds the body, as it folds anything else.
+  assert_equal "", Regexp.new("(?~A)", Regexp::IGNORECASE).match("aab")[0]
+end
+
+assert("Regexp - an absent repeater the parser refuses") do
+  assert_raise(RegexpError) { Regexp.new("(?~a") }
+  assert_raise(RegexpError) { Regexp.new("(?~") }
+  # not a fixed-length construct, so not allowed in a lookbehind
+  assert_raise(RegexpError) { Regexp.new("(?<=(?~a))b") }
+end
+
 assert("Regexp - a lookbehind body of no fixed width says which it was") do
   # This engine rewinds a lookbehind by a width it measures at compile
   # time, so a body that has none is refused. CRuby refuses the same
@@ -1974,6 +2039,16 @@ assert("Regexp#named_captures") do
   re = /(?<a>x)/
   re.named_captures["a"] = 99
   assert_equal({"a" => [1]}, re.named_captures)
+
+  # a name given to several groups lists every group it was given to, and
+  # each group keeps its own number
+  assert_equal({"a" => [1, 2]}, /(?<a>x)|(?<a>b)/.named_captures)
+  assert_equal({"b" => [1], "a" => [2, 3]}, /(?<b>1)(?<a>x)|(?<a>b)/.named_captures)
+
+  # the group lists are copies too
+  re = /(?<a>x)|(?<a>b)/
+  re.named_captures["a"] << 99
+  assert_equal({"a" => [1, 2]}, re.named_captures)
 end
 
 assert("Regexp#names") do
@@ -2465,6 +2540,110 @@ assert("Regexp - negative lookbehind at string start") do
   # negative lookbehind succeeds when not enough text before
   md = Regexp.new("(?<!x)a").match("a")
   assert_equal "a", md[0]
+end
+
+assert("Regexp - each branch of a lookbehind looks back its own way") do
+  need_backtracking_stack
+  # The body of a lookbehind is measured so the match knows how far to rewind,
+  # and the branches of an alternation need not measure the same: `(?<=ab|c)`
+  # looks back two characters down one branch and one down the other. Each
+  # branch carries its own rewind, so the widths do not have to be reconciled
+  # and none of them is tried for a branch it does not belong to.
+  assert_equal 2, ("abx" =~ /(?<=ab|c)x/)
+  assert_equal 1, ("cx" =~ /(?<=ab|c)x/)
+  assert_nil ("bx" =~ /(?<=ab|c)x/)
+  # three of them, and the shorter branch written last
+  assert_equal 3, ("abcx" =~ /(?<=abc|q|zz)x/)
+  assert_equal 1, ("qx" =~ /(?<=abc|q|zz)x/)
+  assert_equal 2, ("zzx" =~ /(?<=abc|q|zz)x/)
+  # a branch may be empty, which looks back at nothing and always holds
+  assert_equal 1, ("zx" =~ /(?<=a|)x/)
+  assert_equal 1, ("zx" =~ /(?<=|a)x/)
+  # the negative form is every branch failing
+  assert_nil ("abx" =~ /(?<!ab|c)x/)
+  assert_nil ("cx" =~ /(?<!ab|c)x/)
+  assert_equal 1, ("bx" =~ /(?<!ab|c)x/)
+  # a branch too near the start of the subject fails alone: the branches
+  # after it are still tried
+  assert_equal 1, ("cx" =~ /(?<=abcd|c)x/)
+end
+
+assert("Regexp - a lookbehind branch has to land where it was entered") do
+  need_backtracking_stack
+  # With one width per branch, a branch can match from another branch's
+  # rewind and stop short: rewound the two characters `ab` asks for, `c`
+  # matches the `c` of "cax" and ends before the `x`. That is a match of the
+  # text before the wrong position, so the sub-pattern has to have come back
+  # to where the lookbehind was entered. CRuby answers nil for both.
+  assert_nil ("cax" =~ /(?<=c|ab)x/)
+  assert_nil ("cax" =~ /(?<=ab|c)x/)
+  # and the branch that does land is still found, whichever order they are
+  # written in
+  assert_equal 2, ("acx" =~ /(?<=c|ab)x/)
+  assert_equal 2, ("abx" =~ /(?<=c|ab)x/)
+end
+
+assert("Regexp - the branches of a lookbehind are tried in order") do
+  need_backtracking_stack
+  # Two branches can match at once, and which one the captures come from is
+  # the order they are written in, not the order their widths are tried in.
+  # Both `(b)` and `(cb)` match before the `x` of "cbx"; the leftmost wins.
+  assert_equal ["x", nil, "b", nil], "cbx".match(/(?<=(ab)|(b)|(cb))x/).to_a
+  assert_equal ["x", "cb", nil, nil], "cbx".match(/(?<=(cb)|(b)|(ab))x/).to_a
+  # a capture a branch did not run stays unset
+  assert_equal ["x", "a", nil], "abx".match(/(?<=(a)b|(c))x/).to_a
+  assert_equal ["x", nil, "c"], "cx".match(/(?<=(a)b|(c))x/).to_a
+end
+
+assert("Regexp - an alternation a lookbehind body only holds must measure one width") do
+  need_backtracking_stack
+  # A body that *is* an alternation gives each branch its own rewind. An
+  # alternation anywhere else has to come out one width, since what stands
+  # beside it is measured from wherever it ends. CRuby draws the line in the
+  # same place, and reads the pattern the same way: `(?:...)` around the whole
+  # body is nothing at all, so the body is the alternation; a capture group is
+  # something, so the alternation is inside it.
+  assert_equal 2, ("abx" =~ /(?<=(?:ab|b))x/)
+  assert_equal 1, ("bx" =~ /(?<=(a|b))x/)
+  assert_equal 2, ("bcx" =~ /(?<=(?:a|b)c)x/)
+  assert_equal 2, ("xby" =~ /(?<=x(a|b))y/)
+
+  msg = "invalid pattern in look-behind"
+  ["(?<=(ab|b))x", "(?<=(?:a|bc)d)x", "(?<=a|b*)x", "(?<=(?:a|b)*)x"].each do |src|
+    assert_raise_with_message(RegexpError, "#{msg}: /#{src}/", src) do
+      Regexp.new(src)
+    end
+  end
+
+  # Which branches the body has is read from what the alternation left behind
+  # when it was compiled, and `{0}` throws the code away and emits the rest
+  # over the top of it. The branch heads then point at instructions belonging
+  # to something else, and this body, which is the refused `(?<=a?bc)` with
+  # such a record beside it, was taken for an alternation of two branches.
+  ["(?<=(?:a|b){0}a?bc)x", "(?<=(?:ab|c){0}a?bcd)x"].each do |src|
+    assert_raise_with_message(RegexpError, "#{msg}: /#{src}/", src) do
+      Regexp.new(src)
+    end
+  end
+
+  # An option construct is where the two engines part: it emits nothing here,
+  # so the alternation under it is still the body, where CRuby keeps it as an
+  # enclosure and refuses the first two of these. README.md lists it.
+  assert_equal 2, ("abx" =~ /(?<=(?i:ab|b))x/)
+  assert_equal 2, ("abx" =~ /(?<=(?i)ab|b)x/)
+  assert_equal 2, ("abx" =~ /(?<=(?i:ab)|b)x/)  # accepted by CRuby too
+end
+
+assert("Regexp - a lookbehind body of many forks is measured once per fork") do
+  need_backtracking_stack
+  # Both arms of a fork are measured to the end of the body, so a chain of
+  # them has a path per combination: twenty forks are a million paths, and
+  # walking each one is a compile that does not finish. What each pc is worth
+  # is remembered instead, which makes the measure one walk per arm.
+  re = Regexp.new("(?<=" + "(?:a|b)" * 20 + ")x")
+  assert_equal 20, (("a" * 20 + "x") =~ re)
+  assert_equal 20, (("b" * 10 + "a" * 10 + "x") =~ re)
+  assert_nil (("c" + "a" * 19 + "x") =~ re)
 end
 
 assert("Regexp - a capture inside a lookaround is undone with the lookaround") do

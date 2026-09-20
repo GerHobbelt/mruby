@@ -12,6 +12,7 @@
 #include <mruby/variable.h>
 #include <mruby/hash.h>
 #include <mruby/range.h>
+#include <mruby/numeric.h>
 #include <mruby/error.h>
 #include <mruby/internal.h>
 #include "re_internal.h"
@@ -23,7 +24,7 @@ static void regexp_free(mrb_state *mrb, void *ptr) {
   mrb_re_free(mrb, (mrb_regexp_pattern*)ptr);
 }
 
-static mrb_bool re_binary_string_p(mrb_value str);
+static mrb_bool re_pattern_binary(mrb_value str);
 
 static const struct mrb_data_type regexp_type = { "Regexp", regexp_free };
 
@@ -162,16 +163,27 @@ re_initialize(mrb_state *mrb, mrb_value self, mrb_value pattern, uint32_t flags)
   DATA_PTR(self) = pat;
 
   mrb_re_compile(mrb, pat, RSTRING_PTR(pattern), RSTRING_LEN(pattern), flags,
-                 re_binary_string_p(pattern));
+                 re_pattern_binary(pattern));
 
-  /* store named captures as hash */
+  /* Store named captures as a hash of name -> [group, ...]. A name may be
+     given to several groups, and each keeps its own number, so the table
+     carries them all; a name's slot in the hash is made by its first group
+     and later ones append to it, which is the order CRuby's named_captures
+     lists both the names and each name's groups in. */
   if (pat->num_named > 0) {
     mrb_value nc = mrb_hash_new_capa(mrb, pat->num_named);
+    mrb_iv_set(mrb, self, MRB_IVSYM(named_captures), nc);
+    int ai = mrb_gc_arena_save(mrb);
     for (uint16_t i = 0; i < pat->num_named; i++) {
       mrb_value name = mrb_str_new(mrb, pat->named_captures[i].name, pat->named_captures[i].name_len);
-      mrb_hash_set(mrb, nc, name, mrb_fixnum_value(pat->named_captures[i].group));
+      mrb_value groups = mrb_hash_get(mrb, nc, name);
+      if (mrb_nil_p(groups)) {
+        groups = mrb_ary_new_capa(mrb, 1);
+        mrb_hash_set(mrb, nc, name, groups);
+      }
+      mrb_ary_push(mrb, groups, mrb_fixnum_value(pat->named_captures[i].group));
+      mrb_gc_arena_restore(mrb, ai);
     }
-    mrb_iv_set(mrb, self, MRB_IVSYM(named_captures), nc);
   }
   else {
     /* The table belongs to the pattern compiled just above, so a pattern that
@@ -351,38 +363,44 @@ re_char_to_byte(mrb_state *mrb, mrb_value str, mrb_int char_off)
   return byte_off;
 }
 
+/* Whether a pattern is compiled by byte, which is the one thing
+   mrb_re_compile() asks of the string it is handed. A subject is read by
+   re_subject_binary() below. */
 static mrb_bool
-re_binary_string_p(mrb_value str)
+re_pattern_binary(mrb_value str)
 {
   return RSTR_BINARY_P(RSTRING(str));
 }
 
-/* CRuby refuses a search whose subject holds a byte that spells no character,
-   and mruby answers for it. Refuse it here too, so that a program moved from
-   one to the other is told about the subject rather than handed a result the
-   other would not have produced.
+/* How a search reads `str`: TRUE when by byte. This is the one place a
+   subject is read, and every search takes what it answers.
+
+   CRuby refuses a search whose subject holds a byte that spells no character,
+   and mruby answers for it. A subject read by character is refused here too,
+   so that a program moved from one to the other is told about the subject
+   rather than handed a result the other would not have produced.
 
    A binary string is exempt because it is indexed by byte throughout, so its
-   bytes make no claim that could be broken. A quoted String pattern is exempt
-   for a narrower reason: CRuby searches for a literal byte by byte and reads
+   bytes make no claim that could be broken. `unread` exempts a subject for a
+   narrower reason: CRuby searches for a quoted String byte by byte and reads
    the subject as UTF-8 nowhere along the way, so `"a\x80b".sub("b", "!")`
-   answers there while the same call with `/b/` is refused. re_sub_lit() and
-   re_gsub_lit() never ask, having no compiled pattern to ask on behalf of,
-   and the searches a literal reaches with one take a `checked` argument to
-   say so.
+   answers there while the same call with `/b/` is refused. The searches a
+   literal reaches set it, apart from `scan` and `split`, which CRuby refuses
+   a literal on as well.
 
-   The check walks the whole subject, so every entry point below runs it on
-   the subject it is handed, and the loops that search per match (`scan`,
-   `split`, the gsub walks) ask again each turn: core remembers a string it
-   has read as valid UTF-8, so every turn after the first costs a flag test
-   and not a walk, and only a block that rewrote the receiver pays a new
+   The check walks the whole subject, so every entry point below reads the
+   subject it is handed, and the loops that search per match (`scan`,
+   `split`, the gsub walks) read it again each turn: core remembers a string
+   it has read as valid UTF-8, so every turn after the first costs a flag
+   test and not a walk, and only a block that rewrote the receiver pays a new
    one. */
-static void
-re_check_encoding(mrb_state *mrb, mrb_value str)
+static mrb_bool
+re_subject_binary(mrb_state *mrb, mrb_value str, mrb_bool unread)
 {
-  if (!mrb_str_valid_encoding_p(mrb, str)) {
+  if (!unread && !mrb_str_valid_encoding_p(mrb, str)) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid byte sequence in UTF-8");
   }
+  return RSTR_BINARY_P(RSTRING(str));
 }
 
 /* Create MatchData from captures, and make it the match the globals
@@ -454,10 +472,15 @@ re_check_exec_error(mrb_state *mrb, int n)
 
 /* Internal: execute match and create MatchData.
    Returns MatchData on match, nil on no match.
-   Publishes the match as $~, and clears it on a miss. */
+   Publishes the match as $~, and clears it on a miss.
+   `unread` is passed on to re_subject_binary(), and is asked first, so that
+   a subject it refuses is refused before the pattern is looked at. `literal`
+   says what the MatchData records (below); the two part only in `scan`. */
 static mrb_value
-exec_match(mrb_state *mrb, mrb_value self, mrb_value str, mrb_int pos)
+exec_match(mrb_state *mrb, mrb_value self, mrb_value str, mrb_int pos,
+           mrb_bool unread, mrb_bool literal)
 {
+  mrb_bool binary = re_subject_binary(mrb, str, unread);
   mrb_regexp_pattern *pat = DATA_GET_PTR(mrb, self, &regexp_type, mrb_regexp_pattern);
   if (re_uninitialized_p(pat)) mrb_raise(mrb, E_ARGUMENT_ERROR, "uninitialized Regexp");
 
@@ -465,14 +488,17 @@ exec_match(mrb_state *mrb, mrb_value self, mrb_value str, mrb_int pos)
   int captures[RE_MAX_CAPTURES * 2];
   memset(captures, -1, sizeof(int) * cap_size);
   int ncap = mrb_re_exec(mrb, pat, RSTRING_PTR(str), RSTRING_LEN(str), pos,
-                     captures, cap_size, re_binary_string_p(str));
+                     captures, cap_size, binary);
   re_check_exec_error(mrb, ncap);
 
   if (ncap == 0) {
     clear_match_globals(mrb);
     return mrb_nil_value();
   }
-  return create_matchdata(mrb, self, str, captures, cap_size);
+  /* `literal` says the caller quoted a String pattern into `self` to have
+     something to search with. Such a match carries no Regexp in CRuby until
+     MatchData#regexp builds one, so the quoted one is not recorded here. */
+  return create_matchdata(mrb, literal ? mrb_nil_value() : self, str, captures, cap_size);
 }
 
 /*
@@ -498,8 +524,7 @@ regexp_match(mrb_state *mrb, mrb_value self)
     return mrb_nil_value();
   }
 
-  re_check_encoding(mrb, str);
-  md = exec_match(mrb, self, str, pos);
+  md = exec_match(mrb, self, str, pos, FALSE, FALSE);
   if (!mrb_nil_p(md) && !mrb_nil_p(block)) {
     return mrb_yield(mrb, block, md);
   }
@@ -512,13 +537,13 @@ regexp_match(mrb_state *mrb, mrb_value self)
  * globals and answers nil, as `Regexp#match` does, which is what the
  * overrides use to report a miss.
  *
- * `checked` says the caller has settled the encoding question for the subject
- * and this search must not ask it again. `sub`, `sub!` and `gsub!` set it when
- * their pattern is a quoted String, which CRuby searches for without reading
- * the subject as UTF-8 at all.
+ * `literal` says the pattern arrived as a String and `re` is its quoting.
+ * `sub`, `sub!` and `gsub!` set it, and it carries what CRuby's literal
+ * search carries: the subject is not read as UTF-8 on the way, and the match
+ * records no Regexp (see exec_match()).
  */
 static mrb_value
-re_search(mrb_state *mrb, mrb_value re, mrb_value str, mrb_int pos, mrb_bool checked)
+re_search(mrb_state *mrb, mrb_value re, mrb_value str, mrb_int pos, mrb_bool literal)
 {
   if (mrb_nil_p(str)) {
     clear_match_globals(mrb);
@@ -530,8 +555,7 @@ re_search(mrb_state *mrb, mrb_value re, mrb_value str, mrb_int pos, mrb_bool che
     clear_match_globals(mrb);
     return mrb_nil_value();
   }
-  if (!checked) re_check_encoding(mrb, str);
-  return exec_match(mrb, re, str, pos);
+  return exec_match(mrb, re, str, pos, literal, literal);
 }
 
 /*
@@ -541,7 +565,7 @@ re_search(mrb_state *mrb, mrb_value re, mrb_value str, mrb_int pos, mrb_bool che
  *
  * The three callers work in byte space and clamp the limit into the subject
  * first, so there is no position normalization and no operand conversion
- * here. Nor is there a `checked`: none of the three has a quoted String
+ * here. Nor is there a `literal`: none of the three has a quoted String
  * pattern to reach here with, a String argument being the form each of them
  * leaves to the C method it captured.
  *
@@ -553,7 +577,7 @@ re_search(mrb_state *mrb, mrb_value re, mrb_value str, mrb_int pos, mrb_bool che
 static mrb_value
 re_byte_rsearch(mrb_state *mrb, mrb_value re, mrb_value str, mrb_int limit)
 {
-  re_check_encoding(mrb, str);
+  mrb_bool binary = re_subject_binary(mrb, str, FALSE);
 
   mrb_regexp_pattern *pat = DATA_GET_PTR(mrb, re, &regexp_type, mrb_regexp_pattern);
   if (!pat) mrb_raise(mrb, E_ARGUMENT_ERROR, "uninitialized Regexp");
@@ -561,7 +585,7 @@ re_byte_rsearch(mrb_state *mrb, mrb_value re, mrb_value str, mrb_int limit)
   int cap_size = pat->num_captures * 2;
   int captures[RE_MAX_CAPTURES * 2];
   int ncap = mrb_re_rexec(mrb, pat, RSTRING_PTR(str), RSTRING_LEN(str), limit,
-                          captures, cap_size, re_binary_string_p(str));
+                          captures, cap_size, binary);
   re_check_exec_error(mrb, ncap);
   if (ncap == 0) {
     clear_match_globals(mrb);
@@ -583,10 +607,10 @@ exec_match_p(mrb_state *mrb, mrb_value re, mrb_value str, mrb_int pos)
 
   mrb_regexp_pattern *pat = DATA_GET_PTR(mrb, re, &regexp_type, mrb_regexp_pattern);
   if (re_uninitialized_p(pat)) mrb_raise(mrb, E_ARGUMENT_ERROR, "uninitialized Regexp");
-  re_check_encoding(mrb, str);
+  mrb_bool binary = re_subject_binary(mrb, str, FALSE);
 
   int ncap = mrb_re_exec(mrb, pat, RSTRING_PTR(str), RSTRING_LEN(str), pos, NULL, 0,
-                         re_binary_string_p(str));
+                         binary);
   re_check_exec_error(mrb, ncap);
   return mrb_bool_value(ncap > 0);
 }
@@ -616,9 +640,7 @@ regexp_match_op(mrb_state *mrb, mrb_value self)
     return mrb_nil_value();
   }
   str = match_operand(mrb, str);
-  re_check_encoding(mrb, str);
-
-  mrb_value md = exec_match(mrb, self, str, 0);
+  mrb_value md = exec_match(mrb, self, str, 0, FALSE, FALSE);
   if (mrb_nil_p(md)) return mrb_nil_value();
 
   mrb_match_data *m = DATA_GET_PTR(mrb, md, &matchdata_type, mrb_match_data);
@@ -640,9 +662,7 @@ regexp_case_match(mrb_state *mrb, mrb_value self)
 
   pat = DATA_GET_PTR(mrb, self, &regexp_type, mrb_regexp_pattern);
   if (re_uninitialized_p(pat)) return mrb_false_value();
-  re_check_encoding(mrb, str);
-
-  md = exec_match(mrb, self, str, 0);
+  md = exec_match(mrb, self, str, 0, FALSE, FALSE);
   return mrb_bool_value(!mrb_nil_p(md));
 }
 
@@ -841,7 +861,7 @@ re_fold_leading_group(mrb_state *mrb, mrb_value src, const char **ptrp, mrb_int 
     /* n counts ':' and ')' as well as what lies between, which may be empty:
        "(?:)" is a group around nothing. */
     if (n >= 2 && *p == ':' && p[n-1] == ')' &&
-        re_compiles_alone(mrb, p + 1, n - 2, on, re_binary_string_p(src))) {
+        re_compiles_alone(mrb, p + 1, n - 2, on, re_pattern_binary(src))) {
       flags = on;
       ptr = p + 1;
       len = n - 2;
@@ -1403,7 +1423,7 @@ re_subject_reads_as(mrb_state *mrb, mrb_value str, mrb_value mdv)
   mrb_value src = md->source;
   mrb_int len = RSTRING_LEN(src);
   if (RSTRING_LEN(str) != len) return FALSE;
-  if (re_binary_string_p(str) != re_binary_string_p(src)) return FALSE;
+  if (re_subject_binary(mrb, str, TRUE) != re_subject_binary(mrb, src, TRUE)) return FALSE;
   const char *p = RSTRING_PTR(str), *q = RSTRING_PTR(src);
   return p == q || memcmp(p, q, (size_t)len) == 0;
 }
@@ -1492,10 +1512,17 @@ matchdata_named_captures(mrb_state *mrb, mrb_value self)
   }
   if (!pat || pat->num_named == 0) return mrb_hash_new(mrb);
 
+  /* Each name gets the group re_name_to_group() picks for it, the same one
+     MatchData#[] reads, so a name given to several groups answers with the
+     one that took part in the match; walking the entries in order would
+     instead leave the value of whichever group the pattern spelled the name
+     on last. Duplicates re-resolve to the same group and overwrite with the
+     same value, and the first entry of each name fixes its key's position. */
   mrb_value result = mrb_hash_new_capa(mrb, pat->num_named);
   for (uint16_t i = 0; i < pat->num_named; i++) {
     mrb_value name = mrb_str_new(mrb, pat->named_captures[i].name, pat->named_captures[i].name_len);
-    int group = pat->named_captures[i].group;
+    int group = re_name_to_group(md->captures, md->num_captures, pat,
+                                 pat->named_captures[i].name, pat->named_captures[i].name_len);
     mrb_value val = mrb_nil_value();
     if (group >= 0 && group < md->num_captures) {
       int s = md->captures[group * 2];
@@ -1557,11 +1584,13 @@ re_quoted_regexp(mrb_state *mrb, mrb_value lit)
  * MatchData#regexp - the Regexp used
  *
  * A literal String pattern leaves none behind: `__sub_lit` and `__gsub_lit`
- * search for its bytes without compiling anything to search with, so the
- * Regexp it names is built here, out of the bytes the match reports, the first
- * time something asks for one. That is what CRuby does with a match against a
- * String pattern, down to the memo the answer is kept in. A call that never
- * asks pays for no compile at all.
+ * search for its bytes without compiling anything to search with, and the
+ * paths that do quote one to search with withhold it from the match (see
+ * exec_match()). So the Regexp named here is built here, out of the bytes
+ * the match reports, the first time something asks for one; group 0 of a
+ * literal match spans the pattern itself, whichever path made it. That is
+ * what CRuby does with a match against a String pattern, down to the memo
+ * the answer is kept in. A call that never asks pays for no compile at all.
  */
 static mrb_value
 matchdata_regexp(mrb_state *mrb, mrb_value self)
@@ -1593,6 +1622,71 @@ matchdata_to_s(mrb_state *mrb, mrb_value self)
   int s = md->captures[0];
   int e = md->captures[1];
   return re_byte_substr(mrb, md->source, s, e - s);
+}
+
+/*
+ * MatchData#inspect - the groups by number or name, e.g.
+ * #<MatchData "ab" 1:"a" 2:"b">
+ */
+static mrb_value
+matchdata_inspect(mrb_state *mrb, mrb_value self)
+{
+  /* dup/clone leave the copy without match data. inspect answers rather than
+     raising, as it does on an uninitialized Regexp, and CRuby's answer for a
+     MatchData with no data is the bare class-and-address form. */
+  mrb_match_data *md = DATA_CHECK_GET_PTR(mrb, self, &matchdata_type, mrb_match_data);
+  if (!md) return mrb_any_to_s(mrb, self);
+
+  /* A match a literal String pattern made carries no Regexp until
+     MatchData#regexp builds one. CRuby renders such a match as
+     "#<MatchData: ab>", the whole match raw, and switches to the group
+     listing once the memo is filled; the memo is mirrored here, so the
+     switch comes with it. */
+  if (mrb_nil_p(md->regexp)) {
+    mrb_value result = mrb_str_new_lit(mrb, "#<MatchData: ");
+    mrb_str_cat_str(mrb, result, re_byte_substr(mrb, md->source, md->captures[0],
+                                                md->captures[1] - md->captures[0]));
+    mrb_str_cat_lit(mrb, result, ">");
+    return result;
+  }
+
+  mrb_regexp_pattern *pat = DATA_GET_PTR(mrb, md->regexp, &regexp_type, mrb_regexp_pattern);
+
+  mrb_value result = mrb_str_new_lit(mrb, "#<MatchData");
+  int ai = mrb_gc_arena_save(mrb);
+  for (int i = 0; i < md->num_captures; i++) {
+    mrb_str_cat_lit(mrb, result, " ");
+    if (i > 0) {
+      /* A group a name reaches is labeled with the name, not its number.
+         Each group carries at most one name, so the first entry that names
+         it is the whole answer; several groups of one name each show it. */
+      const re_named_capture *nc = NULL;
+      for (uint16_t j = 0; j < pat->num_named; j++) {
+        if (pat->named_captures[j].group == i) {
+          nc = &pat->named_captures[j];
+          break;
+        }
+      }
+      if (nc) {
+        mrb_str_cat(mrb, result, nc->name, nc->name_len);
+      }
+      else {
+        mrb_str_cat_str(mrb, result, mrb_integer_to_str(mrb, mrb_int_value(mrb, i), 10));
+      }
+      mrb_str_cat_lit(mrb, result, ":");
+    }
+    int s = md->captures[i * 2];
+    if (s < 0) {
+      mrb_str_cat_lit(mrb, result, "nil");
+    }
+    else {
+      mrb_value grp = re_byte_substr(mrb, md->source, s, md->captures[i * 2 + 1] - s);
+      mrb_str_cat_str(mrb, result, mrb_str_inspect(mrb, grp));
+    }
+    mrb_gc_arena_restore(mrb, ai);
+  }
+  mrb_str_cat_lit(mrb, result, ">");
+  return result;
 }
 
 /* --- C-level gsub/sub/scan core --- */
@@ -1715,11 +1809,11 @@ has_backslash(const char *s, mrb_int len)
    result holds the subject alone and the replacement says nothing about it.
    This is where CRuby lands on every pair it accepts. */
 static void
-re_mark_spliced(mrb_value result, mrb_value subject, mrb_value replacement,
-                mrb_bool spliced)
+re_mark_spliced(mrb_state *mrb, mrb_value result, mrb_value subject,
+                mrb_value replacement, mrb_bool spliced)
 {
-  if (!re_binary_string_p(subject)) {
-    if (!spliced || !re_binary_string_p(replacement)) return;
+  if (!re_subject_binary(mrb, subject, TRUE)) {
+    if (!spliced || !RSTR_BINARY_P(RSTRING(replacement))) return;
     const char *p = RSTRING_PTR(replacement);
     const char *e = p + RSTRING_LEN(replacement);
     while (p < e && !(*p & 0x80)) p++;
@@ -1732,7 +1826,7 @@ re_mark_spliced(mrb_value result, mrb_value subject, mrb_value replacement,
  * gsub core with a String replacement and no block.
  *
  * A compiled pattern only: a String pattern is a literal and reaches
- * re_gsub_lit() instead, which is why there is no `checked` here to say that
+ * re_gsub_lit() instead, which is why there is no `literal` here to say that
  * the subject was left unread.
  */
 static mrb_value
@@ -1740,14 +1834,13 @@ re_gsub_str(mrb_state *mrb, mrb_value re, mrb_value str, mrb_value replacement)
 {
   mrb_regexp_pattern *pat = DATA_GET_PTR(mrb, re, &regexp_type, mrb_regexp_pattern);
   if (re_uninitialized_p(pat)) mrb_raise(mrb, E_ARGUMENT_ERROR, "uninitialized Regexp");
-  re_check_encoding(mrb, str);
+  mrb_bool binary = re_subject_binary(mrb, str, FALSE);
 
   const char *s = RSTRING_PTR(str);
   mrb_int slen = RSTRING_LEN(str);
   const char *rep = RSTRING_PTR(replacement);
   mrb_int rep_len = RSTRING_LEN(replacement);
   mrb_bool need_expand = has_backslash(rep, rep_len);
-  mrb_bool binary = re_binary_string_p(str);
 
   int ncap = pat->num_captures;
   int cap_size = ncap * 2;
@@ -1815,7 +1908,7 @@ re_gsub_str(mrb_state *mrb, mrb_value re, mrb_value str, mrb_value replacement)
     clear_match_globals(mrb);
   }
 
-  re_mark_spliced(result, str, replacement, last_ncap > 0);
+  re_mark_spliced(mrb, result, str, replacement, last_ncap > 0);
   return result;
 }
 
@@ -1829,7 +1922,7 @@ re_sub_str(mrb_state *mrb, mrb_value re, mrb_value str, mrb_value replacement)
 {
   mrb_regexp_pattern *pat = DATA_GET_PTR(mrb, re, &regexp_type, mrb_regexp_pattern);
   if (re_uninitialized_p(pat)) mrb_raise(mrb, E_ARGUMENT_ERROR, "uninitialized Regexp");
-  re_check_encoding(mrb, str);
+  mrb_bool binary = re_subject_binary(mrb, str, FALSE);
 
   const char *s = RSTRING_PTR(str);
   mrb_int slen = RSTRING_LEN(str);
@@ -1840,7 +1933,7 @@ re_sub_str(mrb_state *mrb, mrb_value re, mrb_value str, mrb_value replacement)
   int captures[RE_MAX_CAPTURES * 2];
   memset(captures, -1, sizeof(int) * cap_size);
 
-  int n = mrb_re_exec(mrb, pat, s, slen, 0, captures, cap_size, re_binary_string_p(str));
+  int n = mrb_re_exec(mrb, pat, s, slen, 0, captures, cap_size, binary);
   re_check_exec_error(mrb, n);
   if (n == 0) {
     clear_match_globals(mrb);
@@ -1868,7 +1961,7 @@ re_sub_str(mrb_state *mrb, mrb_value re, mrb_value str, mrb_value replacement)
   }
 
   create_matchdata(mrb, re, str, captures, cap_size);
-  re_mark_spliced(result, str, replacement, TRUE);
+  re_mark_spliced(mrb, result, str, replacement, TRUE);
   return result;
 }
 
@@ -1952,7 +2045,7 @@ re_gsub_lit(mrb_state *mrb, mrb_value lit, mrb_value str, mrb_value replacement,
   const char *rep = RSTRING_PTR(replacement);
   mrb_int rep_len = RSTRING_LEN(replacement);
   mrb_bool need_expand = has_backslash(rep, rep_len);
-  mrb_bool binary = re_binary_string_p(str);
+  mrb_bool binary = re_subject_binary(mrb, str, TRUE);
 
   mrb_int beg = re_lit_search(s, slen, p, plen, 0);
   if (beg < 0) {
@@ -2001,7 +2094,7 @@ re_gsub_lit(mrb_state *mrb, mrb_value lit, mrb_value str, mrb_value replacement,
   if (pos < slen) re_cat_bytes(mrb, result, s + pos, slen - pos, binary);
 
   re_lit_matchdata(mrb, str, captures[0], captures[1]);
-  re_mark_spliced(result, str, replacement, TRUE);
+  re_mark_spliced(mrb, result, str, replacement, TRUE);
   return result;
 }
 
@@ -2015,7 +2108,7 @@ re_sub_lit(mrb_state *mrb, mrb_value lit, mrb_value str, mrb_value replacement, 
   mrb_int slen = RSTRING_LEN(str);
   const char *rep = RSTRING_PTR(replacement);
   mrb_int rep_len = RSTRING_LEN(replacement);
-  mrb_bool binary = re_binary_string_p(str);
+  mrb_bool binary = re_subject_binary(mrb, str, TRUE);
 
   mrb_int beg = re_lit_search(s, slen, RSTRING_PTR(lit), RSTRING_LEN(lit), 0);
   if (beg < 0) {
@@ -2038,7 +2131,7 @@ re_sub_lit(mrb_state *mrb, mrb_value lit, mrb_value str, mrb_value replacement, 
   if (end < slen) re_cat_bytes(mrb, result, s + end, slen - end, binary);
 
   re_lit_matchdata(mrb, str, beg, end);
-  re_mark_spliced(result, str, replacement, TRUE);
+  re_mark_spliced(mrb, result, str, replacement, TRUE);
   return result;
 }
 
@@ -2073,7 +2166,7 @@ sub_piece(mrb_state *mrb, mrb_value block, mrb_value hash, mrb_value matched)
  * replacement forms, `hash` standing where the block call would be when it
  * is given.
  *
- * `checked` carries the same meaning as in re_search().
+ * `literal` carries the same meaning as in re_search().
  *
  * The loop yields from C the way CRuby's does: every match is published
  * before the block sees it, which is why a MatchData is built per turn.
@@ -2096,14 +2189,13 @@ sub_piece(mrb_state *mrb, mrb_value block, mrb_value hash, mrb_value matched)
  * the lookup form walks under the same answers.
  */
 static mrb_value
-re_gsub_walk(mrb_state *mrb, mrb_value re, mrb_value str, mrb_bool checked,
+re_gsub_walk(mrb_state *mrb, mrb_value re, mrb_value str, mrb_bool literal,
              mrb_value block, mrb_value hash)
 {
   mrb_regexp_pattern *pat = DATA_GET_PTR(mrb, re, &regexp_type, mrb_regexp_pattern);
   if (re_uninitialized_p(pat)) mrb_raise(mrb, E_ARGUMENT_ERROR, "uninitialized Regexp");
-  if (!checked) re_check_encoding(mrb, str);
 
-  mrb_bool binary = re_binary_string_p(str);
+  mrb_bool binary = re_subject_binary(mrb, str, literal);
   int cap_size = pat->num_captures * 2;
   int captures[RE_MAX_CAPTURES * 2];
   mrb_value result = mrb_str_new_capa(mrb, RSTRING_LEN(str));
@@ -2127,7 +2219,7 @@ re_gsub_walk(mrb_state *mrb, mrb_value re, mrb_value str, mrb_bool checked,
     mrb_int beg = captures[0], end = captures[1];
 
     mrb_value matched = re_byte_substr(mrb, str, beg, end - beg);
-    last_md = create_matchdata(mrb, re, str, captures, cap_size);
+    last_md = create_matchdata(mrb, literal ? mrb_nil_value() : re, str, captures, cap_size);
     last = pos;
     mrb_value piece = sub_piece(mrb, block, hash, matched);
     /* What the block did to the receiver while it had it. A change of length
@@ -2135,13 +2227,12 @@ re_gsub_walk(mrb_state *mrb, mrb_value re, mrb_value str, mrb_bool checked,
        rewrote in place are read from where they are now, since the write can
        have moved the buffer; whether they are read by byte can have changed
        with them (`s.replace(s.b)`), and so can whether they spell characters
-       at all, which the next search asks as `__byte_search` would. */
+       at all, which is asked again here as `__byte_search` would ask it. */
     if (RSTRING_LEN(str) != slen) {
       mrb_raise(mrb, E_RUNTIME_ERROR, "string modified");
     }
-    if (!checked) re_check_encoding(mrb, str);
     s = RSTRING_PTR(str);
-    binary = re_binary_string_p(str);
+    binary = re_subject_binary(mrb, str, literal);
 
     /* After the block and not before it, as in CRuby: the bytes before the
        match are taken from the receiver as the block left it. */
@@ -2187,7 +2278,7 @@ re_gsub_walk(mrb_state *mrb, mrb_value re, mrb_value str, mrb_bool checked,
   else {
     /* The closing search of `str_gsub`, on the receiver as the block left it,
        which publishes what it finds or clears the globals for a miss. */
-    exec_match(mrb, re, str, last);
+    exec_match(mrb, re, str, last, literal, literal);
   }
   return result;
 }
@@ -2196,15 +2287,14 @@ re_gsub_walk(mrb_state *mrb, mrb_value re, mrb_value str, mrb_bool checked,
  * scan core without a block: every match collected into the answered array.
  */
 static mrb_value
-re_scan_ary(mrb_state *mrb, mrb_value re, mrb_value str)
+re_scan_ary(mrb_state *mrb, mrb_value re, mrb_value str, mrb_bool literal)
 {
   mrb_regexp_pattern *pat = DATA_GET_PTR(mrb, re, &regexp_type, mrb_regexp_pattern);
   if (re_uninitialized_p(pat)) mrb_raise(mrb, E_ARGUMENT_ERROR, "uninitialized Regexp");
-  re_check_encoding(mrb, str);
+  mrb_bool binary = re_subject_binary(mrb, str, FALSE);
 
   const char *s = RSTRING_PTR(str);
   mrb_int slen = RSTRING_LEN(str);
-  mrb_bool binary = re_binary_string_p(str);
   int ncap = pat->num_captures;
   int cap_size = ncap * 2;
   int captures[RE_MAX_CAPTURES * 2];
@@ -2261,7 +2351,7 @@ re_scan_ary(mrb_state *mrb, mrb_value re, mrb_value str)
   }
 
   if (last_ncap > 0) {
-    create_matchdata(mrb, re, str, last_captures, last_ncap);
+    create_matchdata(mrb, literal ? mrb_nil_value() : re, str, last_captures, last_ncap);
   }
   else {
     clear_match_globals(mrb);
@@ -2841,8 +2931,9 @@ str_scan_m(mrb_state *mrb, mrb_value self)
 
   mrb_get_args(mrb, "o&", &pattern, &block);
   pattern = check_pattern(mrb, pattern);
-  if (mrb_string_p(pattern)) pattern = quote_to_regexp(mrb, pattern);
-  if (mrb_nil_p(block)) return re_scan_ary(mrb, pattern, self);
+  mrb_bool literal = mrb_string_p(pattern);
+  if (literal) pattern = quote_to_regexp(mrb, pattern);
+  if (mrb_nil_p(block)) return re_scan_ary(mrb, pattern, self, literal);
 
   /* A block reads the match globals of the match it was handed, so the block
      form walks the subject itself and lets each search publish as it goes:
@@ -2874,8 +2965,7 @@ str_scan_m(mrb_state *mrb, mrb_value self)
     if (RSTRING_LEN(self) != len) {
       mrb_raise(mrb, E_RUNTIME_ERROR, "string modified");
     }
-    re_check_encoding(mrb, self);
-    mrb_value md = exec_match(mrb, pattern, self, pos);
+    mrb_value md = exec_match(mrb, pattern, self, pos, FALSE, literal);
     if (mrb_nil_p(md)) break;
     last = pos;
     last_md = md;
@@ -2900,8 +2990,7 @@ str_scan_m(mrb_state *mrb, mrb_value self)
       if (RSTRING_LEN(self) != len) {
         mrb_raise(mrb, E_RUNTIME_ERROR, "string modified");
       }
-      re_check_encoding(mrb, self);
-      exec_match(mrb, pattern, self, last);
+      exec_match(mrb, pattern, self, last, FALSE, literal);
     }
   }
   return self;
@@ -2937,7 +3026,8 @@ str_split_m(mrb_state *mrb, mrb_value self)
   /* The real type, which an argument redefining `nil?` or `is_a?` cannot
      steer, and the same reading `Module#===` would give the pair. */
   if (mrb_nil_p(pattern) || mrb_string_p(pattern)) {
-    if (limit != 1) re_check_encoding(mrb, self);
+    /* Read for the refusal alone: core's `split` searches the literal. */
+    if (limit != 1) (void)re_subject_binary(mrb, self, FALSE);
     mrb_value split_args[2] = { pattern, mrb_int_value(mrb, limit) };
     return mrb_funcall_argv(mrb, self, MRB_SYM(__split), limit_given ? 2 : 1, split_args);
   }
@@ -2953,7 +3043,7 @@ str_split_m(mrb_state *mrb, mrb_value self)
   mrb_int field_start = 0, search_pos = 0;
   mrb_int len = RSTRING_LEN(self);
   mrb_int count = 0;
-  mrb_bool binary = re_binary_string_p(self);
+  mrb_bool binary = re_subject_binary(mrb, self, FALSE);
   int ai = mrb_gc_arena_save(mrb);
 
   while (search_pos <= len) {
@@ -2963,8 +3053,7 @@ str_split_m(mrb_state *mrb, mrb_value self)
       mrb_ary_push(mrb, result, tail);
       return result;
     }
-    re_check_encoding(mrb, self);
-    mrb_value md = exec_match(mrb, pattern, self, search_pos);
+    mrb_value md = exec_match(mrb, pattern, self, search_pos, FALSE, FALSE);
     if (mrb_nil_p(md)) break;
     mrb_match_data *m = DATA_GET_PTR(mrb, md, &matchdata_type, mrb_match_data);
     mrb_int ms = m->captures[0], me = m->captures[1];
@@ -3203,8 +3292,7 @@ str_byteindex_m(mrb_state *mrb, mrb_value self)
      where the C method asks it too, so an offset outside the subject stays a
      miss rather than becoming an error. */
   mrb_str_check_byte_pos(mrb, self, pos);
-  re_check_encoding(mrb, self);
-  mrb_value md = exec_match(mrb, pattern, self, pos);
+  mrb_value md = exec_match(mrb, pattern, self, pos, FALSE, FALSE);
   if (mrb_nil_p(md)) return mrb_nil_value();
   mrb_match_data *m = DATA_GET_PTR(mrb, md, &matchdata_type, mrb_match_data);
   return mrb_int_value(mrb, m->captures[0]);
@@ -3573,6 +3661,7 @@ mrb_mruby_regexp_gem_init(mrb_state *mrb)
   mrb_define_method(mrb, md, "string", matchdata_string, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "regexp", matchdata_regexp, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "to_s", matchdata_to_s, MRB_ARGS_NONE());
+  mrb_define_method(mrb, md, "inspect", matchdata_inspect, MRB_ARGS_NONE());
 }
 
 void

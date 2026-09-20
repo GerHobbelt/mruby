@@ -33,9 +33,10 @@ simulation) with backtracking fallback.
 - `\g<n>`, `\g<-n>`, `\g<+n>` the same by number, `\g<0>` the whole pattern
 - `(?=...)` positive lookahead
 - `(?!...)` negative lookahead
-- `(?<=...)` positive lookbehind (fixed-length only)
-- `(?<!...)` negative lookbehind (fixed-length only)
+- `(?<=...)` positive lookbehind (fixed-length, per branch)
+- `(?<!...)` negative lookbehind (fixed-length, per branch)
 - `(?>...)` atomic group
+- `(?~...)` absent repeater
 - `(?imx-imx)` options for the rest of the enclosing group
 - `(?imx-imx:...)` options for the group's own body
 
@@ -221,8 +222,8 @@ Regexp.new("(a)(?<b>b)\\1")
 Two engines, chosen automatically at compile time by pattern analysis.
 
 - **Pike VM (NFA simulation)** for patterns without backreferences, non-greedy
-  quantifiers, lookaround, atomic groups or subexpression calls. O(pattern x
-  text), so it is immune to ReDoS.
+  quantifiers, lookaround, atomic groups, absent repeaters or subexpression
+  calls. O(pattern x text), so it is immune to ReDoS.
 - **Backtracking engine** for the rest, whose state the Pike VM's threads have
   no stack to hold. It backtracks on a stack of its own on the heap, so a
   search spends a constant amount of C stack however long the subject is.
@@ -236,9 +237,19 @@ Every entry is a place this engine answers a pattern differently from CRuby.
   the build's `String` reads them. Without `MRB_UTF8_STRING` both are bytes:
   `/./` matches one byte, `/Ā/` is two atoms of one byte each, and `/i` folds
   ASCII only. A binary (`ASCII-8BIT`) subject reads by byte on either build.
-- **Fixed-length lookbehind only**: `(?<=...)` and `(?<!...)` take no `*`, `+`,
-  `?` or alternation, and at most 255 bytes. A call inside one must be
-  fixed-length too, recursion included, or `invalid pattern in look-behind`.
+- **Fixed-length lookbehind only**: `(?<=...)` and `(?<!...)` take no `*`, `+`
+  or `?` and hold no lookaround of their own, which is
+  `invalid pattern in look-behind` when they do, and are at most 255 bytes
+  wide, which is `lookbehind too long (max 255 bytes)`. The body's branches
+  are fixed per branch as in CRuby, so `(?<=ab|c)` looks back two characters
+  down one branch and one down the other, and the line either side of that
+  falls in two places CRuby puts it elsewhere. A call narrows the whole body
+  to one width, since a body holding one is measured after the calls are
+  wired and can no longer be given a rewind per branch: `(?<=\g<1>|zz)(a)`
+  raises where CRuby accepts it. An option construct between the lookbehind
+  and its alternation is nothing here and an enclosure in CRuby, so
+  `(?<=(?i:ab|b))x` and `(?<=(?i)ab|b)x` are accepted where CRuby raises
+  (`(?<=(?i:ab)|b)x`, the option inside a branch, is accepted by both).
 - **No Unicode properties**: `\p{Alpha}`, `\p{L}` raise `RegexpError`, inside a
   character class as much as outside one. A bare `\p`, and `\pL`, is the
   letter. `[[:alpha:]]` asks for a letter of any script.
@@ -258,6 +269,13 @@ Every entry is a place this engine answers a pattern differently from CRuby.
   every inline repeat here follows. Onigmo switches such repeats to a
   capture-tracking empty check that answers a few of them differently, among
   them `/((?<g1>|){2}b){2}\g<g1>{0}/` and `/(?<g1>)b\g<g1>{1,3}?/`.
+- **An absent repeater's body captures nothing**: the body of `(?~...)` is a
+  test the scan runs at one position after another and no part of the match,
+  so a group inside one is left as the match found it. CRuby keeps what the
+  runs of the body wrote where Onigmo has no restore for the group, so `(a)`
+  in `/(?~(a)(b))/` holds `"a"` there against a subject starting with one
+  though the body never matched, and drops it where it has one, which leaves
+  `/(?~(a|b)+)/` with an empty group in both engines.
 - **No character class intersection**: `[a&&b]` raises `RegexpError`. A lone
   `&` is a member of the class.
 - **No encodings**: a byte that starts no whole character is that byte, inside
