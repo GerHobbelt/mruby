@@ -80,9 +80,15 @@ class String
     pos = 0
     len = self.bytesize
     binary = Regexp.__binary_string?(self)
+    # The loop normally ends on a failed __byte_match, which clears $~ and the
+    # thirteen names that go with it. CRuby leaves the last match behind, so
+    # keep it and republish it below. A gsub that matched nothing has nothing
+    # to restore and keeps the cleared state, as CRuby does.
+    last = nil
     while pos <= len
       md = pattern.__byte_match(self, pos)
       break unless md
+      last = md
       # gsub works in byte space (match pos, byteslice). begin/end report
       # character offsets (CRuby-compatible), so use the byte accessors.
       match_start = md.__byte_begin(0)
@@ -108,6 +114,7 @@ class String
       end
     end
     parts << self.byteslice(pos..-1)
+    last.__set_globals if last
     parts.join
   end
 
@@ -138,12 +145,10 @@ class String
     # `ary[obj]` and `"s" * obj` all reject an object that only defines
     # `to_int`; dispatching it here would leave this the one place in the tree
     # that accepts one, as the same reasoning keeps `match` off `to_str`.
-    # `is_a?` is redefinable, so a limit claiming to be an Integer would skip
-    # that conversion and reach the arithmetic below as itself. `Module#===`
-    # reads the real type and cannot be redefined.
-    if limit_given && !(Integer === limit)
-      limit = limit.__to_int
-    end
+    # Every limit goes through it, an Integer included: a Bigint is an Integer
+    # and does not fit `mrb_int`, and `__ensure` is what narrows it and raises
+    # the `RangeError` `__split` raises on the string path.
+    limit = Integer.__ensure(limit) if limit_given
     # `nil?` and `is_a?` are redefinable, so an argument answering either one
     # could steer itself around the check below and reach `__split` instead.
     # `Module#===` reads the real type and cannot be redefined.

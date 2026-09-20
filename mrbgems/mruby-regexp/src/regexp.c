@@ -134,8 +134,12 @@ regexp_init(mrb_state *mrb, mrb_value self)
 /* Pre-interned symbols for $1-$9 (cached on first use) */
 static mrb_sym nth_syms[9];
 
+/* Pre-interned symbols for $&, $`, $' and $+ (cached on first use) */
+enum { LAST_MATCH, PRE_MATCH, POST_MATCH, LAST_PAREN, LAST_SYM_COUNT };
+static mrb_sym last_match_syms[LAST_SYM_COUNT];
+
 static void
-ensure_nth_syms(mrb_state *mrb)
+ensure_match_syms(mrb_state *mrb)
 {
   if (nth_syms[0]) return;
   nth_syms[0] = mrb_intern_lit(mrb, "$1");
@@ -147,15 +151,22 @@ ensure_nth_syms(mrb_state *mrb)
   nth_syms[6] = mrb_intern_lit(mrb, "$7");
   nth_syms[7] = mrb_intern_lit(mrb, "$8");
   nth_syms[8] = mrb_intern_lit(mrb, "$9");
+  last_match_syms[LAST_MATCH] = mrb_intern_lit(mrb, "$&");
+  last_match_syms[PRE_MATCH] = mrb_intern_lit(mrb, "$`");
+  last_match_syms[POST_MATCH] = mrb_intern_lit(mrb, "$'");
+  last_match_syms[LAST_PAREN] = mrb_intern_lit(mrb, "$+");
 }
 
 static void
 clear_match_globals(mrb_state *mrb)
 {
-  ensure_nth_syms(mrb);
+  ensure_match_syms(mrb);
   mrb_gv_set(mrb, mrb_intern_lit(mrb, "$~"), mrb_nil_value());
   for (int i = 0; i < 9; i++) {
     mrb_gv_set(mrb, nth_syms[i], mrb_nil_value());
+  }
+  for (int i = 0; i < LAST_SYM_COUNT; i++) {
+    mrb_gv_set(mrb, last_match_syms[i], mrb_nil_value());
   }
 }
 
@@ -261,12 +272,50 @@ regexp_binary_string_p(mrb_state *mrb, mrb_value self)
   return mrb_bool_value(re_binary_string_p(str));
 }
 
+/* Publish `obj` and the thirteen names derived from its offsets, the
+   counterpart of clear_match_globals(). Kept apart from create_matchdata() so
+   that an existing MatchData can be republished without rebuilding it. */
+static void
+set_match_globals(mrb_state *mrb, mrb_value obj, mrb_value str, int *captures, int num_captures)
+{
+  ensure_match_syms(mrb);
+
+  mrb_gv_set(mrb, mrb_intern_lit(mrb, "$~"), obj);
+
+  /* set $1-$9 from captures */
+  for (int i = 0; i < 9; i++) {
+    mrb_value val = mrb_nil_value();
+    int g = i + 1;
+    if (g < num_captures && captures[g*2] >= 0) {
+      val = re_byte_substr(mrb, str, captures[g*2], captures[g*2+1] - captures[g*2]);
+    }
+    mrb_gv_set(mrb, nth_syms[i], val);
+  }
+
+  /* set $&, $` and $' from the whole-match offsets */
+  mrb_gv_set(mrb, last_match_syms[LAST_MATCH],
+             re_byte_substr(mrb, str, captures[0], captures[1] - captures[0]));
+  mrb_gv_set(mrb, last_match_syms[PRE_MATCH],
+             re_byte_substr(mrb, str, 0, captures[0]));
+  mrb_gv_set(mrb, last_match_syms[POST_MATCH],
+             re_byte_substr(mrb, str, captures[1], RSTRING_LEN(str) - captures[1]));
+
+  /* set $+ from the last group that actually participated, which is not
+     necessarily the last group in the pattern */
+  mrb_value last_paren = mrb_nil_value();
+  for (int g = num_captures - 1; g >= 1; g--) {
+    if (captures[g*2] >= 0) {
+      last_paren = re_byte_substr(mrb, str, captures[g*2], captures[g*2+1] - captures[g*2]);
+      break;
+    }
+  }
+  mrb_gv_set(mrb, last_match_syms[LAST_PAREN], last_paren);
+}
+
 /* Create MatchData from captures */
 static mrb_value
 create_matchdata(mrb_state *mrb, mrb_value regexp, mrb_value str, int *captures, int ncap)
 {
-  ensure_nth_syms(mrb);
-
   struct RClass *md_class = mrb_class_get(mrb, "MatchData");
   mrb_match_data *md = (mrb_match_data*)mrb_malloc(mrb, sizeof(mrb_match_data));
   md->source = str;
@@ -281,17 +330,8 @@ create_matchdata(mrb_state *mrb, mrb_value regexp, mrb_value str, int *captures,
    * structs are not scanned by the GC. */
   mrb_iv_set(mrb, obj, mrb_intern_lit(mrb, "source"), str);
   mrb_iv_set(mrb, obj, mrb_intern_lit(mrb, "regexp"), regexp);
-  mrb_gv_set(mrb, mrb_intern_lit(mrb, "$~"), obj);
 
-  /* set $1-$9 from captures */
-  for (int i = 0; i < 9; i++) {
-    mrb_value val = mrb_nil_value();
-    int g = i + 1;
-    if (g < md->num_captures && captures[g*2] >= 0) {
-      val = re_byte_substr(mrb, str, captures[g*2], captures[g*2+1] - captures[g*2]);
-    }
-    mrb_gv_set(mrb, nth_syms[i], val);
-  }
+  set_match_globals(mrb, obj, str, captures, md->num_captures);
 
   return obj;
 }
@@ -548,9 +588,20 @@ regexp_escape(mrb_state *mrb, mrb_value self)
   for (mrb_int i = 0; i < len; i++) {
     char c = s[i];
     switch (c) {
+    /* Control characters become two-character escapes so that the result
+       stays printable; the rest are emitted as a backslash and the byte. */
+    case '\n': mrb_str_cat_lit(mrb, result, "\\n"); break;
+    case '\t': mrb_str_cat_lit(mrb, result, "\\t"); break;
+    case '\r': mrb_str_cat_lit(mrb, result, "\\r"); break;
+    case '\f': mrb_str_cat_lit(mrb, result, "\\f"); break;
+    case '\v': mrb_str_cat_lit(mrb, result, "\\v"); break;
     case '\\': case '.': case '*': case '+': case '?': case '|':
     case '(': case ')': case '[': case ']': case '{': case '}':
     case '^': case '$':
+    /* `#`, `-` and space are only special under `/x` or inside `[...]`,
+       but escaping them unconditionally keeps the result literal in
+       every mode. */
+    case '#': case '-': case ' ':
       mrb_str_cat_lit(mrb, result, "\\");
       /* fall through */
     default:
@@ -562,6 +613,45 @@ regexp_escape(mrb_state *mrb, mrb_value self)
 }
 
 /* --- MatchData methods --- */
+
+/* Resolve a String or Symbol to the group it names. Shared by MatchData#[],
+   #begin and #end: the three disagree about what an out-of-range integer
+   means, but a name is looked up the same way for all of them. Does not
+   return when the name reaches no group. */
+static mrb_int
+matchdata_name_to_group(mrb_state *mrb, mrb_match_data *md, mrb_value arg)
+{
+  const char *name;
+  mrb_int name_len;
+  if (mrb_symbol_p(arg)) {
+    name = mrb_sym_name_len(mrb, mrb_symbol(arg), &name_len);
+  }
+  else {
+    name = RSTRING_PTR(arg);
+    name_len = RSTRING_LEN(arg);
+  }
+  /* look up name in regexp's named captures */
+  mrb_regexp_pattern *pat = NULL;
+  if (!mrb_nil_p(md->regexp)) {
+    pat = DATA_GET_PTR(mrb, md->regexp, &regexp_type, mrb_regexp_pattern);
+  }
+  /* A stored name never exceeds RE_MAX_NAME_LEN, so a longer request can
+     name no group. Rejecting it here keeps the cast in the loop lossless;
+     without it the length test truncates while the memcmp() next to it does
+     not. */
+  if (pat && RE_NAME_LEN_FITS(name_len)) {
+    for (uint16_t i = 0; i < pat->num_named; i++) {
+      if (pat->named_captures[i].name_len == (uint32_t)name_len &&
+          memcmp(pat->named_captures[i].name, name, name_len) == 0) {
+        return pat->named_captures[i].group;
+      }
+    }
+  }
+  /* A name that resolves to no group is a mistake at the point of the call,
+     not a failed match. CRuby raises here even when the pattern has no
+     named group at all. */
+  mrb_raisef(mrb, E_INDEX_ERROR, "undefined group name reference: %l", name, (size_t)name_len);
+}
 
 /*
  * MatchData#[](n)
@@ -578,36 +668,7 @@ matchdata_aref(mrb_state *mrb, mrb_value self)
   mrb_int idx;
   if (mrb_string_p(arg) || mrb_symbol_p(arg)) {
     /* named capture access */
-    const char *name;
-    mrb_int name_len;
-    if (mrb_symbol_p(arg)) {
-      name = mrb_sym_name_len(mrb, mrb_symbol(arg), &name_len);
-    }
-    else {
-      name = RSTRING_PTR(arg);
-      name_len = RSTRING_LEN(arg);
-    }
-    /* look up name in regexp's named captures */
-    mrb_regexp_pattern *pat = NULL;
-    if (!mrb_nil_p(md->regexp)) {
-      pat = DATA_GET_PTR(mrb, md->regexp, &regexp_type, mrb_regexp_pattern);
-    }
-    /* A stored name never exceeds UINT16_MAX, so a longer request can name no
-       group. Rejecting it here keeps the cast in the loop lossless; without it
-       the length test truncates while the memcmp() next to it does not. */
-    if (pat && name_len <= UINT16_MAX) {
-      for (uint16_t i = 0; i < pat->num_named; i++) {
-        if (pat->named_captures[i].name_len == (uint16_t)name_len &&
-            memcmp(pat->named_captures[i].name, name, name_len) == 0) {
-          idx = pat->named_captures[i].group;
-          goto found;
-        }
-      }
-    }
-    /* A name that resolves to no group is a mistake at the point of the call,
-       not a failed match. CRuby raises here even when the pattern has no
-       named group at all. */
-    mrb_raisef(mrb, E_INDEX_ERROR, "undefined group name reference: %l", name, (size_t)name_len);
+    idx = matchdata_name_to_group(mrb, md, arg);
   }
   else {
     idx = mrb_as_int(mrb, arg);
@@ -621,7 +682,6 @@ matchdata_aref(mrb_state *mrb, mrb_value self)
     }
   }
 
-found:
   if (idx >= md->num_captures) return mrb_nil_value();
   int start = md->captures[idx * 2];
   int end = md->captures[idx * 2 + 1];
@@ -666,14 +726,35 @@ matchdata_to_a(mrb_state *mrb, mrb_value self)
 /*
  * MatchData#begin(n) / MatchData#end(n)
  */
+
+/* begin and end return an offset, and nil is not one, so an argument they
+   cannot use is an error rather than a missing result. That is stricter than
+   MatchData#[], which has nil to return for a group that did not participate
+   and reuses it for an index out of range. A group that exists but did not
+   participate is still nil here; only the argument itself raises. Does not
+   return when the argument reaches no group. */
+static mrb_int
+matchdata_group_arg(mrb_state *mrb, mrb_match_data *md, mrb_value arg)
+{
+  if (mrb_string_p(arg) || mrb_symbol_p(arg)) {
+    return matchdata_name_to_group(mrb, md, arg);
+  }
+  mrb_int idx = mrb_as_int(mrb, arg);
+  if (idx < 0 || idx >= md->num_captures) {
+    mrb_raisef(mrb, E_INDEX_ERROR, "index %i out of matches", idx);
+  }
+  return idx;
+}
+
 static mrb_value
 matchdata_begin(mrb_state *mrb, mrb_value self)
 {
-  mrb_int idx;
-  mrb_get_args(mrb, "i", &idx);
+  mrb_value arg;
+  mrb_get_args(mrb, "o", &arg);
 
   mrb_match_data *md = DATA_GET_PTR(mrb, self, &matchdata_type, mrb_match_data);
-  if (!md || idx < 0 || idx >= md->num_captures) return mrb_nil_value();
+  if (!md) return mrb_nil_value();
+  mrb_int idx = matchdata_group_arg(mrb, md, arg);
   int pos = md->captures[idx * 2];
   if (pos < 0) return mrb_nil_value();
   return mrb_int_value(mrb, re_byte_to_char(mrb, md->source, pos));
@@ -682,11 +763,12 @@ matchdata_begin(mrb_state *mrb, mrb_value self)
 static mrb_value
 matchdata_end(mrb_state *mrb, mrb_value self)
 {
-  mrb_int idx;
-  mrb_get_args(mrb, "i", &idx);
+  mrb_value arg;
+  mrb_get_args(mrb, "o", &arg);
 
   mrb_match_data *md = DATA_GET_PTR(mrb, self, &matchdata_type, mrb_match_data);
-  if (!md || idx < 0 || idx >= md->num_captures) return mrb_nil_value();
+  if (!md) return mrb_nil_value();
+  mrb_int idx = matchdata_group_arg(mrb, md, arg);
   int pos = md->captures[idx * 2 + 1];
   if (pos < 0) return mrb_nil_value();
   return mrb_int_value(mrb, re_byte_to_char(mrb, md->source, pos));
@@ -719,6 +801,20 @@ matchdata_byte_end(mrb_state *mrb, mrb_value self)
   int pos = md->captures[idx * 2 + 1];
   if (pos < 0) return mrb_nil_value();
   return mrb_int_value(mrb, pos);
+}
+
+/* Private: republish $~ and the thirteen names derived from it. Used by the
+   mrblib loops that drive __byte_match themselves, where the failing call
+   that ends the loop clears the match the loop is supposed to leave behind.
+   The names other than $~ are not assignable from Ruby, so restoring them
+   has to come from here. */
+static mrb_value
+matchdata_set_globals(mrb_state *mrb, mrb_value self)
+{
+  mrb_match_data *md = DATA_GET_PTR(mrb, self, &matchdata_type, mrb_match_data);
+  if (!md) return mrb_nil_value();
+  set_match_globals(mrb, self, md->source, md->captures, md->num_captures);
+  return self;
 }
 
 /*
@@ -1190,6 +1286,7 @@ mrb_mruby_regexp_gem_init(mrb_state *mrb)
   mrb_define_method(mrb, md, "end", matchdata_end, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, md, "__byte_begin", matchdata_byte_begin, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, md, "__byte_end", matchdata_byte_end, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, md, "__set_globals", matchdata_set_globals, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "pre_match", matchdata_pre, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "post_match", matchdata_post, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "named_captures", matchdata_named_captures, MRB_ARGS_NONE());

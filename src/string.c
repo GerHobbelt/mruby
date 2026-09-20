@@ -21,6 +21,10 @@
 typedef struct mrb_shared_string {
   int refcnt;
   mrb_int capa;
+  /* Offset past the last byte any sharer can see. Bytes at or above it are
+     dead to every sharer, so a writer may use them in place (str_modify_cat).
+     Only grows, as sharers are added. */
+  mrb_int reserved;
   char *ptr;
 } mrb_shared_string;
 
@@ -109,6 +113,8 @@ static struct RString*
 str_init_shared(mrb_state *mrb, const struct RString *orig, struct RString *s, mrb_shared_string *shared)
 {
   if (shared) {
+    mrb_int end = (mrb_int)(orig->as.heap.ptr - shared->ptr) + orig->as.heap.len;
+    if (shared->reserved < end) shared->reserved = end;
     shared->refcnt++;
   }
   else {
@@ -116,6 +122,7 @@ str_init_shared(mrb_state *mrb, const struct RString *orig, struct RString *s, m
     shared->refcnt = 1;
     shared->ptr = orig->as.heap.ptr;
     shared->capa = orig->as.heap.aux.capa;
+    shared->reserved = orig->as.heap.len;
   }
   s->as.heap.ptr = orig->as.heap.ptr;
   s->as.heap.len = orig->as.heap.len;
@@ -766,10 +773,8 @@ str_share(mrb_state *mrb, struct RString *orig, struct RString *s)
     str_init_fshared(orig, s, orig->as.heap.aux.fshared);
   }
   else {
-    if (orig->as.heap.aux.capa > orig->as.heap.len) {
-      orig->as.heap.ptr = (char*)mrb_realloc(mrb, orig->as.heap.ptr, len+1);
-      orig->as.heap.aux.capa = (mrb_ssize)len;
-    }
+    /* Spare capacity is kept, not trimmed: it lies above `reserved`, so
+       `orig` can still append into it without copying the buffer. */
     str_init_shared(mrb, orig, s, NULL);
     str_init_shared(mrb, orig, orig, s->as.heap.aux.shared);
   }
@@ -3118,6 +3123,37 @@ mrb_str_dump(mrb_state *mrb, mrb_value str)
   return str_escape(mrb, str, FALSE);
 }
 
+/* mrb_str_modify() for appending `addlen` bytes at the end of `s`.
+   An append only touches [len, len+addlen), which no other sharer of the
+   buffer can see, so the buffer copy that mrb_str_modify() would do can be
+   skipped as long as the write stays inside the shared allocation. Growing
+   past it still has to detach, but capacity grows geometrically, so the
+   copies are amortized instead of one per append.
+   `addlen` must not be negative: it would pass the capacity guard below and
+   then lower `reserved`, handing bytes another sharer still reads to the
+   appender. mrb_str_cat() rejects a length that does not fit beforehand.
+   Returns the usable capacity of `s`. */
+static mrb_int
+str_modify_cat(mrb_state *mrb, struct RString *s, mrb_int addlen)
+{
+  mrb_assert(addlen >= 0);
+  if (RSTR_SHARED_P(s)) {
+    mrb_check_frozen(mrb, s);
+    mrb_shared_string *shared = s->as.heap.aux.shared;
+    mrb_int off = (mrb_int)(s->as.heap.ptr - shared->ptr);
+    mrb_int capa = shared->capa - off;
+    if (off + s->as.heap.len >= shared->reserved && addlen < capa - s->as.heap.len) {
+      /* The appended bytes belong to `s` from now on, so no other sharer may
+         write over them. */
+      shared->reserved = off + s->as.heap.len + addlen;
+      RSTR_UNSET_SINGLE_BYTE_FLAG(s);
+      return capa;
+    }
+  }
+  mrb_str_modify(mrb, s);
+  return RSTR_CAPA(s);
+}
+
 /*
  * @param mrb The mruby state.
  * @param str The mruby string to append to (modified in place).
@@ -3136,17 +3172,28 @@ mrb_str_cat(mrb_state *mrb, mrb_value str, const char *ptr, size_t len)
   ptrdiff_t off = -1;
 
   if (len == 0) return str;
-  mrb_str_modify(mrb, s);
-  if (ptr >= RSTR_PTR(s) && ptr <= RSTR_PTR(s) + (size_t)RSTR_LEN(s)) {
-      off = ptr - RSTR_PTR(s);
-  }
-
-  mrb_int capa = RSTR_CAPA(s);
+  /* `len` has to be known to fit in an `mrb_int` before it is used as one:
+     the conversion is otherwise free to make it negative, and the overflow
+     check takes `mrb_int` parameters, so it would not see it. Checking ahead
+     of the modification also leaves the string untouched when it raises. */
   mrb_int total;
-  if (mrb_int_add_overflow(RSTR_LEN(s), len, &total)) {
+  if (len > (size_t)MRB_INT_MAX ||
+      mrb_int_add_overflow(RSTR_LEN(s), (mrb_int)len, &total)) {
   size_error:
     mrb_raise(mrb, E_ARGUMENT_ERROR, "string size too big");
   }
+  /* The overlap has to be recognized against the buffer `ptr` was taken
+     from, which is the one `s` holds now. `str_modify_cat()` either appends
+     inside the shared allocation, where `ptr` stays valid and the offset is
+     the same answer reached another way, or detaches `s` onto a fresh buffer
+     and releases the old one, where `ptr` is neither inside the new buffer
+     nor safe to read. Recording the offset ahead of the call covers both
+     without having to know which path ran. */
+  if (ptr >= RSTR_PTR(s) && ptr <= RSTR_PTR(s) + (size_t)RSTR_LEN(s)) {
+      off = ptr - RSTR_PTR(s);
+  }
+  mrb_int capa = str_modify_cat(mrb, s, (mrb_int)len);
+
   if (capa <= total) {
     if (capa == 0) capa = 1;
     while (capa <= total) {

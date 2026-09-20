@@ -14,8 +14,10 @@
 /* Compiler state */
 typedef struct {
   mrb_state *mrb;
-  const char *src;     /* pattern source */
+  const char *src;     /* pattern source (preprocessed in extended mode) */
   const char *src_end;
+  const char *orig;    /* pattern as written, for error messages */
+  const char *orig_end;
   const char *p;       /* current position */
   re_inst *code;       /* instruction array */
   uint32_t code_len;
@@ -37,11 +39,13 @@ static void compile_alt(re_compiler *c);  /* forward */
 static void
 compile_error(re_compiler *c, const char *msg)
 {
-  /* Format the message before freeing c->stripped (which may alias c->src
-     in extended mode). c->src is not NUL-terminated, so use %l with the
-     explicit length from c->src_end. */
+  /* Quote c->orig, the pattern as written: in extended mode c->src points at
+     the buffer strip_extended() returned, so quoting it would drop the
+     free-spacing and the comments from the message. c->orig is the caller's
+     buffer, which outlives the compile. It is not NUL-terminated, so use %l
+     with the explicit length from c->orig_end. */
   mrb_value emsg = mrb_format(c->mrb, "%s: /%l/",
-                              msg, c->src, (size_t)(c->src_end - c->src));
+                              msg, c->orig, (size_t)(c->orig_end - c->orig));
 
   /* Free compile buffers before raising, since mrb_exc_raise longjmps out
      and the stack-local re_compiler is abandoned without a chance to clean
@@ -163,6 +167,13 @@ class_set_bit(re_charclass *cc, uint8_t ch)
   }
 }
 
+static mrb_bool
+class_get_bit(const re_charclass *cc, uint8_t ch)
+{
+  if (ch >= 128) return FALSE;
+  return (cc->bitmap[ch >> 3] >> (ch & 7)) & 1;
+}
+
 /* Append a non-ASCII codepoint range [lo, hi]. Both bounds must be >= 128. */
 static void
 class_add_range(re_compiler *c, re_charclass *cc, uint32_t lo, uint32_t hi)
@@ -271,7 +282,7 @@ class_add_shorthand(re_charclass *cc, int ch)
    Returns FALSE for an unknown name. Semantics are ASCII, like this gem's
    \w/\d shorthands; non-ASCII codepoints are not classified. */
 static mrb_bool
-posix_class_bits(uint8_t *bits, const char *name, uint16_t len)
+posix_class_bits(uint8_t *bits, const char *name, size_t len)
 {
 #define NAME_IS(s) (len == sizeof(s) - 1 && memcmp(name, s, len) == 0)
 #define BSET(ch)   (bits[(ch) >> 3] |= (uint8_t)(1u << ((ch) & 7)))
@@ -409,7 +420,7 @@ compile_charclass(re_compiler *c)
       while (peek(c) >= 0 && peek(c) != ':' && peek(c) != ']') next_char(c);
       if (peek(c) == ':' && c->p + 1 < c->src_end && c->p[1] == ']') {
         uint8_t bits[16] = {0};
-        if (!posix_class_bits(bits, name, (uint16_t)(c->p - name))) {
+        if (!posix_class_bits(bits, name, (size_t)(c->p - name))) {
           compile_error(c, "invalid POSIX bracket class");
         }
         next_char(c);  /* ':' */
@@ -461,6 +472,19 @@ compile_charclass(re_compiler *c)
     }
   }
   next_char(c);  /* skip ']' */
+
+  /* Fold ASCII letters under /i. This runs once the class is complete, so a
+     single pass covers every form the loop above merges into the bitmap:
+     POSIX brackets, shorthands, ranges and single literals. Negation is
+     applied at match time against this same bitmap (RE_NCLASS), so folding
+     the positive set also fixes [^a-c] under /i. Non-ASCII case folding is
+     out of scope, so the codepoint range list is left alone. */
+  if (c->flags & RE_FLAG_IGNORECASE) {
+    for (int ch = 'a'; ch <= 'z'; ch++) {
+      if (class_get_bit(cc, (uint8_t)ch)) class_set_bit(cc, (uint8_t)(ch - 32));
+      else if (class_get_bit(cc, (uint8_t)(ch - 32))) class_set_bit(cc, (uint8_t)ch);
+    }
+  }
 
   cc->negated = negated;
   emit(c, negated ? RE_NCLASS : RE_CLASS, (uint8_t)id, 0);
@@ -613,7 +637,7 @@ compile_atom(re_compiler *c)
       uint32_t saved_flags = c->flags;
 
       const char *cap_name = NULL;
-      uint16_t cap_name_len = 0;
+      uint32_t cap_name_len = 0;
 
       if (peek(c) == '?' && c->p + 1 < c->src_end) {
         if (c->p[1] == ':') {
@@ -665,7 +689,9 @@ compile_atom(re_compiler *c)
           cap_name = c->p;
           while (peek(c) != '>' && peek(c) >= 0) next_char(c);
           if (peek(c) != '>') compile_error(c, "unterminated named capture");
-          cap_name_len = (uint16_t)(c->p - cap_name);
+          if (c->p == cap_name) compile_error(c, "group name is empty");
+          if (!RE_NAME_LEN_FITS(c->p - cap_name)) compile_error(c, "group name too long");
+          cap_name_len = (uint32_t)(c->p - cap_name);
           next_char(c);  /* skip > */
         }
         else if (c->p[1] == 'i' || c->p[1] == 'm' || c->p[1] == 'x' || c->p[1] == '-') {
@@ -758,7 +784,7 @@ compile_atom(re_compiler *c)
     ch = peek(c);
     if (ch >= '1' && ch <= '9') {
       next_char(c);
-      emit(c, RE_BACKREF, (uint8_t)(ch - '0'), 0);
+      emit(c, RE_BACKREF, (uint8_t)(ch - '0'), (c->flags & RE_FLAG_IGNORECASE) ? 1 : 0);
       c->has_backref = TRUE;
     }
     else if (ch == 'd' || ch == 'D' || ch == 'w' || ch == 'W' || ch == 's' || ch == 'S') {
@@ -811,16 +837,19 @@ compile_atom(re_compiler *c)
       const char *name = c->p;
       while (peek(c) != close && peek(c) >= 0) next_char(c);
       if (peek(c) != close) compile_error(c, "unterminated backreference name");
-      uint16_t name_len = (uint16_t)(c->p - name);
+      if (c->p == name) compile_error(c, "group name is empty");
+      if (!RE_NAME_LEN_FITS(c->p - name)) compile_error(c, "group name too long");
+      uint32_t name_len = (uint32_t)(c->p - name);
       next_char(c);  /* skip the closing > or ' */
 
       int group = -1;
       if (name_len > 0 && (name[0] == '-' || (name[0] >= '0' && name[0] <= '9'))) {
         mrb_bool relative = (name[0] == '-');
         int n = 0;
-        for (uint16_t i = (relative ? 1 : 0); i < name_len; i++) {
+        for (uint32_t i = (relative ? 1 : 0); i < name_len; i++) {
           if (name[i] < '0' || name[i] > '9') compile_error(c, "invalid backreference");
           n = n * 10 + (name[i] - '0');
+          if (n > (int)c->num_captures - 1) compile_error(c, "undefined group name reference");
         }
         group = relative ? (int)c->num_captures - n : n;
       }
@@ -836,7 +865,7 @@ compile_atom(re_compiler *c)
       if (group < 1 || group >= (int)c->num_captures) {
         compile_error(c, "undefined group name reference");
       }
-      emit(c, RE_BACKREF, (uint8_t)group, 0);
+      emit(c, RE_BACKREF, (uint8_t)group, (c->flags & RE_FLAG_IGNORECASE) ? 1 : 0);
       c->has_backref = TRUE;
     }
     else {
@@ -1131,6 +1160,19 @@ strip_extended(mrb_state *mrb, const char *src, mrb_int len, mrb_int *out_len)
       continue;
     }
     if (in_class) {
+      /* compile_charclass() consumes a POSIX bracket as a unit, so the ']'
+         of [:name:] does not end the class. Copy it whole and keep the
+         class open; a malformed bracket falls through and the '[' is
+         copied as an ordinary member, which is what the parser does too. */
+      if (ch == '[' && src + 1 < end && src[1] == ':') {
+        const char *q = src + 2;
+        while (q < end && *q != ':' && *q != ']') q++;
+        if (q + 1 < end && *q == ':' && q[1] == ']') {
+          q += 2;
+          while (src < q) buf[o++] = *src++;
+          continue;
+        }
+      }
       if (ch == ']') in_class = FALSE;
       buf[o++] = *src++;
       continue;
@@ -1138,6 +1180,10 @@ strip_extended(mrb_state *mrb, const char *src, mrb_int len, mrb_int *out_len)
     if (ch == '[') {
       in_class = TRUE;
       buf[o++] = *src++;
+      /* A ']' written first is a literal member, optionally after '^',
+         mirroring the `first` flag in compile_charclass(). */
+      if (src < end && *src == '^') buf[o++] = *src++;
+      if (src < end && *src == ']') buf[o++] = *src++;
       continue;
     }
     if (ch == '#') {
@@ -1245,6 +1291,9 @@ mrb_re_compile(mrb_state *mrb, const char *pattern, mrb_int len, uint32_t flags)
   re_compiler c;
   memset(&c, 0, sizeof(c));
 
+  c.orig = pattern;
+  c.orig_end = pattern + len;
+
   if (flags & RE_FLAG_EXTENDED) {
     mrb_int slen;
     c.stripped = strip_extended(mrb, pattern, len, &slen);
@@ -1292,7 +1341,7 @@ mrb_re_compile(mrb_state *mrb, const char *pattern, mrb_int len, uint32_t flags)
       pat->named_arena = (char*)mrb_malloc(mrb, total);
       size_t off = 0;
       for (uint16_t i = 0; i < c.num_named; i++) {
-        uint16_t n = c.named_captures[i].name_len;
+        uint32_t n = c.named_captures[i].name_len;
         memcpy(pat->named_arena + off, c.named_captures[i].name, n);
         pat->named_captures[i].name = pat->named_arena + off;
         off += n;

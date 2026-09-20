@@ -186,6 +186,9 @@ assert("Regexp - POSIX bracket classes") do
   assert_equal "snake_case", "snake_case".match(/[[:word:]]+/)[0]
   assert_equal "!", "ab!cd".match(/[[:punct:]]/)[0]
   assert_equal "AB", "abAB".match(/[[:upper:]]+/)[0]
+  # /i makes the two letter-case classes equivalent.
+  assert_equal "abAB", "abAB".match(/[[:upper:]]+/i)[0]
+  assert_equal "abAB", "abAB".match(/[[:lower:]]+/i)[0]
   # combine with literals and other classes
   assert_equal "a1", "a1-".match(/[a[:digit:]]+/)[0]
   assert_equal "ab12", "ab12 ".match(/[[:alpha:][:digit:]]+/)[0]
@@ -194,6 +197,12 @@ assert("Regexp - POSIX bracket classes") do
   assert_equal "x", " x".match(/[^[:space:]]/)[0]
   # an unknown class name is an error
   assert_raise(RegexpError) { Regexp.new("[[:bogus:]]") }
+  # The name length used to be truncated with a (uint16_t) cast, so a name
+  # 65536 bytes longer than "alpha" compared equal to "alpha" and compiled
+  # as [[:alpha:]] instead of raising.
+  long = "alpha" + "A" * 65536
+  assert_raise(RegexpError) { Regexp.new("[[:#{long}:]]") }
+  assert_raise(RegexpError) { Regexp.new("[[:^#{long}:]]") }
 end
 
 assert("Regexp - \\b inside character class is backspace") do
@@ -327,6 +336,24 @@ assert("Regexp - case insensitive") do
   assert_true re.match?("Abc")
 end
 
+assert("Regexp - case insensitive character class") do
+  # /i used to be folded in only where a single literal was emitted, so a
+  # character class ignored it entirely.
+  assert_true(/[abc]/i.match?("A"))
+  assert_true(/[a-c]/i.match?("A"))
+  assert_true(/[A-C]/i.match?("a"))
+  assert_true(/[a-c]+/i.match?("AB"))
+  assert_true Regexp.new("[a-c]", Regexp::IGNORECASE).match?("A")
+  # A negated class matched what it had to reject, which is a false positive.
+  assert_false(/[^a-c]/i.match?("A"))
+  assert_false(/[^A-C]/i.match?("a"))
+  assert_true(/[^a-c]/i.match?("d"))
+  # Folding must not widen the class beyond the ASCII letters.
+  assert_false(/[a-c]/i.match?("D"))
+  assert_false(/[\[]/i.match?("{"))  # `[` and `{` are 32 apart but are not a case pair
+  assert_false(/[@]/i.match?("`"))
+end
+
 assert("Regexp - repetition {n,m}") do
   assert_equal "aaa", Regexp.new("a{3}").match("aaaa")[0]
   assert_equal "aa", Regexp.new("a{2,3}").match("aa")[0]
@@ -403,9 +430,20 @@ assert("Regexp - inline options (?i) / (?i:...)") do
   assert_nil (/(?i:a)b/ =~ "aB")          # option must not leak past the `)`
   assert_equal 0, (/(?i:ab)+/ =~ "AbaB")  # scoped group is still quantifiable
 
+  # A character class reads the inline-scoped flag, not the pattern-wide one.
+  assert_equal 0, (/(?i)[a-c]/ =~ "A")
+  assert_equal 0, (/(?i:[a-c])/ =~ "A")
+  assert_nil (/(?i:[a-c])[a-c]/ =~ "AB")  # option must not leak past the `)`
+
   # The toggle inside a group is confined to that group.
   assert_equal 0, (/(a(?i)b)c/ =~ "aBc")
   assert_nil (/(a(?i)b)c/ =~ "aBC")       # trailing `c` is case-sensitive again
+
+  # A backreference takes the options in effect where it appears, not the
+  # pattern's own, so an inline toggle reaches it like any other atom.
+  assert_equal 0, (/(a)(?i)\1/ =~ "aA")
+  assert_equal 0, (/(a)(?i:\1)/ =~ "aA")
+  assert_nil (/(?-i:(a)\1)/i =~ "aA")
 
   # m enables dot-matches-newline for its scope.
   assert_equal 0, (/(?m:a.b)/ =~ "a\nb")
@@ -465,6 +503,32 @@ assert("MatchData#begin / #end") do
   assert_equal 3, md.end(0)
 end
 
+assert("MatchData#begin / #end - group name") do
+  md = /(?<x>b)(?<y>c)/.match("abcde")
+  assert_equal 1, md.begin(:x)
+  assert_equal 2, md.end(:x)
+  assert_equal 2, md.begin("y")
+  assert_equal 3, md.end("y")
+  assert_raise(IndexError) { md.begin(:zz) }
+  assert_raise(IndexError) { md.end("zz") }
+  # a pattern without any named group raises just the same
+  assert_raise(IndexError) { /(a)/.match("a").begin(:zz) }
+end
+
+assert("MatchData#begin / #end - index out of matches") do
+  # An offset has no nil to fall back on, so an index naming no group raises
+  # here where MatchData#[] returns nil.
+  md = /(a)(b)/.match("ab")
+  assert_raise(IndexError) { md.begin(3) }
+  assert_raise(IndexError) { md.end(3) }
+  assert_raise(IndexError) { md.begin(-1) }
+  assert_raise(IndexError) { md.end(-1) }
+  # a group that exists but did not participate is still nil
+  md = /(a)|(b)/.match("a")
+  assert_nil md.begin(2)
+  assert_nil md.end(2)
+end
+
 assert("Regexp - multibyte (UTF-8) match extraction") do
   # Capture offsets are recorded in bytes; substring extraction must honor
   # them as byte ranges so multibyte matches are not corrupted.
@@ -508,6 +572,30 @@ end
 
 assert("Regexp.escape") do
   assert_equal "a\\.b\\*c", Regexp.escape("a.b*c")
+
+  # characters that are only special under the x flag or inside [...]
+  assert_equal "a\\ b", Regexp.escape("a b")
+  assert_equal "a\\#b", Regexp.escape("a#b")
+  assert_equal "a\\-b", Regexp.escape("a-b")
+
+  # control characters become printable two-character escapes
+  assert_equal "a\\nb", Regexp.escape("a\nb")
+  assert_equal "a\\tb", Regexp.escape("a\tb")
+  assert_equal "a\\rb", Regexp.escape("a\rb")
+  assert_equal "a\\fb", Regexp.escape("a\fb")
+  assert_equal "a\\vb", Regexp.escape("a\vb")
+
+  # non-ASCII bytes pass through untouched
+  assert_equal "あ\\-い", Regexp.escape("あ-い")
+
+  # the escaped pattern matches the original literally in every mode
+  [" ", "#", "-", "\n", "\t", "\r", "\f", "\v"].each do |c|
+    src = Regexp.escape(c)
+    assert_true Regexp.new(src).match?(c)
+    assert_true Regexp.new(src, Regexp::EXTENDED).match?(c)
+  end
+  assert_true Regexp.new(Regexp.escape("a b"), Regexp::EXTENDED).match?("a b")
+  assert_true Regexp.new(Regexp.escape("a # b"), Regexp::EXTENDED).match?("a # b")
 end
 
 assert("Regexp#inspect") do
@@ -583,6 +671,27 @@ assert("Regexp extended mode (x flag)") do
   re = Regexp.new('[ ]', Regexp::EXTENDED)
   assert_true re.match?(" ")
 
+  # a POSIX bracket does not end the class, so what follows it is still
+  # class content
+  re = Regexp.new('[[:alpha:] ]', Regexp::EXTENDED)
+  assert_true re.match?(" ")
+  assert_true re.match?("a")
+
+  re = Regexp.new('[[:alpha:]#x]', Regexp::EXTENDED)
+  assert_true re.match?("#")
+
+  assert_equal " 1 ", Regexp.new('[[:digit:] ]+', Regexp::EXTENDED).match(" 1 ")[0]
+
+  # a ']' written first in a class is a literal member, so the class is
+  # still open after it
+  re = Regexp.new('[] ]', Regexp::EXTENDED)
+  assert_true re.match?(" ")
+  assert_true re.match?("]")
+
+  re = Regexp.new('[^] ]', Regexp::EXTENDED)
+  assert_false re.match?(" ")
+  assert_true re.match?("a")
+
   # escaped whitespace is preserved
   re = Regexp.new('a\\ b', Regexp::EXTENDED)
   assert_true re.match?("a b")
@@ -592,6 +701,14 @@ assert("Regexp extended mode (x flag)") do
 
   # to_s shows x flag
   assert_equal "(?x:abc)", Regexp.new("abc", Regexp::EXTENDED).to_s
+
+  # errors quote the pattern as written, not the stripped text
+  assert_raise_with_message(RegexpError, "unterminated character class: /a # c\n[/") do
+    Regexp.new("a # c\n[", Regexp::EXTENDED)
+  end
+  assert_raise_with_message(RegexpError, "unmatched '(': /a b(/") do
+    Regexp.new("a b(", Regexp::EXTENDED)
+  end
 end
 
 assert("String#match") do
@@ -1120,6 +1237,22 @@ assert("String#split limit cannot pose as an Integer") do
   assert_raise(TypeError) { "a,b,c".split(/,/, StringSplitLimitComparable.new) }
 end
 
+assert("String#split with a Bigint limit") do
+  # A Bigint is an Integer, so a check on the class let one through unconverted
+  # and the split loop ran with a limit that does not fit `mrb_int`, while the
+  # String pattern raised in `__split`. The exponent is a variable because a
+  # constant power out of `mrb_int` range fails the build rather than raising.
+  exp = 70
+  begin
+    limit = 2 ** exp
+  rescue RangeError
+    skip "requires mruby-bigint"
+  end
+  assert_raise(RangeError) { "a,b,c".split(/,/, limit) }
+  assert_raise(RangeError) { "a,b,c".split(",", limit) }
+  assert_raise(RangeError) { "a,b,c".split(/,/, -limit) }
+end
+
 assert("String#split with empty regexp") do
   assert_equal ["a", "b", "c"], "abc".split(//)
   assert_equal ["a", "bc"], "abc".split(//, 2)
@@ -1189,12 +1322,54 @@ assert("Regexp - backreference no match") do
   assert_nil /(\w+) \1/.match("hello world")
 end
 
+assert("Regexp - backreference under /i") do
+  # The comparison against the captured text has to fold case too, otherwise
+  # `\1` stays case-sensitive while the rest of the pattern does not.
+  assert_equal "aA", /(a)\1/i.match("aA")[0]
+  assert_equal "Hello hELLO", /(\w+) \1/i.match("Hello hELLO world")[0]
+  assert_nil /(a)\1/i.match("ab")
+end
+
 assert("Regexp - named captures") do
   md = /(?<year>\d+)-(?<month>\d+)-(?<day>\d+)/.match("2026-03-21")
   assert_equal "2026", md[:year]
   assert_equal "03", md[:month]
   assert_equal "21", md[:day]
   assert_equal "2026", md["year"]
+end
+
+assert("Regexp#named_captures") do
+  assert_equal({"year" => [1], "month" => [2], "day" => [3]},
+               /(?<year>\d+)-(?<month>\d+)-(?<day>\d+)/.named_captures)
+  assert_equal({}, /\d+/.named_captures)
+
+  # the returned Hash is a copy; mutating it must not affect a later call
+  re = /(?<a>x)/
+  re.named_captures["a"] = 99
+  assert_equal({"a" => [1]}, re.named_captures)
+end
+
+assert("Regexp#names") do
+  assert_equal ["year", "month", "day"],
+               /(?<year>\d+)-(?<month>\d+)-(?<day>\d+)/.names
+  assert_equal [], /\d+/.names
+
+  # a name that is registered twice is reported once, as in CRuby
+  assert_equal ["tag"], /(?<tag>\w+)-(?<tag>\w+)/.names
+end
+
+assert("Regexp - empty group name") do
+  # (?<>x) used to compile and answer to "", and in /x mode the stored name
+  # pointed into the preprocessing buffer the compiler frees on the way out.
+  assert_raise(RegexpError) { Regexp.new("(?<>x)") }
+  assert_raise(RegexpError) { Regexp.new("(?<>x) ", Regexp::EXTENDED) }
+  assert_raise(RegexpError) { Regexp.new("(?<>x)\\k<>") }
+  assert_raise(RegexpError) { Regexp.new("\\k<>") }
+  assert_raise(RegexpError) { Regexp.new("\\k''") }
+
+  # lookbehind is not a named group and is unaffected
+  assert_equal "b", Regexp.new("(?<=a)b").match("ab")[0]
+  assert_nil Regexp.new("(?<!a)b").match("ab")
 end
 
 assert("MatchData#[] - negative index") do
@@ -1229,6 +1404,44 @@ assert("MatchData#[] - group name longer than a uint16 length") do
   assert_equal "x", md[:abc]
 end
 
+assert("MatchData#begin / #end - group name longer than a stored name") do
+  # begin/end share the name lookup with MatchData#[], so the bound that keeps
+  # the memcmp() from being handed a length larger than what was measured
+  # covers them too.
+  md = /(?<abc>x)/.match("x")
+  assert_raise(IndexError) { md.begin("abc" + "A" * 65536) }
+  assert_raise(IndexError) { md.end("abc" + "A" * 65536) }
+  assert_equal 0, md.begin(:abc)
+end
+
+assert("Regexp - group name longer than a uint16 length") do
+  # The name length used to live in a uint16_t and was truncated with a cast,
+  # so (uint16_t)65538 == 2 made this group answer to "ab" instead of to the
+  # name it was given.
+  long = "ab" + "A" * 65536
+  re = Regexp.new("(?<#{long}>x)")
+  assert_equal [long], re.named_captures.keys
+  assert_equal "x", re.match("x")[long]
+  assert_raise(IndexError) { re.match("x")["ab"] }
+
+  # two names that shared a truncation stay distinct, and the two APIs that
+  # resolve a name agree on which group it names
+  re = Regexp.new("(?<ab>x)(?<#{long}>y)")
+  md = re.match("xy")
+  assert_equal "x", md["ab"]
+  assert_equal "y", md[long]
+  assert_equal({ "ab" => "x", long => "y" }, md.named_captures)
+
+  # \k binds to the group the name was written on
+  re = Regexp.new("(?<ab>x)(?<#{long}>y)\\k<#{long}>")
+  assert_nil re.match("xyx")
+  assert_equal "xyy", re.match("xyy")[0]
+
+  # a name of exactly 65536 bytes is not the empty name
+  z = "Z" * 65536
+  assert_equal [z], Regexp.new("(?<#{z}>x)").named_captures.keys
+end
+
 assert("Regexp - named backreference \\k") do
   assert_equal "aa", "aa".match(/(?<n>\w)\k<n>/)[0]
   assert_equal "abba", "abba".match(/(?<a>.)(?<b>.)\k<b>\k<a>/)[0]
@@ -1237,8 +1450,19 @@ assert("Regexp - named backreference \\k") do
   # numeric and relative forms
   assert_equal "aa", "aa".match(/(a)\k<1>/)[0]
   assert_equal "abba", "abba".match(/(.)(.)\k<-1>\k<-2>/)[0]
+  # /i folds the comparison against the captured text
+  assert_equal "aA", "aA".match(/(?<n>a)\k<n>/i)[0]
+  assert_nil "ab".match(/(?<n>a)\k<n>/i)
   # an unknown name is an error
   assert_raise(RegexpError) { Regexp.new("\\k<missing>") }
+end
+
+assert("Regexp - numeric \\k backreference out of int range") do
+  # The digit accumulator is an int with no bound, so 4294967297 used to wrap
+  # to 1 and bind this backreference to group 1 instead of raising.
+  assert_raise(RegexpError) { Regexp.new("(a)\\k<4294967297>") }
+  assert_raise(RegexpError) { Regexp.new("(a)\\k<-4294967297>") }
+  assert_raise(RegexpError) { Regexp.new("(a)(b)\\k<4294967298>") }
 end
 
 assert("MatchData#named_captures") do
@@ -1246,6 +1470,11 @@ assert("MatchData#named_captures") do
   nc = md.named_captures
   assert_equal "user", nc["a"]
   assert_equal "host", nc["b"]
+end
+
+assert("MatchData#names") do
+  assert_equal ["a", "b"], /(?<a>\w+)@(?<b>\w+)/.match("user@host").names
+  assert_equal [], /\w+/.match("user").names
 end
 
 assert("Regexp - named captures survive /x preprocessing") do
@@ -1330,6 +1559,74 @@ assert("$1-$9 cleared on no match") do
   assert_equal "hello", $1
   /xyz/ =~ "abc"
   assert_nil $1
+end
+
+assert("$&, $`, $' and $+ global variables") do
+  /b(c)/ =~ "abcd"
+  assert_equal "bc", $&
+  assert_equal "a", $`
+  assert_equal "d", $'
+  assert_equal "c", $+
+
+  # $+ is the last group that participated, not the last group in the pattern
+  /(a)|(b)/ =~ "a"
+  assert_equal "a", $+
+
+  # a pattern without groups has no $+
+  /cd/ =~ "abcd"
+  assert_equal "cd", $&
+  assert_nil $+
+end
+
+assert("$&, $`, $' and $+ cleared on no match") do
+  /b(c)/ =~ "abcd"
+  assert_equal "bc", $&
+  /xyz/ =~ "abc"
+  assert_nil $&
+  assert_nil $`
+  assert_nil $'
+  assert_nil $+
+end
+
+assert("String#gsub with block leaves the last match behind") do
+  # The block form drives the search from mrblib, and the failed match that
+  # ends the loop used to clear the match the loop was supposed to leave.
+  $~ = nil
+  "hello".gsub(/l/) { |m| m }
+  assert_equal "l", $~[0]
+
+  # every name a match publishes, not just $~
+  $~ = nil
+  "a1b22c".gsub(/([a-c])(\d+)/) { |m| m }
+  assert_equal "b22", $~[0]
+  assert_equal "b22", $&
+  assert_equal "a1", $`
+  assert_equal "c", $'
+  assert_equal "b", $1
+  assert_equal "22", $2
+  assert_equal "22", $+
+
+  # a block that matches on its own does not get the last word
+  $~ = nil
+  "hello".gsub(/l/) { |m| /z+/ =~ "zzz"; m }
+  assert_equal "l", $~[0]
+
+  # a zero-width match at the end of the subject ends the loop on the
+  # `pos <= len` test rather than a failed match, and lands the same way
+  $~ = nil
+  "ab".gsub(/x*/) { "-" }
+  assert_equal "", $~[0]
+  assert_equal 2, $~.begin(0)
+
+  # matching nothing clears, as it does everywhere else
+  /b(c)/ =~ "abcd"
+  "hello".gsub(/z/) { |m| m }
+  assert_nil $~
+  assert_nil $&
+  assert_nil $`
+  assert_nil $'
+  assert_nil $1
+  assert_nil $+
 end
 
 assert("Regexp - consecutive optional quantifiers (#6853)") do

@@ -2077,9 +2077,11 @@ vm_op_getidx(mrb_state *mrb, uint32_t a, mrb_sym *midp)
   else if (tt == MRB_TT_HASH) {
     /* optimize only for Hash class; subclasses/singleton may override [] */
     if (mrb_obj_ptr(va)->c != mrb->hash_class) goto getidx_fallback;
+    int ai = mrb_gc_arena_save(mrb);
     va = mrb_hash_get(mrb, va, vb);
     ci = mrb->c->ci;
     regs[a] = va;
+    mrb_gc_arena_restore(mrb, ai);
     return VM_NEXT;
   }
   else if (tt == MRB_TT_STRING) {
@@ -2089,9 +2091,13 @@ vm_op_getidx(mrb_state *mrb, uint32_t a, mrb_sym *midp)
     case MRB_TT_INTEGER:
     case MRB_TT_STRING:
     case MRB_TT_RANGE:
-      va = mrb_str_aref(mrb, va, vb, mrb_undef_value());
-      regs[a] = va;
-      return VM_NEXT;
+      {
+        int ai = mrb_gc_arena_save(mrb);
+        va = mrb_str_aref(mrb, va, vb, mrb_undef_value());
+        regs[a] = va;
+        mrb_gc_arena_restore(mrb, ai);
+        return VM_NEXT;
+      }
     default:
       break;
     }
@@ -2127,10 +2133,28 @@ vm_op_getidx0(mrb_state *mrb, uint32_t a, uint16_t b, mrb_sym *midp)
     {
       /* same as the Hash branch of vm_op_getidx(): mrb_hash_get() can run a
          default proc and move the stack, so take the result first and store
-         it through the refreshed `regs` */
+         it through the refreshed `regs`. The arena is restored only after
+         that store, which is what roots the result. */
+      int ai = mrb_gc_arena_save(mrb);
       mrb_value val = mrb_hash_get(mrb, recv, mrb_fixnum_value(0));
       ci = mrb->c->ci;
       regs[a] = val;
+      mrb_gc_arena_restore(mrb, ai);
+    }
+    return VM_NEXT;
+  }
+  else if (tt == MRB_TT_STRING) {
+    /* optimize only for String class; subclasses/singleton may override [] */
+    if (mrb_obj_ptr(recv)->c != mrb->string_class) goto getidx0_fallback;
+    {
+      /* mrb_str_aref() allocates, and an inline opcode never runs the cfunc
+         epilogue that would shrink the arena, so save and restore it here.
+         Unlike the Hash branch above, `ci` needs no refresh: this call cannot
+         run Ruby code and so cannot move the stack. */
+      int ai = mrb_gc_arena_save(mrb);
+      mrb_value val = mrb_str_aref(mrb, recv, mrb_fixnum_value(0), mrb_undef_value());
+      regs[a] = val;
+      mrb_gc_arena_restore(mrb, ai);
     }
     return VM_NEXT;
   }
@@ -2158,9 +2182,13 @@ vm_op_setidx(mrb_state *mrb, uint32_t a, mrb_sym *midp)
   case MRB_TT_HASH:
     /* optimize only for Hash class; subclasses/singleton may override []= */
     if (mrb_obj_ptr(va)->c != mrb->hash_class) goto setidx_fallback;
-    mrb_hash_set(mrb, va, vb, vc);
-    ci = mrb->c->ci;
-    regs[a] = vc;
+    {
+      int ai = mrb_gc_arena_save(mrb);
+      mrb_hash_set(mrb, va, vb, vc);
+      ci = mrb->c->ci;
+      regs[a] = vc;
+      mrb_gc_arena_restore(mrb, ai);
+    }
     return VM_NEXT;
   default:
   setidx_fallback:
@@ -2184,7 +2212,9 @@ vm_op_div(mrb_state *mrb, uint32_t a, mrb_sym *midp)
     {
       mrb_int x = mrb_integer(regs[a]);
       mrb_int y = mrb_integer(regs[a+1]);
+      int ai = mrb_gc_arena_save(mrb);
       regs[a] = mrb_div_int_value(mrb, x, y);
+      mrb_gc_arena_restore(mrb, ai);
     }
     return VM_NEXT;
 #ifndef MRB_NO_FLOAT
@@ -2271,6 +2301,23 @@ vm_call_proc(mrb_state *mrb, const struct RProc *p, mrb_int nargs,
   }
   return VM_NEXT;
 }
+
+/* Stores an mrb_int into a register from inside mrb_vm_exec().
+   SET_INT_VALUE() heap-allocates an RInteger for a value outside the fixnum
+   range, and an inline opcode has no cfunc epilogue behind it to shrink the
+   arena, so a boxing site in the interpreter loop has to restore for itself.
+   The restore is skipped when the store produced an immediate, which is the
+   fixnum fast path and allocates nothing.  Where the macro cannot allocate at
+   all this expands to the bare store.  `ai` is the arena index mrb_vm_exec()
+   saved on entry. */
+#if defined(MRB_WORD_BOXING) || (defined(MRB_NAN_BOXING) && defined(MRB_INT64))
+#define VM_SET_INT_VALUE(r,n) do {                                          \
+  SET_INT_VALUE(mrb, r, n);                                                 \
+  if (!mrb_immediate_p(r)) mrb_gc_arena_restore(mrb, ai);                   \
+} while (0)
+#else
+#define VM_SET_INT_VALUE(r,n) SET_INT_VALUE(mrb,r,n)
+#endif
 
 /**
  * @brief Executes a sequence of mruby bytecode instructions.
@@ -2368,16 +2415,16 @@ RETRY_TRY_BLOCK:
     CASE(OP_LOADL, BB) {
       switch (irep->pool[b].tt) {   /* number */
       case IREP_TT_INT32:
-        regs[a] = mrb_int_value(mrb, (mrb_int)irep->pool[b].u.i32);
+        VM_SET_INT_VALUE(regs[a], (mrb_int)irep->pool[b].u.i32);
         break;
       case IREP_TT_INT64:
 #if defined(MRB_INT64)
-        regs[a] = mrb_int_value(mrb, (mrb_int)irep->pool[b].u.i64);
+        VM_SET_INT_VALUE(regs[a], (mrb_int)irep->pool[b].u.i64);
         break;
 #else
 #if defined(MRB_64BIT)
         if (INT32_MIN <= irep->pool[b].u.i64 && irep->pool[b].u.i64 <= INT32_MAX) {
-          regs[a] = mrb_int_value(mrb, (mrb_int)irep->pool[b].u.i64);
+          VM_SET_INT_VALUE(regs[a], (mrb_int)irep->pool[b].u.i64);
           break;
         }
 #endif
@@ -2388,6 +2435,7 @@ RETRY_TRY_BLOCK:
         {
           const char *s = irep->pool[b].u.str;
           regs[a] = mrb_bint_new_str(mrb, s+2, (uint8_t)s[0], (int8_t)s[1]);
+          mrb_gc_arena_restore(mrb, ai);
         }
         break;
 #else
@@ -2436,7 +2484,7 @@ RETRY_TRY_BLOCK:
     }
 
     CASE(OP_LOADI32, BSS) {
-      SET_INT_VALUE(mrb, regs[a], (int32_t)(((uint32_t)b<<16)+c));
+      VM_SET_INT_VALUE(regs[a], (int32_t)(((uint32_t)b<<16)+c));
       NEXT;
     }
 
@@ -3249,7 +3297,7 @@ RETRY_TRY_BLOCK:
       OP_MATH_OVERFLOW_INT(op_name,x,y);                                    \
     }                                                                       \
     else                                                                    \
-      SET_INT_VALUE(mrb,regs[a], z);                                        \
+      VM_SET_INT_VALUE(regs[a], z);                                         \
   }                                                                         \
   else switch (tt) {                                                        \
     OP_MATH_CASE_FLOAT(op_name, integer, float);                            \
@@ -3270,7 +3318,7 @@ RETRY_TRY_BLOCK:
         OP_MATH_OVERFLOW_INT(op_name,x,y);                                  \
       }                                                                     \
       else                                                                  \
-        SET_INT_VALUE(mrb,regs[a], z);                                      \
+        VM_SET_INT_VALUE(regs[a], z);                                       \
     }                                                                       \
     break
 #ifdef MRB_NO_FLOAT
@@ -3285,7 +3333,10 @@ RETRY_TRY_BLOCK:
     break
 #endif
 #ifdef MRB_USE_BIGINT
-#define OP_MATH_OVERFLOW_INT(op,x,y) regs[a] = mrb_bint_##op##_ii(mrb,x,y)
+#define OP_MATH_OVERFLOW_INT(op,x,y) do {                                   \
+  regs[a] = mrb_bint_##op##_ii(mrb,x,y);                                    \
+  mrb_gc_arena_restore(mrb, ai);                                            \
+} while (0)
 #else
 #define OP_MATH_OVERFLOW_INT(op,x,y) goto L_INT_OVERFLOW
 #endif
@@ -3329,7 +3380,7 @@ RETRY_TRY_BLOCK:
       OP_MATH_OVERFLOW_INT(op_name,x,y);                                    \
     }                                                                       \
     else                                                                    \
-      SET_INT_VALUE(mrb,regs[a], z);                                        \
+      VM_SET_INT_VALUE(regs[a], z);                                         \
   }                                                                         \
   else switch (mrb_type(regs[a])) {                                         \
     OP_MATHI_CASE_FLOAT(op_name);                                           \
@@ -3348,7 +3399,7 @@ RETRY_TRY_BLOCK:
         OP_MATH_OVERFLOW_INT(op_name,x,y);                                  \
       }                                                                     \
       else                                                                  \
-        SET_INT_VALUE(mrb,regs[a], z);                                      \
+        VM_SET_INT_VALUE(regs[a], z);                                       \
     }                                                                       \
     break
 #ifdef MRB_NO_FLOAT
@@ -3392,15 +3443,30 @@ RETRY_TRY_BLOCK:
           OP_MATH_OVERFLOW_INT(op_name,x,y);                                \
         }                                                                   \
         else {                                                              \
-          SET_INT_VALUE(mrb,regs[a], z);                                    \
+          VM_SET_INT_VALUE(regs[a], z);                                     \
         }                                                                   \
       }                                                                     \
       break;                                                                \
     OP_MATHILV_CASE_FLOAT(op_name);                                         \
     default:                                                                \
-      SET_INT_VALUE(mrb,regs[a+1], c);                                      \
-      mid = MRB_OPSYM(op_name);                                             \
-      goto L_SEND_SYM;                                                      \
+      /* `a` is a local variable slot, not a temporary, so the L_SEND_SYM   \
+         path the other OP_MATH opcodes take cannot be used: it writes the  \
+         argument into regs[a+1] and lays the callee frame over the locals  \
+         from regs[a] on. `b` is the working space reserved for the call,   \
+         but a send set up there leaves its result in regs[b] and the       \
+         `MOVE local, temp` that used to copy it back is what the fusion    \
+         removed, so the call is made from C. It can move the stack, hence  \
+         the `ci` refresh before storing through `regs`. */                 \
+      {                                                                     \
+        int ai_ = mrb_gc_arena_save(mrb);                                   \
+        mrb_value arg_ = mrb_int_value(mrb, c);                             \
+        mrb_value v_ = mrb_funcall_argv(mrb, regs[a],                       \
+                                        MRB_OPSYM(op_name), 1, &arg_);      \
+        ci = mrb->c->ci;                                                    \
+        regs[a] = v_;                                                       \
+        mrb_gc_arena_restore(mrb, ai_);                                     \
+      }                                                                     \
+      break;                                                                \
   }                                                                         \
   NEXT
 
