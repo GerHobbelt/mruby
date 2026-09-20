@@ -1191,10 +1191,12 @@ mrb_define_private_method(mrb_state *mrb, struct RClass *c, const char *name, mr
  *
  * @param mrb The mruby state.
  * @sideeffect Raises a NotImplementedError exception. This function does not return.
- *             If a method name is available from the callinfo, it's included
- *             in the error message (e.g., "foo() function is unimplemented on this machine").
+ *             The name comes from the callinfo of the frame the call is made on
+ *             (e.g., "foo() function is unimplemented on this machine"). A frame
+ *             that is not a method call has no name, and the message goes without
+ *             one.
  */
-MRB_API void
+MRB_API mrb_noreturn void
 mrb_notimplement(mrb_state *mrb)
 {
   mrb_callinfo *ci = mrb->c->ci;
@@ -1202,6 +1204,7 @@ mrb_notimplement(mrb_state *mrb)
   if (ci->mid) {
     mrb_raisef(mrb, E_NOTIMP_ERROR, "%n() function is unimplemented on this machine", ci->mid);
   }
+  mrb_raise(mrb, E_NOTIMP_ERROR, "function is unimplemented on this machine");
 }
 
 /*
@@ -3367,8 +3370,8 @@ mrb_obj_equal_m(mrb_state *mrb, mrb_value self)
  * @param c The `RClass*` representing the class of the object.
  * @param mid The symbol ID (`mrb_sym`) of the method name.
  * @return `TRUE` if an object of class `c` would respond to the method `mid`
- *         (i.e., the method is found and not undefined).
- *         `FALSE` otherwise.
+ *         (i.e., the method is found, not undefined, and not standing for a
+ *         feature this build does not have). `FALSE` otherwise.
  * @sideeffect May update the method cache if the method is found (due to the
  *             internal call to `mrb_method_search_vm`).
  */
@@ -3377,7 +3380,7 @@ mrb_obj_respond_to(mrb_state *mrb, struct RClass* c, mrb_sym mid)
 {
   mrb_method_t m = mrb_method_search_vm(mrb, &c, mid);
 
-  if (MRB_METHOD_UNDEF_P(m)) {
+  if (MRB_METHOD_UNDEF_P(m) || MRB_METHOD_NOTIMPL_P(m)) {
     return FALSE;
   }
   return TRUE;
@@ -3810,8 +3813,10 @@ undef_method(mrb_state *mrb, struct RClass *c, mrb_sym a)
  * @param c The class or module (`RClass*`) in which to undefine the method.
  * @param a The symbol ID (`mrb_sym`) of the method to undefine.
  * @return This function does not return a value.
- * @raise NameError if the method `a` is not defined in `c` or its ancestors
- *        (i.e., if `c` does not respond to `a` before undefinition).
+ * @raise NameError if the method `a` is not defined in `c` or its ancestors.
+ *        A method that is defined but unimplemented on this machine can be
+ *        undefined like any other, so the check here asks whether the method
+ *        exists, not whether `c` responds to it.
  * @sideeffect
  *   1. Modifies the method table of `c` by adding an entry that marks `a` as undefined.
  *   2. Triggers `method_undefined` (for regular classes/modules) or
@@ -3822,7 +3827,9 @@ undef_method(mrb_state *mrb, struct RClass *c, mrb_sym a)
 MRB_API void
 mrb_undef_method_id(mrb_state *mrb, struct RClass *c, mrb_sym a)
 {
-  if (!mrb_obj_respond_to(mrb, c, a)) {
+  struct RClass *found = c;
+  mrb_method_t m = mrb_method_search_vm(mrb, &found, a);
+  if (MRB_METHOD_UNDEF_P(m)) {
     mrb_name_error(mrb, a, "undefined method '%n' for class '%C'", a, c);
   }
   undef_method(mrb, c, a);

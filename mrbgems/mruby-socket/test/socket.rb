@@ -50,3 +50,39 @@ assert('Socket.ip_address_list') do
     assert_true [Socket::AF_INET, Socket::AF_INET6].include?(ai.afamily)
   end
 end
+
+# BasicSocket#getpeereid is defined on every platform, so this test runs
+# everywhere.
+assert('BasicSocket#getpeereid') do
+  s = Socket.new(Socket::AF_INET, Socket::SOCK_DGRAM, 0)
+  begin
+    # getpeereid(2) is compiled in only where HAVE_GETPEEREID is defined.
+    # Where it is not, the method is here to refuse, and that is what
+    # respond_to? has to report rather than promise an answer.
+    unless s.respond_to?(:getpeereid)
+      assert_raise(NotImplementedError) { s.getpeereid }
+    end
+  ensure
+    s.close rescue nil
+  end
+end
+
+# SocketTest.win? reads the same _WIN32 that guards the sysseek entry, so this
+# test runs everywhere and asks each platform for the answer it compiled.
+assert('BasicSocket#sysseek') do
+  s = Socket.new(Socket::AF_INET, Socket::SOCK_DGRAM, 0)
+  begin
+    if SocketTest.win?
+      # The entry is here to refuse, a socket having no position to seek to,
+      # and it shadows IO#sysseek for every socket.
+      assert_false s.respond_to?(:sysseek)
+      assert_raise(NotImplementedError) { s.sysseek(0) }
+    else
+      # Without that entry IO#sysseek is the nearest definition, and a socket
+      # answers with it.
+      assert_true s.respond_to?(:sysseek)
+    end
+  ensure
+    s.close rescue nil
+  end
+end

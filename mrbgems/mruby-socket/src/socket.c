@@ -359,6 +359,7 @@ socket_family(int s)
   return ss.ss_family;
 }
 
+#ifdef HAVE_GETPEEREID
 /*
  * call-seq:
  *   basicsocket.getpeereid -> [euid, egid]
@@ -371,7 +372,6 @@ socket_family(int s)
 static mrb_value
 mrb_basicsocket_getpeereid(mrb_state *mrb, mrb_value self)
 {
-#ifdef HAVE_GETPEEREID
   gid_t egid;
   uid_t euid;
   int s = socket_fd(mrb, self);
@@ -382,11 +382,11 @@ mrb_basicsocket_getpeereid(mrb_state *mrb, mrb_value self)
   mrb_ary_push(mrb, ary, mrb_fixnum_value((mrb_int)euid));
   mrb_ary_push(mrb, ary, mrb_fixnum_value((mrb_int)egid));
   return ary;
-#else
-  mrb_raise(mrb, E_RUNTIME_ERROR, "getpeereid is not available on this system");
-  return mrb_nil_value();
-#endif
 }
+#else
+/* unimplemented, and named as such so `respond_to?` can answer false */
+# define mrb_basicsocket_getpeereid mrb_notimplement_m
+#endif
 
 /*
  * call-seq:
@@ -599,14 +599,6 @@ socket_option_bool(mrb_state *mrb, mrb_value self)
 {
   int i = option_int(mrb, self);
   return mrb_bool_value((mrb_bool)i);
-}
-
-/* Helper to raise not implemented error for unimplemented Socket::Option methods */
-static mrb_value
-socket_option_notimp(mrb_state *mrb, mrb_value self)
-{
-  mrb_notimplement(mrb);
-  return mrb_nil_value();
 }
 
 /*
@@ -1305,20 +1297,6 @@ mrb_win32_basicsocket_sysread(mrb_state *mrb, mrb_value self)
 
 /*
  * call-seq:
- *   basicsocket.sysseek(offset, whence) -> integer
- *
- * Windows-specific implementation that raises NotImplementedError.
- * Sockets don't support seeking operations.
- */
-static mrb_value
-mrb_win32_basicsocket_sysseek(mrb_state *mrb, mrb_value self)
-{
-  mrb_raise(mrb, E_NOTIMP_ERROR, "sysseek not implemented for windows sockets");
-  return mrb_nil_value();
-}
-
-/*
- * call-seq:
  *   basicsocket.syswrite(string) -> integer
  *
  * Windows-specific implementation to write to socket using send().
@@ -1361,7 +1339,9 @@ static const mrb_mt_entry basicsocket_rom_entries[] = {
 #ifdef _WIN32
   MRB_MT_ENTRY(mrb_win32_basicsocket_close,    MRB_SYM(close), MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_win32_basicsocket_sysread,  MRB_SYM(sysread), MRB_ARGS_REQ(1)|MRB_ARGS_OPT(1)),
-  MRB_MT_ENTRY(mrb_win32_basicsocket_sysseek,  MRB_SYM(sysseek), MRB_ARGS_REQ(1)),
+  /* a socket cannot seek: unimplemented, and named as such so `respond_to?`
+     can answer false */
+  MRB_MT_ENTRY(mrb_notimplement_m,             MRB_SYM(sysseek), MRB_ARGS_REQ(1)),
   MRB_MT_ENTRY(mrb_win32_basicsocket_syswrite, MRB_SYM(syswrite), MRB_ARGS_REQ(1)),
   MRB_MT_ENTRY(mrb_win32_basicsocket_sysread,  MRB_SYM(read), MRB_ARGS_REQ(1)|MRB_ARGS_OPT(1)),
   MRB_MT_ENTRY(mrb_win32_basicsocket_syswrite, MRB_SYM(write), MRB_ARGS_REQ(1)),
@@ -1381,8 +1361,9 @@ static const mrb_mt_entry socket_option_rom_entries[] = {
   MRB_MT_ENTRY(socket_option_data,    MRB_SYM(data),    MRB_ARGS_REQ(0)),
   MRB_MT_ENTRY(socket_option_bool,    MRB_SYM(bool),    MRB_ARGS_REQ(0)),
   MRB_MT_ENTRY(socket_option_int,     MRB_SYM(int),     MRB_ARGS_REQ(0)),
-  MRB_MT_ENTRY(socket_option_notimp,  MRB_SYM(linger),  MRB_ARGS_REQ(0)),
-  MRB_MT_ENTRY(socket_option_notimp,  MRB_SYM(unpack), MRB_ARGS_REQ(1)),
+  /* unimplemented, and named as such so `respond_to?` can answer false */
+  MRB_MT_ENTRY(mrb_notimplement_m,    MRB_SYM(linger),  MRB_ARGS_REQ(0)),
+  MRB_MT_ENTRY(mrb_notimplement_m,    MRB_SYM(unpack), MRB_ARGS_REQ(1)),
 };
 
 void

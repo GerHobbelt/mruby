@@ -68,10 +68,11 @@ other to provide its own feature set:
 `mruby-io`'s own private spawn/wait primitives rather than by anything here.
 There is no dependency in either direction; `mrbgem.rake` names `mruby-io` only
 as a _test_ dependency, because waiting on a child process is only testable
-with a child, and `IO.popen` is how this build makes one. `mruby-errno` is a
-test dependency for the same kind of reason: a gem's tests run in a state
-holding its dependency closure and nothing else, so naming an `Errno` class in
-an assertion means asking for the gem that defines them.
+with a child, and `IO.popen` is how this build makes one. `mruby-errno` and
+`mruby-metaprog` are test dependencies for the same kind of reason: a gem's
+tests run in a state holding its dependency closure and nothing else, so
+naming an `Errno` class or asking an object for its `instance_variables` means
+asking for the gem that defines them.
 
 `mruby-signal` is a real dependency rather than a test one. `Process.kill`
 takes a signal by name and `Process::Status#to_s` spells one out, so both need
@@ -111,13 +112,14 @@ blocks or `Process::Status`.
 
 ### Process::Status and mruby-io
 
-`mruby-io` sets `$?` after an `IO.popen` stream closes by calling
-`Process::Status.new(pid, raw_status)` when the class happens to be defined,
-and falling back to a plain Integer when it is not. That soft integration keeps
-working unchanged: `Process::Status.new(pid, raw_status)` is a supported way to
-build a status, and the status decodes itself through the same HAL that
-`Process.waitpid` uses, so a status `mruby-io` produced reads exactly like one
-this gem reaped.
+`mruby-io` sets `$?` after an `IO.popen` stream closes by building a status
+when the class happens to be defined, and falling back to a plain Integer when
+it is not. `Process::Status.new` is undefined, as it is in CRuby, so what it
+builds one with is `mrb_obj_new()`: the instance is allocated and handed to
+`#initialize`, which takes the pid and the raw platform status. That is the
+same path `Process.waitpid` takes here, and a status decodes itself through
+the same HAL whichever way it was built, so one `mruby-io` produced reads
+exactly like one this gem reaped.
 
 A `Process::Status` stores only the pid and the raw platform status, and asks
 the HAL afresh for every question about it. Nothing above the HAL ever holds a
@@ -151,8 +153,26 @@ kept separate from adding this gem.
   when `mruby-errno` is in the build. Methods are never conditionally absent,
   so a program can be written once and told at the call site what this platform
   will not do.
-- **`Process::Status.new(pid, raw_status)` stays public.** Making it private
-  would break the `mruby-io` path it exists for.
+- **`Process::Status.new` is undefined.** A status reports what happened to a
+  process, so one written by hand reports nothing, and CRuby says so by
+  undefining `new` on the class. What the
+  `mruby-io` seam needs is not a public constructor but a way to build the
+  object from C, and `mrb_obj_new()` allocates and initializes without asking
+  the class for `new`. That is also why `MRB_UNDEF_ALLOCATOR()` is not set
+  beside the undefinition, as `Data`, `Complex` and `Binding` set it:
+  `mrb_obj_new()` goes through the allocator, so marking it undefined would
+  close the seam along with the constructor. CRuby leaves its allocator alone
+  too, so `Process::Status.allocate` answers there with an uninitialized
+  status; here such an instance is answered with
+  `RuntimeError: uninitialized Process::Status` rather than read past, so
+  `allocate` gives nothing away that was not reachable before.
+- **A `Process::Status` is frozen once built.** What a process did is over by
+  the time there is a status for it, and the pid and the raw status set at
+  construction are what every other question is read back from. Freezing says
+  so, and keeps the two from being rewritten under the answers. CRuby freezes
+  the status it leaves in `$?` for the same reason. An instance of a subclass
+  is left unfrozen: it is still being built when `#initialize` returns, and
+  every status this gem and `mruby-io` publish is a `Process::Status` itself.
 - **A wait flag no port stands for is refused before a port sees it.** The
   flags are mruby's own bits, and a port reads the ones it knows and can say
   nothing about the rest, so `MRB_PROCESS_WAIT_FLAGS` names every bit a wait

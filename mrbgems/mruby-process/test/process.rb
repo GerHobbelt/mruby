@@ -39,6 +39,15 @@ module ProcessTestUtil
     false
   end
 
+  # Write a status carrying +raw+ for +pid+.  Process::Status.new is
+  # undefined, here as in CRuby, so a status is built the way mruby-io builds
+  # the one it sets $? to: by allocating an instance and initializing it,
+  # which is what the C helper does.  +cls+ names the class to build, since a
+  # subclass has no `new` to reach either.
+  def self.status(pid, raw, cls = Process::Status)
+    ProcessStatusTest.build(pid, raw, cls)
+  end
+
   # Start a child running +cmd+ through a shell, or return nil where this
   # build has no child to give.
   def self.spawn(cmd)
@@ -82,6 +91,16 @@ assert('Process.waitpid with a flag it does not define') do
   end
 end
 
+assert('Process.waitpid reports the error by itself') do
+  # What a SystemCallError message carries after the error is the object the
+  # call was working on, the way `File.open` names the path it could not open.
+  # A wait has no such object and CRuby names nothing here.  Compared against
+  # the text this platform gives that errno rather than against a literal, so
+  # the wording itself is not pinned.
+  e = assert_raise(Errno::EINVAL) { Process.waitpid(-1, 4) }
+  assert_equal SystemCallError.new(e.errno).message, e.message
+end
+
 assert('Process.kill with signal 0') do
   # Signal 0 sends nothing; it only asks whether the process can be signalled.
   assert_equal 1, Process.kill(0, Process.pid)
@@ -115,6 +134,19 @@ assert('Process.kill with an unknown signal name') do
   end
   assert_raise_with_message(ArgumentError, "unsupported signal 'SIGNO_SUCH'") do
     Process.kill("SIGNO_SUCH", Process.pid)
+  end
+end
+
+assert('Process.kill with a signal name too long for any signal') do
+  # A name past the lookup buffer's width is still an unsupported signal, not
+  # a different kind of error; the name is reported in full rather than
+  # replaced by a generic message.
+  long_name = "A" * 40
+  assert_raise_with_message(ArgumentError, "unsupported signal 'SIG#{long_name}'") do
+    Process.kill(long_name, Process.pid)
+  end
+  assert_raise_with_message(ArgumentError, "unsupported signal 'SIG#{long_name}'") do
+    Process.kill(long_name.to_sym, Process.pid)
   end
 end
 
@@ -221,10 +253,18 @@ assert('a pid or a signal number too large for the platform') do
   end
 end
 
-assert('Process::Status.new') do
+assert('Process::Status.new is undefined') do
+  # As in CRuby, which undefines it: a status reports what happened to a
+  # process, so one written by hand reports nothing.  A subclass inherits the
+  # absence rather than gaining a way round it.
+  assert_raise(NoMethodError) { Process::Status.new(1234, 0) }
+  assert_raise(NoMethodError) { Class.new(Process::Status).new(1234, 0) }
+end
+
+assert('Process::Status') do
   # A raw status of 0 means "exited with 0" on every port, which is what lets
   # this be asserted without knowing the platform's status layout.
-  st = Process::Status.new(1234, 0)
+  st = ProcessTestUtil.status(1234, 0)
   assert_equal 1234, st.pid
   assert_equal 0, st.to_i
   assert_true st.exited?
@@ -237,7 +277,15 @@ assert('Process::Status.new') do
   assert_false st.coredump?
 end
 
-assert('Process::Status.new with a status too large for the platform') do
+assert('Process::Status keeps its pid and raw status out of instance_variables') do
+  # The pid and raw status are internal state, not something a caller wrote or
+  # is meant to read back by name; CRuby answers the same empty array, since
+  # it keeps both in the object's own struct rather than in an ivar table.
+  st = ProcessTestUtil.status(1234, 0)
+  assert_equal [], st.instance_variables
+end
+
+assert('Process::Status with a status too large for the platform') do
   # A port reads a raw status as the `int` the platform reported it with, so a
   # value that does not fit one is refused where RangeError can be said rather
   # than answered about from bits nobody wrote.  Nothing this gem produces can
@@ -251,20 +299,58 @@ assert('Process::Status.new with a status too large for the platform') do
   big = (2**31 rescue nil)
   skip "this build cannot name a number wider than an int" unless big
 
-  assert_raise(RangeError) { Process::Status.new(1234, big) }
-  assert_raise(RangeError) { Process::Status.new(1234, -big - 1) }
+  assert_raise(RangeError) { ProcessTestUtil.status(1234, big) }
+  assert_raise(RangeError) { ProcessTestUtil.status(1234, -big - 1) }
 
   # The edges themselves are still statuses, being what an int can carry.
-  assert_equal big - 1, Process::Status.new(1234, big - 1).to_i
-  assert_equal(-big, Process::Status.new(1234, -big).to_i)
+  assert_equal big - 1, ProcessTestUtil.status(1234, big - 1).to_i
+  assert_equal(-big, ProcessTestUtil.status(1234, -big).to_i)
+end
+
+assert('Process::Status is frozen once built') do
+  # What a process did is over by the time there is a status for it, and the
+  # pid and the raw status set at construction are what every other question
+  # is read back from.  Freezing says so, and keeps the two from being
+  # rewritten under the answers; CRuby freezes the status it leaves in $?.
+  st = ProcessTestUtil.status(1234, 0)
+  assert_true st.frozen?
+  # Written through the one door there is: #initialize is where the two are
+  # set, and a frozen receiver turns a second pass through it away.
+  assert_raise(FrozenError) { st.__send__(:initialize, 1234, 1) }
+  assert_equal 1234, st.pid
+  assert_equal 0, st.to_i
+end
+
+assert('Process::Status subclass is left to finish building itself') do
+  # A subclass calls super to have the two set and goes on to set whatever
+  # else it is made of, so it is still being built when #initialize returns
+  # and freezing there would turn the rest of its construction into a
+  # FrozenError.  What gets frozen is what is a status and nothing more.
+  cls = Class.new(Process::Status) do
+    def initialize(pid, raw_status)
+      super
+      @tag = "reaped"
+    end
+
+    attr_reader :tag
+  end
+
+  st = ProcessTestUtil.status(1234, 0, cls)
+  assert_false st.frozen?
+  assert_equal "reaped", st.tag
+  # Still a status, and still read as one.
+  assert_equal 1234, st.pid
+  assert_equal 0, st.to_i
+  assert_true st.exited?
+  assert_operator st, :==, ProcessTestUtil.status(1234, 0)
 end
 
 assert('Process::Status#==') do
-  st = Process::Status.new(1234, 0)
-  assert_operator st, :==, Process::Status.new(1234, 0)
+  st = ProcessTestUtil.status(1234, 0)
+  assert_operator st, :==, ProcessTestUtil.status(1234, 0)
   # The raw status alone decides, so the pid does not have to match.
-  assert_operator st, :==, Process::Status.new(1235, 0)
-  assert_not_operator st, :==, Process::Status.new(1234, 1)
+  assert_operator st, :==, ProcessTestUtil.status(1235, 0)
+  assert_not_operator st, :==, ProcessTestUtil.status(1234, 1)
   assert_operator st, :==, 0
   assert_not_operator st, :==, 1
   assert_not_operator st, :==, "0"
@@ -278,24 +364,24 @@ assert('Process::Status#== reads a subclass as the status it is') do
   # Integer#== does not hand back, so the unwrapping is this method's to do
   # and it has to read a subclass as a status.
   sub = Class.new(Process::Status)
-  st = Process::Status.new(1234, 0)
+  st = ProcessTestUtil.status(1234, 0)
 
-  assert_operator st, :==, sub.new(1234, 0)
-  assert_operator sub.new(1234, 0), :==, st
+  assert_operator st, :==, ProcessTestUtil.status(1234, 0, sub)
+  assert_operator ProcessTestUtil.status(1234, 0, sub), :==, st
   # The pid takes no part here either.
-  assert_operator st, :==, sub.new(1235, 0)
-  assert_not_operator st, :==, sub.new(1234, 1)
-  assert_not_operator sub.new(1234, 1), :==, st
+  assert_operator st, :==, ProcessTestUtil.status(1235, 0, sub)
+  assert_not_operator st, :==, ProcessTestUtil.status(1234, 1, sub)
+  assert_not_operator ProcessTestUtil.status(1234, 1, sub), :==, st
 end
 
 assert('Process::Status does not answer to_int') do
   # mruby has no implicit-conversion protocol, so nothing would ever call it,
   # and CRuby does not have the method either.
-  assert_false Process::Status.new(1234, 0).respond_to?(:to_int)
+  assert_false ProcessTestUtil.status(1234, 0).respond_to?(:to_int)
 end
 
 assert('Process::Status#to_s, #inspect') do
-  st = Process::Status.new(1234, 0)
+  st = ProcessTestUtil.status(1234, 0)
   assert_equal "pid 1234 exit 0", st.to_s
   assert_equal "#<Process::Status: pid 1234 exit 0>", st.inspect
 end
@@ -306,11 +392,11 @@ assert('Process::Status#to_s spells a signal out') do
   # checked through the decoding predicates first, so a platform that reads
   # one differently skips rather than fails on an encoding assumed here.
   kill = Signal.list["KILL"]
-  st = Process::Status.new(1234, kill)
+  st = ProcessTestUtil.status(1234, kill)
   skip "a raw status is not a POSIX wait status on this platform" unless st.signaled?
   assert_equal "pid 1234 SIGKILL (signal #{kill})", st.to_s
 
-  st = Process::Status.new(1234, kill | 0x80)
+  st = ProcessTestUtil.status(1234, kill | 0x80)
   assert_equal "pid 1234 SIGKILL (signal #{kill}) (core dumped)", st.to_s if st.coredump?
 
   # A raw stopped status can only be spelled where the platform has STOP to
@@ -319,14 +405,14 @@ assert('Process::Status#to_s spells a signal out') do
   # its own.
   stop = Signal.list["STOP"]
   if stop
-    st = Process::Status.new(1234, (stop << 8) | 0x7f)
+    st = ProcessTestUtil.status(1234, (stop << 8) | 0x7f)
     assert_equal "pid 1234 stopped SIGSTOP (signal #{stop})", st.to_s if st.stopped?
   end
 
   # A number this platform gives no name is written as the bare number.
   unnamed = (1..63).find { |signo| Signal.signame(signo).nil? }
   if unnamed
-    st = Process::Status.new(1234, unnamed)
+    st = ProcessTestUtil.status(1234, unnamed)
     assert_equal "pid 1234 signal #{unnamed}", st.to_s if st.signaled?
   end
 end
@@ -342,6 +428,7 @@ assert('Process.waitpid') do
 
   # waitpid publishes what it reaped through $?
   assert_kind_of Process::Status, $?
+  assert_true $?.frozen?
   assert_equal pid, $?.pid
   assert_true $?.exited?
   assert_equal 3, $?.exitstatus
@@ -382,6 +469,23 @@ assert('Process.waitpid with no child to wait for') do
   Process.waitpid(pid)
   assert_raise(Errno::ECHILD) { Process.waitpid(pid) }
   io.close
+end
+
+assert('Process.kill reports the error by itself') do
+  # Signalling names no object either, so its message is the error alone.  A
+  # reaped pid is one nothing answers to any more, which is how the failure is
+  # reached without naming a process that might belong to someone else.
+  skip ProcessTestUtil.child_reason if ProcessTestUtil.child_reason
+  io = ProcessTestUtil.spawn("exit 0")
+  skip "IO.popen is not available" unless io
+
+  io.read
+  pid = io.pid
+  Process.waitpid(pid)
+  io.close
+
+  e = assert_raise(Errno::ESRCH) { Process.kill(0, pid) }
+  assert_equal SystemCallError.new(e.errno).message, e.message
 end
 
 assert('Process.wait') do
@@ -443,8 +547,9 @@ assert('Process.wait2 with Process::WNOHANG') do
 end
 
 assert('$? after IO.popen') do
-  # mruby-io sets $? through Process::Status.new(pid, raw_status) when this
-  # gem is present.  Neither gem depends on the other; this is the seam.
+  # mruby-io builds the status it sets $? to when this gem is present, by
+  # allocating one and initializing it with the pid and the raw status.
+  # Neither gem depends on the other; this is the seam.
   skip ProcessTestUtil.child_reason if ProcessTestUtil.child_reason
   io = ProcessTestUtil.spawn("exit 0")
   skip "IO.popen is not available" unless io

@@ -117,7 +117,7 @@ signal_to_number(mrb_state *mrb, mrb_value sig)
     len -= 3;
   }
   if ((size_t)len >= sizeof(bare)) {
-    mrb_raise(mrb, E_ARGUMENT_ERROR, "bad signal name");
+    mrb_raisef(mrb, E_ARGUMENT_ERROR, "unsupported signal 'SIG%l'", name, (size_t)len);
   }
   /* The HAL takes a C string, and `name` is a slice of a longer one. */
   memcpy(bare, name, (size_t)len);
@@ -206,7 +206,12 @@ process_kill(mrb_state *mrb, mrb_value self)
   for (i = 0; i < argc; i++) {
     mrb_int pid = mrb_process_int_arg(mrb, mrb_as_int(mrb, pids[i]), "pid");
     if (mrb_hal_process_kill(mrb, pid, signo) != 0) {
-      mrb_sys_fail(mrb, "kill");
+      /* What a SystemCallError message carries after the error itself is the
+         object the call was working on, the way `File.open` names the path it
+         could not open.  Signalling a process works on no such object, and
+         CRuby names nothing here.  Passing the name of the call instead would
+         put a word in the message that CRuby never prints. */
+      mrb_sys_fail(mrb, NULL);
     }
   }
   return mrb_int_value(mrb, argc);
@@ -231,11 +236,12 @@ wait_for_child(mrb_state *mrb, mrb_value *statusp)
      every port refuses the same values. */
   if (flags < 0 || (flags & ~(mrb_int)MRB_PROCESS_WAIT_FLAGS) != 0) {
     errno = EINVAL;
-    mrb_sys_fail(mrb, "waitpid");
+    mrb_sys_fail(mrb, NULL);
   }
 
+  /* A wait names no object either, so both failures report the error alone. */
   if (mrb_hal_process_waitpid(mrb, pid, (unsigned int)flags, &result_pid, &raw_status) != 0) {
-    mrb_sys_fail(mrb, "waitpid");
+    mrb_sys_fail(mrb, NULL);
   }
   if (result_pid == 0) {
     /* MRB_PROCESS_WAIT_NOHANG and nothing had finished */

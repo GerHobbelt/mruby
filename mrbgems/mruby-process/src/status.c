@@ -9,10 +9,12 @@
 ** Ruby side never grows its own idea of what the bits mean and a status
 ** built elsewhere reads exactly as one this gem reaped.
 **
-** That "built elsewhere" is the point of keeping `Process::Status.new(pid,
-** raw_status)` a working construction path: mruby-io's `IO.popen` sets `$?`
-** that way when this gem happens to be present, and it must keep working
-** without either gem depending on the other.
+** That "built elsewhere" is mruby-io: its `IO.popen` sets `$?` with a status
+** it builds when this gem happens to be present, and that has to keep
+** working without either gem depending on the other.  `Process::Status.new`
+** is undefined here as it is in CRuby, so the seam is not a constructor but
+** the allocate-and-#initialize pair `mrb_obj_new()` performs, which is also
+** how Process.waitpid builds the status it publishes.
 */
 
 #include <mruby.h>
@@ -51,8 +53,8 @@ status_class(mrb_state *mrb)
 static void
 status_decode(mrb_state *mrb, mrb_value self, mrb_process_status *st)
 {
-  mrb_int pid = status_ivar(mrb, self, MRB_IVSYM(pid));
-  mrb_int raw = status_ivar(mrb, self, MRB_IVSYM(status));
+  mrb_int pid = status_ivar(mrb, self, MRB_SYM(pid));
+  mrb_int raw = status_ivar(mrb, self, MRB_SYM(status));
 
   mrb_hal_process_status_decode(mrb, pid, raw, st);
 }
@@ -67,12 +69,19 @@ status_flag(mrb_state *mrb, mrb_value self, unsigned int flag)
 }
 
 /*
- * call-seq:
- *   Process::Status.new(pid, raw_status) -> status
- *
  * Wraps a platform wait status for the process +pid+.  +raw_status+ is the
  * value the platform reported the process with, as Process.waitpid passes
  * on and as Process::Status#to_i gives back.
+ *
+ * Reached by allocating an instance and initializing it rather than through
+ * `new`, which this class does not have.  Private, as mruby makes every
+ * #initialize.
+ *
+ * A Process::Status is frozen once built, as CRuby freezes the one it leaves
+ * in <code>$?</code>.  What a process did is over by the time there is a
+ * status for it, and every question a status answers is read back from the
+ * two integers set here.  An instance of a subclass is left unfrozen, since
+ * whatever else it is made of is set after this returns.
  */
 static mrb_value
 status_initialize(mrb_state *mrb, mrb_value self)
@@ -86,8 +95,22 @@ status_initialize(mrb_state *mrb, mrb_value self)
      read the low half of it.  The pid needs no such check, since it is
      carried and handed back whole rather than narrowed. */
   mrb_process_int_arg(mrb, raw_status, "status");
-  mrb_iv_set(mrb, self, MRB_IVSYM(pid), mrb_int_value(mrb, pid));
-  mrb_iv_set(mrb, self, MRB_IVSYM(status), mrb_int_value(mrb, raw_status));
+  mrb_iv_set(mrb, self, MRB_SYM(pid), mrb_int_value(mrb, pid));
+  mrb_iv_set(mrb, self, MRB_SYM(status), mrb_int_value(mrb, raw_status));
+  /* Last, since the two above are what there is to write.  A second
+     #initialize on the same object is refused from here on, which is what
+     freezing a value means and not a case this gem's own paths reach.
+
+     Only when the object is a Process::Status and nothing more.  A subclass
+     is still being built when this returns: its own #initialize called super
+     to have the two set and goes on to set whatever else it is made of, and
+     freezing here would turn that into a FrozenError.  Every status this gem
+     and mruby-io publish through `$?` is of this exact class, so the ones
+     that answer for a reaped process are the ones that are frozen.  CRuby's
+     Range does the same, freezing in #initialize only what is a Range. */
+  if (mrb_obj_class(mrb, self) == status_class(mrb)) {
+    mrb_obj_freeze(mrb, self);
+  }
   return self;
 }
 
@@ -100,7 +123,7 @@ status_initialize(mrb_state *mrb, mrb_value self)
 static mrb_value
 status_pid(mrb_state *mrb, mrb_value self)
 {
-  return mrb_int_value(mrb, status_ivar(mrb, self, MRB_IVSYM(pid)));
+  return mrb_int_value(mrb, status_ivar(mrb, self, MRB_SYM(pid)));
 }
 
 /*
@@ -113,7 +136,7 @@ status_pid(mrb_state *mrb, mrb_value self)
 static mrb_value
 status_to_i(mrb_state *mrb, mrb_value self)
 {
-  return mrb_int_value(mrb, status_ivar(mrb, self, MRB_IVSYM(status)));
+  return mrb_int_value(mrb, status_ivar(mrb, self, MRB_SYM(status)));
 }
 
 /*
@@ -225,7 +248,7 @@ status_coredump_p(mrb_state *mrb, mrb_value self)
 static mrb_value
 status_eq(mrb_state *mrb, mrb_value self)
 {
-  mrb_value raw = mrb_int_value(mrb, status_ivar(mrb, self, MRB_IVSYM(status)));
+  mrb_value raw = mrb_int_value(mrb, status_ivar(mrb, self, MRB_SYM(status)));
   mrb_value other;
 
   mrb_get_args(mrb, "o", &other);
@@ -237,7 +260,7 @@ status_eq(mrb_state *mrb, mrb_value self)
      one, and CRuby's way round reaches it through whichever #== the object
      carries. */
   if (mrb_obj_is_kind_of(mrb, other, status_class(mrb))) {
-    other = mrb_int_value(mrb, status_ivar(mrb, other, MRB_IVSYM(status)));
+    other = mrb_int_value(mrb, status_ivar(mrb, other, MRB_SYM(status)));
   }
   return mrb_bool_value(mrb_equal(mrb, raw, other));
 }
@@ -355,4 +378,15 @@ mrb_process_status_init(mrb_state *mrb, struct RClass *process)
   mrb_define_method_id(mrb, status, MRB_SYM(stopsig),    status_stopsig,    MRB_ARGS_NONE());
   mrb_define_method_id(mrb, status, MRB_SYM_Q(coredump), status_coredump_p, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, status, MRB_OPSYM(eq),       status_eq,         MRB_ARGS_REQ(1));
+
+  /* A status reports something that happened, so one written by hand reports
+     nothing: CRuby undefines `new` on the class for that reason, and the call
+     raises there as it now does here.  What is left is #initialize, which
+     mrb_obj_new() calls without asking for `new`: the path Process.waitpid
+     takes, and the one mruby-io takes to set `$?`.  MRB_UNDEF_ALLOCATOR() is
+     not set beside this, the way Data and Complex set it, because
+     mrb_obj_new() allocates through it and marking it undefined would close
+     that path too.  CRuby leaves its allocator alone as well; what it takes
+     away is the constructor. */
+  mrb_undef_class_method_id(mrb, status, MRB_SYM(new));
 }
