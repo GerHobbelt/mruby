@@ -1214,19 +1214,30 @@ mrb_cv_defined(mrb_state *mrb, mrb_value mod, mrb_sym sym)
   return mrb_mod_cv_defined(mrb, mrb_class_ptr(mod), sym);
 }
 
+/* The class a class variable written in the scope of `p` is read from: the
+   nearest cref on the `upper` chain, as mrb_vm_cref_class() finds it, with a
+   singleton class passed over.  A block is not a cref and carries the class
+   of the frame it was made in, which is the receiver's class where that
+   frame was given one to run under, as a `Class.new` or `class_eval` block
+   is; the variable is read from the scope the block was written in, as
+   under the cref CRuby skips.  A method written in such a block carries the
+   given class for a `def` and is passed over the same way.  Off the end of
+   the chain the variable is read from `Object`, as at the top level. */
+static struct RClass*
+cv_scope_class(mrb_state *mrb, const struct RProc *p)
+{
+  for (; p && !MRB_PROC_CFUNC_P(p); p = p->upper) {
+    if (!MRB_PROC_CREF_P(p) || MRB_PROC_GIVEN_P(p)) continue;
+    struct RClass *c = MRB_PROC_TARGET_CLASS(p);
+    if (c && c->tt != MRB_TT_SCLASS) return c;
+  }
+  return mrb->object_class;
+}
+
 mrb_value
 mrb_vm_cv_get(mrb_state *mrb, mrb_sym sym)
 {
-  struct RClass *c;
-
-  const struct RProc *p = mrb->c->ci->proc;
-
-  for (;;) {
-    c = MRB_PROC_TARGET_CLASS(p);
-    if (c && c->tt != MRB_TT_SCLASS) break;
-    p = p->upper;
-  }
-  return mrb_mod_cv_get(mrb, c, sym);
+  return mrb_mod_cv_get(mrb, cv_scope_class(mrb, mrb->c->ci->proc), sym);
 }
 
 /* Non-raising class-variable lookup for `defined?(@@v)`. Resolves the class
@@ -1235,29 +1246,13 @@ mrb_vm_cv_get(mrb_state *mrb, mrb_sym sym)
 mrb_bool
 mrb_vm_cv_defined_p(mrb_state *mrb, const struct RProc *proc, mrb_sym sym)
 {
-  struct RClass *c;
-
-  for (;;) {
-    c = MRB_PROC_TARGET_CLASS(proc);
-    if (c && c->tt != MRB_TT_SCLASS) break;
-    proc = proc->upper;
-    if (!proc) { c = mrb->object_class; break; }
-  }
-  return mrb_mod_cv_defined(mrb, c, sym);
+  return mrb_mod_cv_defined(mrb, cv_scope_class(mrb, proc), sym);
 }
 
 void
 mrb_vm_cv_set(mrb_state *mrb, mrb_sym sym, mrb_value v)
 {
-  struct RClass *c;
-  const struct RProc *p = mrb->c->ci->proc;
-
-  for (;;) {
-    c = MRB_PROC_TARGET_CLASS(p);
-    if (c && c->tt != MRB_TT_SCLASS) break;
-    p = p->upper;
-  }
-  mrb_mod_cv_set(mrb, c, sym, v);
+  mrb_mod_cv_set(mrb, cv_scope_class(mrb, mrb->c->ci->proc), sym, v);
 }
 
 static void
@@ -1364,10 +1359,15 @@ proc_class(mrb_state *mrb, const struct RProc *proc)
    is a scope, as its cref is in CRuby. The caller leaves out the proc
    with no `upper`, the top level: it is not a scope of its own, and
    its class is reached through the ancestors after the lexical scopes,
-   so that a superclass wins over a top-level constant. */
+   so that a superclass wins over a top-level constant.  A method written
+   in a block given a class carries that class for a `def` in its body and
+   is not a scope for the walk, as the cref CRuby pushes for such a block
+   is skipped: the class the block was given is not where a constant in
+   the method is read from. */
 static mrb_bool
 lexical_scope_p(mrb_state *mrb, const struct RProc *proc)
 {
+  if (MRB_PROC_GIVEN_P(proc)) return FALSE;
   if (MRB_PROC_SCOPE_P(proc)) return TRUE;
   return proc_class(mrb, proc) != proc_class(mrb, proc->upper);
 }
@@ -1486,6 +1486,19 @@ mrb_const_cache_clear(mrb_state *mrb)
 
   for (int i=0; i<MRB_CONST_CACHE_SIZE; cc++,i++) {
     cc->irep = NULL;
+  }
+}
+
+/* Forget the entries of one irep before its memory is freed. The cache is
+   keyed by the irep's address, so the next irep allocated at that address
+   would otherwise inherit answers resolved in another scope. */
+void
+mrb_const_cache_forget_irep(mrb_state *mrb, const mrb_irep *irep)
+{
+  struct mrb_const_cache_entry *cc = mrb->const_cache;
+
+  for (int i=0; i<MRB_CONST_CACHE_SIZE; cc++,i++) {
+    if (cc->irep == irep) cc->irep = NULL;
   }
 }
 #endif

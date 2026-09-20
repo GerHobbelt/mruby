@@ -3007,11 +3007,11 @@ vm_op_div(mrb_state *mrb, uint32_t a, mrb_sym *midp)
 static mrb_sym
 vm_define_method(mrb_state *mrb, struct RClass *tc, const mrb_irep *irep, uint16_t b, uint16_t c, uint32_t vis)
 {
-  struct RProc *p = mrb_proc_new(mrb, irep->reps[c]);
+  struct RProc *p = mrb_method_proc_new(mrb, irep->reps[c]);
   mrb_sym mid = irep->syms[b];
   mrb_method_t m;
 
-  p->flags |= MRB_PROC_SCOPE | MRB_PROC_STRICT | MRB_PROC_CREF;
+  p->flags |= MRB_PROC_STRICT;
   MRB_METHOD_FROM_PROC(m, p);
   MRB_METHOD_SET_VISIBILITY(m, vis);
   mrb_define_method_raw(mrb, tc, mid, m);
@@ -3724,20 +3724,36 @@ RETRY_TRY_BLOCK:
         ci->mid = mid;
         /* visibility is checked only when the method is actually found;
            the `method_missing` fallback dispatches regardless of its own
-           visibility, as in CRuby */
-        if (insn == OP_SEND || insn == OP_SEND0 || insn == OP_SENDB) {
-          mrb_bool priv = TRUE;
-          if (m.flags & MRB_METHOD_PRIVATE_FL) {
-          vis_err:;
-            mrb_value args = (ci->n == 15) ? regs[1] : mrb_ary_new_from_values(mrb, ci->n, regs+1);
-            vis_error(mrb, mid, args, recv, priv);
+           visibility, as in CRuby. A call on a written `self` is exempt,
+           which OP_SSEND says of a named call. The send an operator
+           instruction falls back to has no operand that says how its
+           receiver was written, so it is exempt while the receiver is the
+           caller's own `self`: that admits `x = self; x[0] = 1`, which CRuby
+           rejects, and no other receiver. */
+        if (mrb_unlikely(m.flags & (MRB_METHOD_PRIVATE_FL | MRB_METHOD_PROTECTED_FL))) {
+          mrb_bool exempt;
+          if (insn == OP_SEND || insn == OP_SEND0 || insn == OP_SENDB) {
+            exempt = FALSE;
           }
-          /* protected methods are callable when the caller's `self` belongs
-             to the class (or module) where the method is defined */
-          else if ((m.flags & MRB_METHOD_PROTECTED_FL) &&
-                   !mrb_obj_is_kind_of(mrb, ci[-1].stack[0], ci->u.target_class)) {
-            priv = FALSE;
-            goto vis_err;
+          else if (insn == OP_SSEND || insn == OP_SSEND0 || insn == OP_SSENDB || insn == OP_SUPER) {
+            exempt = TRUE;
+          }
+          else {
+            exempt = mrb_obj_eq(mrb, recv, ci[-1].stack[0]);
+          }
+          if (!exempt) {
+            mrb_bool priv = TRUE;
+            if (m.flags & MRB_METHOD_PRIVATE_FL) {
+            vis_err:;
+              mrb_value args = (ci->n == 15) ? regs[1] : mrb_ary_new_from_values(mrb, ci->n, regs+1);
+              vis_error(mrb, mid, args, recv, priv);
+            }
+            /* protected methods are callable when the caller's `self` belongs
+               to the class (or module) where the method is defined */
+            else if (!mrb_obj_is_kind_of(mrb, ci[-1].stack[0], ci->u.target_class)) {
+              priv = FALSE;
+              goto vis_err;
+            }
           }
         }
       }
@@ -4603,8 +4619,7 @@ RETRY_TRY_BLOCK:
       }
       else {
         /* OP_METHOD is the only one here without OP_L_CAPTURE: a method body */
-        p = mrb_proc_new(mrb, nirep);
-        p->flags |= MRB_PROC_SCOPE | MRB_PROC_CREF;
+        p = mrb_method_proc_new(mrb, nirep);
       }
       if (c & OP_L_STRICT) p->flags |= MRB_PROC_STRICT;
       regs[a] = mrb_obj_value(p);

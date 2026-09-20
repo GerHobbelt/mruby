@@ -391,7 +391,6 @@ uint32_t mrb_str_hash(mrb_state *mrb, mrb_value str);
 mrb_value mrb_str_dump(mrb_state *mrb, mrb_value str);
 mrb_value mrb_str_inspect(mrb_state *mrb, mrb_value str);
 mrb_bool mrb_str_beg_len(mrb_int str_len, mrb_int *begp, mrb_int *lenp);
-mrb_value mrb_str_byte_subseq(mrb_state *mrb, mrb_value str, mrb_int beg, mrb_int len);
 mrb_value mrb_str_aref(mrb_state *mrb, mrb_value str, mrb_value idx, mrb_value len);
 void mrb_str_aset(mrb_state *mrb, mrb_value str, mrb_value idx, mrb_value len, mrb_value replace);
 
@@ -579,7 +578,14 @@ enum mrb_case_mode {
    or empty. A caller takes -1 as "the ASCII loop I have is the whole answer",
    which is what every build without the tables answers to every string.
    `swapcase` lives in mruby-string-ext and reaches the tables through this, so
-   they are asked about in one place. */
+   they are asked about in one place.
+   The walk raises rather than answering in two cases: `ArgumentError` for a
+   run of bytes that spells no character, which is what CRuby answers for the
+   same input, and `FrozenError` for a frozen receiver it would convert, raised
+   before anything is read. A string it answers -1 for is not looked at for
+   freezing: the caller's own loop is the one that writes it, and the one that
+   refuses it. A refused conversion leaves the receiver as it was: the answer
+   is built beside the string and taken only at the end. */
 #if defined(MRB_UTF8_STRING) && !defined(MRB_USE_ASCII_CTYPE)
 int mrb_str_case_convert_unicode(mrb_state *mrb, mrb_value str, enum mrb_case_mode mode);
 #else
@@ -651,6 +657,12 @@ void mrb_uni_case_unfold_range(uint32_t lo, uint32_t hi,
 mrb_value mrb_attr_reader(mrb_state *mrb, mrb_value obj);
 mrb_value mrb_attr_writer(mrb_state *mrb, mrb_value obj);
 
+/* symbol */
+/* How many symbols are preallocated, the largest of their numbers; a
+   dynamic symbol is numbered from there. The count is a macro of the presym
+   table header, which symbol.c alone includes (see there). */
+mrb_sym mrb_presym_max(void);
+
 /* variable */
 mrb_value mrb_vm_special_get(mrb_state*, mrb_sym);
 void mrb_vm_special_set(mrb_state*, mrb_sym, mrb_value);
@@ -663,6 +675,12 @@ mrb_value mrb_const_get_noraise(mrb_state *mrb, struct RClass *mod, mrb_sym sym)
 mrb_bool mrb_vm_cv_defined_p(mrb_state *mrb, const struct RProc *proc, mrb_sym sym);
 struct RClass *mrb_vm_cref_class(mrb_state *mrb, mrb_callinfo *ci);
 struct RClass *mrb_vm_definee_class(mrb_state *mrb, mrb_callinfo *ci);
+#ifndef MRB_NO_CONST_CACHE
+void mrb_const_cache_forget_irep(mrb_state *mrb, const struct mrb_irep *irep);
+#else
+#define mrb_const_cache_forget_irep(mrb, irep) ((void)0)
+#endif
+struct RProc *mrb_method_proc_new(mrb_state *mrb, const mrb_irep *irep);
 mrb_bool mrb_gv_defined(mrb_state *mrb, mrb_sym sym);
 #ifdef MRUBY_VARIABLE_H
 void mrb_gv_foreach(mrb_state *mrb, mrb_iv_foreach_func *func, void *p);

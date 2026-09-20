@@ -737,3 +737,91 @@ assert('a string given to eval runs under the class the calling frame runs under
   assert_true Object.const_defined?(:EvalFrameClassConst, false)
   assert_false k.const_defined?(:EvalFrameClassConst, false)
 end
+
+module EvalGivenMethodMaker
+  # Run in a method, so that the block's cref is this module rather than the
+  # class `mrb_proc_new()` falls back to when a block at the top level of a
+  # compiled test file has no cref to answer with.
+  def self.klass
+    Class.new do
+      def in_string; eval("def from_string; end"); end
+      def in_binding; eval("def from_binding; end", binding); end
+    end
+  end
+end
+
+assert('a `def` in a string evaluated in a method written in a block given a class adds to that class') do
+  # The string's frame runs under the class the method was found in, and the
+  # method carries the class its block was given, so the `def` lands where
+  # one written in the method body does.
+  c = EvalGivenMethodMaker.klass
+  c.new.in_string
+  c.new.in_binding
+  assert_equal [:from_binding, :from_string, :in_binding, :in_string], c.instance_methods(false).sort
+  assert_false Object.new.respond_to?(:from_string, true)
+  assert_false Object.new.respond_to?(:from_binding, true)
+end
+
+module ConstCacheIrepReuse
+  X = :outer
+  class Inner
+    X = :inner
+  end
+end
+
+assert('constant read by an eval whose irep took a freed irep\'s address') do
+  # The constant cache is keyed by the irep's address. Once the irep of one
+  # eval string is collected, the next eval string can be compiled into the
+  # same address, and a read of the same constant name from another scope
+  # used to be answered from the stale entry.
+  seen = []
+  8.times do
+    seen << [ConstCacheIrepReuse::Inner.class_eval("X"),
+             ConstCacheIrepReuse.class_eval("X")]
+    GC.start
+  end
+  assert_equal [[:inner, :outer]] * 8, seen
+end
+
+ConstCacheTestValue = :probe
+
+assert('the constant cache forgets an irep when the irep is freed') do
+  # Same defect as above, seen from the cache itself: after the irep of a
+  # constant read is freed no entry may still be keyed by its address,
+  # whatever the allocator does with that address next.
+  dangles = ConstCacheTest.dangles_after_irep_free?("ConstCacheTestValue")
+  skip "this build has no constant cache" if dangles.nil?
+  assert_false dangles
+end
+
+assert('eval of a pattern deeper than the compiler walks') do
+  # A pattern is walked by a recursion of its own, which nothing bounded: a
+  # pattern nested as deep as it is written ran the compiler off the C stack,
+  # and the walk that gave the tree back afterwards would have too. It goes
+  # on the count the rest of the compiler keeps, and the tree comes from an
+  # arena that is given back in one piece rather than walked.
+  #
+  # Deep enough that the walk this replaces would not have survived it on the
+  # megabyte of stack Windows gives a thread.
+  assert_raise(SyntaxError) { eval("SOK  =>_xec" * 60000) }
+  # the compiler is still there afterwards, and an ordinary pattern still
+  # compiles and matches
+  assert_equal [1, 2], eval("q = [1, 2]; q => [a, b]; [a, b]")
+  assert_true eval("({k: 1} in {k:})")
+end
+
+assert('eval of a nesting Prism would recurse through') do
+  # Prism refuses to parse deeper than PRISM_DEPTH_MAXIMUM where it parses an
+  # expression, but the walk over a pattern carries the count without ever
+  # reading it, so a pattern nested as deep as it is written recursed until
+  # the C stack ran out. The brackets the lexer opens are counted instead,
+  # and the one past the limit is given to the parser as the end of input.
+  assert_raise(SyntaxError) { eval("case 1\nin " + "[" * 100000 + "1" + "]" * 100000 + " then 1\nend") }
+  assert_raise(SyntaxError) { eval("case 1\nin " + "{a: " * 100000 + "1" + "}" * 100000 + " then 1\nend") }
+  # a nesting Prism accepts is parsed as before, and the count is per compile
+  a = eval("[" * 250 + "1" + "]" * 250)
+  250.times { a = a[0] }
+  assert_equal 1, a
+  assert_equal 2, eval("[1].map { |v| eval('[[[2]]]')[0][0][0] }[0]")
+  assert_equal [1, 2], eval("q = [1, 2]; q => [a, b]; [a, b]")
+end
