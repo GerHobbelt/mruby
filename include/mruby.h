@@ -172,8 +172,8 @@ typedef struct mrb_irep mrb_irep;
 #endif
 
 typedef struct {
-  uint8_t n:4;                  /* (15=*) c=n|nk<<4 */
-  uint8_t nk:4;                 /* (15=*) */
+  uint8_t n:4;                  /* number of positional arguments; 15 means packed arguments */
+  uint8_t kw:1;                 /* has keyword arguments (TRUE or FALSE) */
   uint8_t cci;                  /* called from C function */
   uint8_t vis;                  /* 4(ZERO):1(module_function):1(separate module):2(method visibility) */
                                 /* under 3-bit flags are copied to env, and after that, env takes precedence */
@@ -209,6 +209,23 @@ struct mrb_context {
 
   mrb_callinfo *ci;
   mrb_callinfo *cibase, *ciend;
+
+  /* One entry per call frame, indexed the way the frame is: `svars[ci -
+     cibase]`.  It holds what that frame's scope carries as special variables
+     (CRuby's svar): a keyed container (struct RSvar), or, for a frame with no
+     scope of its own, the env of the scope it resolves to -- the forward the
+     same slot of an escaped env carries (see mrb_svar_frame_container() in
+     vm.c), which is why the entries are typed by what both are rather than by
+     one.  The core stores and marks them; each key's meaning belongs to
+     whoever registers the matching virtual global (see mrb_vm_svar_get()).
+
+     Kept beside the frames rather than in them: a mrb_callinfo is 48 bytes
+     with nothing spare, and a frame that carries no special variable is the
+     overwhelming case.  NULL until a first write needs one, so a program that
+     never touches `$~` pays this pointer and nothing else, where a field
+     would have cost every frame of every call stack eight bytes.  Grown with
+     cibase and freed with it. */
+  struct RBasic **svars;
 
   enum mrb_fiber_state status : 4;
   mrb_bool vmexec : 1;
@@ -352,6 +369,12 @@ struct mrb_state {
   struct RClass *nil_class;
   struct RClass *symbol_class;
   struct RClass *kernel_module;
+
+  /* Whether any special variable has been written in this state.  While it
+     is false no frame can be carrying one, so the per-context arrays behind
+     mrb_ci_svar() are not made: a build with a gem that registers a virtual
+     global still pays nothing until a program actually writes through it. */
+  mrb_bool svar_used;
 
   mrb_gc gc;
 

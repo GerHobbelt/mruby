@@ -132,6 +132,12 @@ assert("MatchData#begin / #end - group name") do
   assert_raise(IndexError) { md.end("zz") }
   # a pattern without any named group raises just the same
   assert_raise(IndexError) { /(a)/.match("a").begin(:zz) }
+  # a name the pattern gives to several groups reads the last one that took
+  # part in the match, nil when none of them did
+  assert_equal [0, 2], [/(?<y>ab)|(?<y>c)/.match("ab").begin(:y),
+                        /(?<y>ab)|(?<y>c)/.match("ab").end(:y)]
+  assert_equal 1, /(?<y>ab)|(?<y>c)/.match("c").end(:y)
+  assert_nil /(?<y>a)(?<y>b)|c/.match("c").begin(:y)
 end
 
 assert("MatchData#begin / #end - index out of matches") do
@@ -196,6 +202,14 @@ assert("MatchData#[] - undefined group name") do
   assert_raise(IndexError) { /(a)/.match("a")[:zz] }
 end
 
+assert("MatchData#[] - a name given to several groups") do
+  # a name the pattern gives to several groups reads the last one that took
+  # part in the match, nil when none of them did
+  assert_equal "b", /(?<x>a)|(?<x>b)/.match("b")[:x]
+  assert_equal "a", /(?<x>a)|(?<x>b)/.match("a")[:x]
+  assert_nil /(?<x>a)(?<y>b)|c/.match("c")[:x]
+end
+
 assert("MatchData#[] - group name longer than a uint16 length") do
   # Regression: the length test truncated the requested length to uint16_t
   # while the memcmp() next to it did not, so (uint16_t)65539 == 3 ==
@@ -204,6 +218,85 @@ assert("MatchData#[] - group name longer than a uint16 length") do
   md = /(?<abc>x)/.match("x")
   assert_raise(IndexError) { md["abc" + "A" * 65536] }
   assert_equal "x", md[:abc]
+end
+
+assert("MatchData#values_at") do
+  md = /(a)(b)/.match("ab")
+  assert_equal [], md.values_at
+  assert_equal ["a", "b"], md.values_at(1, 2)
+  assert_equal ["ab"], md.values_at(0)
+  assert_equal ["ab", "a", "b"], md.values_at(0, 1, 2)
+  # an index out of range and a group that did not participate both read nil
+  assert_equal ["b", nil, nil], md.values_at(-1, 3, 5)
+  assert_equal ["a", nil], /(a)|(b)/.match("a").values_at(1, 2)
+  # a group that took part in the match with an empty string reads "", not
+  # the nil a group that did not take part reads
+  assert_equal ["b", ""], /(a?)b/.match("b").values_at(0, 1)
+  # a negative index counts back the way MatchData#[] does, never reaching
+  # the whole match
+  assert_equal ["a", nil, nil], md.values_at(-2, -3, -4)
+  # a Float reads the group its integer part names
+  if Object.const_defined?(:Float)
+    assert_equal ["a"], md.values_at(1.5)
+    assert_equal ["a", "ab"], md.values_at(1.5, 0)
+  end
+  # a pattern without capture groups carries only the whole match, so a
+  # negative index reads nil where a range still reaches the match
+  m = /a/.match("a")
+  assert_equal ["a"], m.values_at(0)
+  assert_equal [nil, nil], m.values_at(1, -1)
+  assert_equal ["a"], m.values_at(0..-1)
+  assert_raise(RangeError) { m.values_at(-2..-1) }
+end
+
+assert("MatchData#values_at - group name") do
+  md = /(?<x>a)(?<y>b)/.match("ab")
+  assert_equal ["a", "b"], md.values_at(:x, :y)
+  assert_equal ["b", "a"], md.values_at(:y, "x")
+  # a String is a group name, not a number
+  assert_raise(IndexError) { md.values_at("1") }
+  # a name the pattern does not carry raises, as in MatchData#[]
+  assert_raise(IndexError) { md.values_at(:zz) }
+  assert_raise(IndexError) { /(a)/.match("a").values_at(:zz) }
+  # a named group that did not take part in the match reads nil
+  assert_equal ["b", nil], /(?<x>a)|(?<y>b)/.match("b").values_at(:y, :x)
+  # a name the pattern gives to several groups reads the last one that took
+  # part in the match, the way MatchData#[] does
+  assert_equal ["b"], /(?<x>a)|(?<x>b)/.match("b").values_at(:x)
+  assert_equal ["a"], /(?<x>a)|(?<x>b)/.match("a").values_at(:x)
+  assert_equal [nil], /(?<x>a)(?<y>b)|c/.match("c").values_at(:x)
+end
+
+assert("MatchData#values_at - range") do
+  md = /(a)(b)/.match("ab")
+  assert_equal ["a", "b"], md.values_at(1..2)
+  # an exclusive end stops before its bound, negative or not
+  assert_equal ["a"], md.values_at(1...2)
+  assert_equal ["ab", "a"], md.values_at(-3...-1)
+  # positions past the last group pad nil, as Array#values_at does
+  assert_equal ["a", "b", nil, nil, nil], md.values_at(1..5)
+  assert_equal [nil, nil, nil], md.values_at(5..7)
+  assert_equal [], md.values_at(2..1)
+  assert_equal [], md.values_at(4..)
+  # a negative bound counts back the way an Array index does, so a range can
+  # reach the whole match where a negative index cannot
+  assert_equal ["ab", "a", "b"], md.values_at(-3..-1)
+  assert_equal ["ab", "a", "b"], md.values_at(0..-1)
+  assert_equal [], md.values_at(-2..0)
+  assert_equal ["b"], md.values_at(-1..)
+  assert_equal ["b", nil, nil, nil], md.values_at(-1..5)
+  assert_equal ["a"], md.values_at(-2..-2)
+  assert_equal ["a", nil], /(a)|(b)/.match("a").values_at(1..2)
+  # a range that starts before the match raises, as Array#[] does
+  assert_raise(RangeError) { md.values_at(-4..-1) }
+  assert_raise(RangeError) { md.values_at(-10..-3) }
+end
+
+assert("MatchData#values_at - a bad argument") do
+  md = /(a)(b)/.match("ab")
+  assert_raise(TypeError) { md.values_at(nil) }
+  assert_raise(TypeError) { md.values_at([1, 2]) }
+  assert_raise(TypeError) { md.values_at(true) }
 end
 
 assert("MatchData#begin / #end - group name longer than a stored name") do
@@ -383,12 +476,10 @@ assert("the five names read the match, not the methods that read it") do
 end
 
 assert("the five names read whatever answers the private names") do
-  # They are sends, so they read what the `$~` in hand answers, MatchData or
-  # not. CRuby's setter refuses a `$~` that is not a MatchData and mruby has
-  # no hook on a global write to refuse from, so the private names buy one
-  # thing only: an accident (a `$~` holding an Array, a redefined
-  # `MatchData#[]`) is not read as a match. Rewriting the readings themselves
-  # is still asking for what comes back.
+  # They are sends, so they read what the `$~` in hand answers. The setter
+  # refuses anything that is not a MatchData (below), so the private names
+  # buy one thing: a redefined `MatchData#[]` is not read as a match.
+  # Rewriting the readings themselves is still asking for what comes back.
   /(b)(c)?/ =~ "abz"
   md = $~
   def md.__group(n)
@@ -398,41 +489,17 @@ assert("the five names read whatever answers the private names") do
   assert_equal "PWNED1", $1
   assert_equal "a", $`
   assert_equal "b", $+
-
-  # a stand-in that never was a match reads the same way
-  begin
-    fake = Object.new
-    def fake.__group(n)
-      "FAKE#{n}"
-    end
-    def fake.__pre_match
-      "FAKEPRE"
-    end
-    $~ = fake
-    assert_equal "FAKE0", $&
-    assert_equal "FAKE1", $1
-    assert_equal "FAKEPRE", $`
-  ensure
-    $~ = nil
-  end
 end
 
-assert("$& and $1 onward refuse a $~ that is not a MatchData") do
-  # `$~` is a plain global and takes any value, where CRuby's setter raises
-  # TypeError. A value that answers `[]` would answer `$1` as well were the
-  # names derived with `[]`, so they ask for the group by a name a MatchData
-  # alone carries and a wrong `$~` is a NoMethodError rather than an answer.
+assert("$& and $1 onward cannot see a $~ that is not a MatchData") do
+  # The names are derived from `$~`, and the setter is what stands between
+  # them and a wrong value: like CRuby's, it refuses anything but a
+  # MatchData or nil with TypeError at the write, so a `$~` holding an Array
+  # is a state the readers never see, and the refused write changes nothing.
   /(b)(c)?/ =~ "abz"
-  begin
-    $~ = [10, 20, 30]
-    assert_raise(NoMethodError) { $& }
-    assert_raise(NoMethodError) { $1 }
-    assert_raise(NoMethodError) { $+ }
-    assert_raise(NoMethodError) { $` }
-    assert_raise(NoMethodError) { $' }
-  ensure
-    $~ = nil
-  end
+  assert_raise(TypeError) { $~ = [10, 20, 30] }
+  assert_equal "b", $&
+  assert_equal "b", $1
 end
 
 assert("a piece cut from a subject is its own string") do

@@ -272,9 +272,6 @@ mrb_struct_s_def(mrb_state *mrb, mrb_value klass)
   mrb_value keyword_init_val = mrb_nil_value();
 
   mrb_get_args(mrb, "*&", &argv, &argc, &b);
-  if (argc == 0) {
-    mrb_raise(mrb, E_ARGUMENT_ERROR, "wrong number of arguments (given 0, expected 1+)");
-  }
 
   /* Check for keyword_init option in arguments */
   if (argc > 0 && mrb_hash_p(argv[argc-1])) {
@@ -400,7 +397,7 @@ mrb_struct_initialize(mrb_state *mrb, mrb_value self)
 
   if (mrb_test(keyword_init)) { /* keyword_init: true or other truthy value */
     if (argc > 1 || (argc == 1 && !mrb_hash_p(argv[0]))) {
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "wrong arguments, expected keyword arguments");
+      mrb_argnum_error(mrb, argc, 0, 0);
     }
     mrb_value hash = (argc == 1) ? argv[0] : mrb_hash_new(mrb);
     return mrb_struct_init_with_keywords(mrb, hash, self);
@@ -603,9 +600,10 @@ mrb_struct_equal(mrb_state *mrb, mrb_value s)
     return mrb_false_value();
   }
 
-  /* Check for recursion */
+  /* A pair already being compared is taken as equal, as in CRuby's
+     recursive_equal(), and the other members decide the outcome. */
   if (MRB_RECURSIVE_BINARY_FUNC_P(mrb, MRB_OPSYM(eq), s, s2)) {
-    return mrb_false_value();
+    return mrb_true_value();
   }
 
   mrb_int len = RSTRUCT_LEN(s);
@@ -650,9 +648,9 @@ mrb_struct_eql(mrb_state *mrb, mrb_value s)
     return mrb_false_value();
   }
 
-  /* Check for recursion */
+  /* see mrb_struct_equal(): the pair being compared is taken as equal */
   if (MRB_RECURSIVE_BINARY_FUNC_P(mrb, MRB_SYM_Q(eql), s, s2)) {
-    return mrb_false_value();
+    return mrb_true_value();
   }
 
   len = RSTRUCT_LEN(s);

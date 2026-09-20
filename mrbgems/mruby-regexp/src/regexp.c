@@ -11,6 +11,7 @@
 #include <mruby/array.h>
 #include <mruby/variable.h>
 #include <mruby/hash.h>
+#include <mruby/range.h>
 #include <mruby/error.h>
 #include <mruby/internal.h>
 #include "re_internal.h"
@@ -245,30 +246,49 @@ regexp_init_copy(mrb_state *mrb, mrb_value self)
   return re_initialize(mrb, self, src, get_iflags(mrb, orig));
 }
 
-/* Pre-interned symbol for $~ (cached on first use). MRB_GVSYM() takes a
-   word after the `$`, which `~` is not, so this one is looked up once here. */
-static mrb_sym match_sym;
-
-static mrb_sym
-ensure_match_sym(mrb_state *mrb)
-{
-  if (!match_sym) match_sym = mrb_intern_lit(mrb, "$~");
-  return match_sym;
-}
-
 /* $~ is the one name a match publishes. `$&`, `` $` ``, `$'`, `$+` and `$1`
    onward are readings of it that the compiler derives when they are read,
-   so publishing and clearing are each one write of `$~`. */
+   so publishing and clearing are each one write of `$~`.
+
+   The value lives in the owning scope's MRB_SVAR_BACKREF slot, not in the
+   globals table, which is what keeps a method's match out of its caller's
+   `$~`. The engine reaches that slot directly, the way CRuby's re.c and
+   string.c reach rb_backref_set(): the global name is how Ruby code spells
+   the slot, not the route a match publishes through. The pair below is
+   what that spelling needs, and nothing more. */
 static void
 set_match_globals(mrb_state *mrb, mrb_value obj)
 {
-  mrb_gv_set(mrb, ensure_match_sym(mrb), obj);
+  mrb_vm_svar_set(mrb, MRB_SVAR_BACKREF, obj);
 }
 
 static void
 clear_match_globals(mrb_state *mrb)
 {
   set_match_globals(mrb, mrb_nil_value());
+}
+
+/* The virtual-global pair `$~` dispatches to, registered in gem init, so
+   that Ruby code reading or assigning the name lands on the same slot the
+   engine publishes into. The slot is opaque to the core; that it holds a
+   MatchData is this gem's contract, and every value the engine stores is
+   one by construction, which leaves the setter, the only path an arbitrary
+   value arrives by, as the home of CRuby's TypeError for
+   `$~ = <not a MatchData>` (CRuby's match_setter()). */
+static mrb_value
+backref_gv_get(mrb_state *mrb)
+{
+  return mrb_vm_svar_get(mrb, MRB_SVAR_BACKREF);
+}
+
+static void
+backref_gv_set(mrb_state *mrb, mrb_value v)
+{
+  if (!mrb_nil_p(v) && !(mrb_data_p(v) && DATA_TYPE(v) == &matchdata_type)) {
+    mrb_raisef(mrb, E_TYPE_ERROR, "wrong argument type %s (expected MatchData)",
+               mrb_obj_classname(mrb, v));
+  }
+  mrb_vm_svar_set(mrb, MRB_SVAR_BACKREF, v);
 }
 
 /* Byte-based substring extraction. The regexp engine records all capture
@@ -992,33 +1012,42 @@ regexp_escape(mrb_state *mrb, mrb_value self)
   return re_escape_str(mrb, str);
 }
 
-/* Answer the group a pattern gives a name to, or -1 for a name it gives to
-   no group. The name is compared as the bytes the pattern spelled it with.
-   A NULL pattern names nothing, which is the answer for a match made
+/* Answer the group a name refers to in the match the captures stand for, or
+   -1 for a name the pattern gives to no group. A pattern may give one name
+   to several groups, and CRuby's named accessors then read the last of them
+   that took part in the match, so the candidates are walked back to front
+   and the first one that participated is the answer; when none of them took
+   part the last of them stands in, a real group the caller reads as one that
+   did not match. The name is compared as the bytes the pattern spelled it
+   with. A NULL pattern names nothing, which is the answer for a match made
    without a pattern to compile: a literal String one. */
 static int
-re_name_to_group(mrb_regexp_pattern *pat, const char *name, mrb_int name_len)
+re_name_to_group(const int *captures, int ncap, mrb_regexp_pattern *pat,
+                 const char *name, mrb_int name_len)
 {
   /* A stored name never exceeds RE_MAX_NAME_LEN, so a longer request can
      name no group. Rejecting it here keeps the cast in the loop lossless;
      without it the length test truncates while the memcmp() next to it does
      not. */
   if (!pat || !RE_NAME_LEN_FITS(name_len)) return -1;
-  for (uint16_t i = 0; i < pat->num_named; i++) {
+  int fallback = -1;
+  for (int i = pat->num_named - 1; i >= 0; i--) {
     if (pat->named_captures[i].name_len == (uint32_t)name_len &&
         memcmp(pat->named_captures[i].name, name, name_len) == 0) {
-      return pat->named_captures[i].group;
+      int group = pat->named_captures[i].group;
+      if (fallback < 0) fallback = group;
+      if (group < ncap && captures[group * 2] >= 0) return group;
     }
   }
-  return -1;
+  return fallback;
 }
 
 /* --- MatchData methods --- */
 
 /* Resolve a String or Symbol to the group it names. Shared by MatchData#[],
-   #begin and #end: the three disagree about what an out-of-range integer
-   means, but a name is looked up the same way for all of them. Does not
-   return when the name reaches no group. */
+   #begin, #end and #values_at: they disagree about what an out-of-range
+   integer means, but a name is looked up the same way for all of them. Does
+   not return when the name reaches no group. */
 static mrb_int
 matchdata_name_to_group(mrb_state *mrb, mrb_match_data *md, mrb_value arg)
 {
@@ -1035,7 +1064,7 @@ matchdata_name_to_group(mrb_state *mrb, mrb_match_data *md, mrb_value arg)
   if (!mrb_nil_p(md->regexp)) {
     pat = DATA_GET_PTR(mrb, md->regexp, &regexp_type, mrb_regexp_pattern);
   }
-  int group = re_name_to_group(pat, name, name_len);
+  int group = re_name_to_group(md->captures, md->num_captures, pat, name, name_len);
   if (group >= 0) return group;
   /* A name that resolves to no group is a mistake at the point of the call,
      not a failed match. CRuby raises here even when the pattern has no
@@ -1046,6 +1075,21 @@ matchdata_name_to_group(mrb_state *mrb, mrb_match_data *md, mrb_value arg)
 /*
  * MatchData#[](n)
  */
+
+/* Read the group at the absolute index `idx`, or nil when it names no group
+   of the match: out of 0...num_captures, or in range but the group did not
+   take part in the match. */
+static mrb_value
+md_nth(mrb_state *mrb, mrb_match_data *md, mrb_int idx)
+{
+  if (idx < 0 || idx >= md->num_captures) return mrb_nil_value();
+  int start = md->captures[idx * 2];
+  int end = md->captures[idx * 2 + 1];
+  if (start < 0) return mrb_nil_value();
+
+  return re_byte_substr(mrb, md->source, start, end - start);
+}
+
 static mrb_value
 md_aref(mrb_state *mrb, mrb_value self, mrb_value arg)
 {
@@ -1069,12 +1113,7 @@ md_aref(mrb_state *mrb, mrb_value self, mrb_value arg)
     }
   }
 
-  if (idx >= md->num_captures) return mrb_nil_value();
-  int start = md->captures[idx * 2];
-  int end = md->captures[idx * 2 + 1];
-  if (start < 0) return mrb_nil_value();
-
-  return re_byte_substr(mrb, md->source, start, end - start);
+  return md_nth(mrb, md, idx);
 }
 
 static mrb_value
@@ -1116,6 +1155,65 @@ static mrb_value
 matchdata_to_a(mrb_state *mrb, mrb_value self)
 {
   return matchdata_to_ary(mrb, self, 0);
+}
+
+/*
+ * MatchData#values_at(*args)
+ */
+
+/* Read the arguments the way CRuby's rb_match_values_at() does. A String or
+   Symbol is the name of a named capture, looked up with the same rule as
+   MatchData#[], so a name the pattern does not carry raises and one that did
+   not take part in the match reads as nil. A Range reads the groups at its
+   positions, the way Array#values_at reads its indexes: a negative bound
+   counts back from the last group, so -num_captures reaches the whole match,
+    and the positions past the last group pad nil. A range that starts before
+    the match raises RangeError, the way an Array range index raises.
+    Everything else converts to an integer and reads the group as MatchData#[]
+    reads it, so a negative one never reaches the whole match and one out of
+    range reads as nil. */
+static mrb_value
+matchdata_values_at(mrb_state *mrb, mrb_value self)
+{
+  mrb_match_data *md = DATA_GET_PTR(mrb, self, &matchdata_type, mrb_match_data);
+  if (!md) return mrb_ary_new(mrb);
+
+  mrb_int argc = mrb_get_argc(mrb);
+  const mrb_value *argv = mrb_get_argv(mrb);
+  mrb_value ary = mrb_ary_new_capa(mrb, argc);
+  for (mrb_int i = 0; i < argc; i++) {
+    mrb_value v = argv[i];
+    if (mrb_string_p(v) || mrb_symbol_p(v)) {
+      mrb_ary_push(mrb, ary, md_nth(mrb, md, matchdata_name_to_group(mrb, md, v)));
+    }
+    else if (mrb_range_p(v)) {
+      mrb_int beg, len;
+      switch (mrb_range_beg_len(mrb, v, &beg, &len, md->num_captures, FALSE)) {
+      case MRB_RANGE_OK:
+        for (mrb_int j = 0; j < len; j++) {
+          mrb_ary_push(mrb, ary, md_nth(mrb, md, beg + j));
+        }
+        break;
+      case MRB_RANGE_OUT:
+        mrb_raisef(mrb, E_RANGE_ERROR, "%v out of range", v);
+        break;
+      default:
+        break;
+      }
+    }
+    else {
+      mrb_int idx = mrb_as_int(mrb, v);
+      if (idx < 0) {
+        idx += md->num_captures;
+        if (idx <= 0) {
+          mrb_ary_push(mrb, ary, mrb_nil_value());
+          continue;
+        }
+      }
+      mrb_ary_push(mrb, ary, md_nth(mrb, md, idx));
+    }
+  }
+  return ary;
 }
 
 /*
@@ -1430,7 +1528,7 @@ apply_replacement(mrb_state *mrb, mrb_value result,
         /* What the name is asked of is the pattern, not the offsets, so a
            name no group carries raises where a group that took no part in
            the match would only have stood for nothing. */
-        g = re_name_to_group(pat, name, name_len);
+        g = re_name_to_group(captures, ncap, pat, name, name_len);
         if (g < 0) {
           mrb_raisef(mrb, E_INDEX_ERROR, "undefined group name reference: %l", name, (size_t)name_len);
         }
@@ -2229,8 +2327,10 @@ str_aset(mrb_state *mrb, mrb_value str)
 
 /* --- The regexp-aware String methods --- */
 
-/* Each stands where CRuby implements the same method in C, a C frame in
-   place of the Ruby frame the mrblib override pushed.
+/* Each stands where CRuby implements the same method in C. Being C frames
+   they are transparent to `$~` owner resolution, so a match inside publishes
+   into the calling scope the way rb_str_sub_bang()'s does, with nothing
+   having to say so.
 
    Every entry point settles its pattern argument up front, so the argument
    cannot steer the decision: check_pattern() reads the real type, an accepted
@@ -3180,12 +3280,14 @@ sym_match_op_m(mrb_state *mrb, mrb_value self)
 /*
  * Regexp.last_match / Regexp.last_match(n)
  *
- * Reads `$~` and indexes it the way MatchData#[] does: CRuby's
- * rb_reg_s_last_match() reaches rb_reg_nth_match() directly rather than
- * dispatching `[]`, so a program redefining `MatchData#[]` moves `md[n]`
- * and leaves this reader alone. The whole MatchData answers only an
- * omitted argument, told apart by arity: an explicit nil goes on to the
- * integer conversion and fails it, as it does in CRuby.
+ * Reads the caller's `$~`, which this C frame is transparent to, and indexes
+ * it the way MatchData#[] does: CRuby's rb_reg_s_last_match() reaches
+ * rb_reg_nth_match() directly rather than dispatching `[]`, so a program
+ * redefining `MatchData#[]` moves `md[n]` and leaves this reader alone. The
+ * whole MatchData answers only an omitted argument, told apart by arity: an
+ * explicit nil goes on to the integer conversion and fails it, as it does
+ * in CRuby. Being the engine, it reads the slot rather than the global
+ * name, as CRuby's rb_reg_s_last_match() reads rb_backref_get().
  */
 static mrb_value
 regexp_s_last_match(mrb_state *mrb, mrb_value klass)
@@ -3193,7 +3295,7 @@ regexp_s_last_match(mrb_state *mrb, mrb_value klass)
   mrb_value n;
 
   mrb_int argc = mrb_get_args(mrb, "|o", &n);
-  mrb_value md = mrb_gv_get(mrb, ensure_match_sym(mrb));
+  mrb_value md = mrb_vm_svar_get(mrb, MRB_SVAR_BACKREF);
   if (argc == 0) return md;
   if (mrb_nil_p(md)) return mrb_nil_value();
   return md_aref(mrb, md, n);
@@ -3206,6 +3308,12 @@ mrb_mruby_regexp_gem_init(mrb_state *mrb)
 {
   struct RClass *re = mrb_define_class(mrb, "Regexp", mrb->object_class);
   MRB_SET_INSTANCE_TT(re, MRB_TT_CDATA);
+
+  /* `$~` is a global name whose value is per method scope. This is the one
+     place the name is needed, so it is interned here rather than cached:
+     MRB_GVSYM() takes a word after the `$`, which `~` is not, and a cache
+     outside `mrb` would hand a second mrb_state the first one's numbering. */
+  mrb_gv_define_virtual(mrb, mrb_intern_lit(mrb, "$~"), backref_gv_get, backref_gv_set);
 
   /* Constants */
   mrb_define_const(mrb, re, "IGNORECASE", mrb_fixnum_value(1));
@@ -3331,6 +3439,7 @@ mrb_mruby_regexp_gem_init(mrb_state *mrb)
   mrb_define_method(mrb, md, "[]", matchdata_aref, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, md, "captures", matchdata_captures, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "to_a", matchdata_to_a, MRB_ARGS_NONE());
+  mrb_define_method(mrb, md, "values_at", matchdata_values_at, MRB_ARGS_ANY());
   mrb_define_method(mrb, md, "length", matchdata_length, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "size", matchdata_length, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "begin", matchdata_begin, MRB_ARGS_REQ(1));

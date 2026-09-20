@@ -727,3 +727,41 @@ assert('Array#hash with self-referencing arrays') do
   b << b
   assert_equal a.hash, b.hash
 end
+
+assert('Array shared from an emptied heap array keeps a buffer') do
+  # ary_make_shared() shrinks the buffer to the length being carried, and
+  # that length can be zero: `pop` leaves the capacity where `clear` gives it
+  # back.  Asking mrb_realloc() for no bytes at all would free the buffer and
+  # answer NULL, so the shrink asks for one element where there are none, and
+  # both arrays are left reading a pointer rather than nothing.
+  a = Array.new(200) { |i| i }
+  200.times { a.pop }
+  skip 'this build keeps an emptied array off the heap' unless AryShared.heap_empty?(a)
+
+  assert_false AryShared.copy_ptr_null?(a)
+  # and it is still an array afterwards
+  assert_equal 0, a.size
+  a.push 1
+  assert_equal [1], a
+end
+
+assert('Array#== and #eql? with recursive elements') do
+  # A pair already being compared is taken as equal and the other elements
+  # decide, as CRuby's recursive_equal() does: read the other way, two arrays
+  # that hold themselves would each be told apart by that very element.
+  a = [1]; a << a
+  b = [1]; b << b
+  c = [9]; c << c
+  d = [1, 2]; d << d
+  [:==, :eql?].each do |op|
+    assert_true a.__send__(op, a), op.to_s
+    assert_true a.__send__(op, b), op.to_s
+    assert_false a.__send__(op, c), op.to_s
+    # the assumption does not paper over a difference elsewhere
+    assert_false a.__send__(op, d), op.to_s
+  end
+  # a cycle through two arrays rather than one
+  e = [1]; f = [1]; e << f; f << e
+  g = [1]; h = [1]; g << h; h << g
+  assert_true e == g
+end

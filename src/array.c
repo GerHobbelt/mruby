@@ -240,7 +240,14 @@ ary_make_shared(mrb_state *mrb, struct RArray *a)
 
     shared->refcnt = 1;
     if (a->as.heap.aux.capa > len) {
-      a->as.heap.ptr = shared->ptr = (mrb_value*)mrb_realloc(mrb, ptr, sizeof(mrb_value)*len+1);
+      /* Shrink to fit.  `len` can be zero here: a heap array emptied by
+         `pop` keeps the capacity it grew to, and mrb_ary_make_shared_copy()
+         brings such an array through.  mrb_realloc() with a size of zero
+         frees the buffer and answers NULL (see mrb_basic_alloc_func()), so
+         one element is asked for where there are none, keeping `ptr` a
+         pointer the shared array can be read and freed through. */
+      mrb_int size = len > 0 ? len : 1;
+      a->as.heap.ptr = shared->ptr = (mrb_value*)mrb_realloc(mrb, ptr, sizeof(mrb_value)*size);
     }
     else {
       shared->ptr = ptr;
@@ -1963,9 +1970,10 @@ mrb_ary_eq(mrb_state *mrb, mrb_value ary1)
   if (n == 1) return mrb_true_value();
   if (n == 0) return mrb_false_value();
 
-  /* Check for recursion */
+  /* A pair already being compared is taken as equal, as in CRuby's
+     recursive_equal(), and the other elements decide the outcome. */
   if (MRB_RECURSIVE_BINARY_FUNC_P(mrb, MRB_OPSYM(eq), ary1, ary2)) {
-    return mrb_false_value();
+    return mrb_true_value();
   }
 
   int ai = mrb_gc_arena_save(mrb);
@@ -2003,9 +2011,10 @@ mrb_ary_eql(mrb_state *mrb, mrb_value ary1)
   if (n == 1) return mrb_true_value();
   if (n == 0) return mrb_false_value();
 
-  /* Check for recursion */
+  /* A pair already being compared is taken as equal, as in CRuby's
+     recursive_equal(), and the other elements decide the outcome. */
   if (MRB_RECURSIVE_BINARY_FUNC_P(mrb, MRB_SYM_Q(eql), ary1, ary2)) {
-    return mrb_false_value();
+    return mrb_true_value();
   }
 
   int ai = mrb_gc_arena_save(mrb);

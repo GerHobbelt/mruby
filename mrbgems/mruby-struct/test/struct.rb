@@ -11,6 +11,15 @@ assert('Struct.new', '15.2.18.3.1') do
   assert_equal [:m1, :m2], c.members
 end
 
+assert('Struct.new with no arguments', '15.2.18.3.1') do
+  c = Struct.new
+  assert_equal Struct, c.superclass
+  assert_equal [], c.members
+  o = c.new
+  assert_equal [], o.members
+  assert_equal 0, o.size
+end
+
 assert('Struct#==', '15.2.18.4.1') do
   c = Struct.new(:m1, :m2)
   cc1 = c.new(1,2)
@@ -49,6 +58,21 @@ assert('Struct#== and #eql? with a member that replaces the storage') do
     p2.victim = r2
     p2.donor = donor
     assert_false l2.__send__(op, r2)
+  end
+end
+
+assert('Struct#== and #eql? with recursive members') do
+  c = Struct.new(:m0, :m1, :m2, :m3)
+  a = c.new
+  b = c.new
+  d = c.new
+  a.initialize(a, 2, 3, 4)
+  b.initialize(b, 2, 3, 4)
+  d.initialize(d, 9, 3, 4)
+  [:==, :eql?].each do |op|
+    assert_true a.__send__(op, a)
+    assert_true a.__send__(op, b)
+    assert_false a.__send__(op, d)
   end
 end
 
@@ -296,11 +320,15 @@ assert "Struct initialize when :keyword_init is true" do
   assert_equal nil, o2.foo
   assert_equal nil, o2.bar
 
-  assert_raise(ArgumentError) do
+  assert_raise_with_message(ArgumentError, "wrong number of arguments (given 2, expected 0)") do
     c.new(1, 2)
   end
 
-  assert_raise(ArgumentError) do
+  assert_raise_with_message(ArgumentError, "wrong number of arguments (given 1, expected 0)") do
+    c.new(1)
+  end
+
+  assert_raise_with_message(ArgumentError, "wrong number of arguments (given 2, expected 0)") do
     c.new({foo: 1}, {bar: 2})
   end
 end
@@ -328,7 +356,7 @@ assert "Struct initialize when :keyword_init is non-boolean value (treat as true
   assert_equal 1, o.foo
   assert_equal 2, o.bar
 
-  assert_raise(ArgumentError) do
+  assert_raise_with_message(ArgumentError, "wrong number of arguments (given 2, expected 0)") do
     c.new(1, 2)
   end
 end
