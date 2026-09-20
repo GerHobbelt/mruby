@@ -490,7 +490,7 @@ struct RClass*
 mrb_vm_define_module(mrb_state *mrb, mrb_value outer, mrb_sym id)
 {
   check_if_class_or_module(mrb, outer);
-  if (mrb_const_defined_at(mrb, outer, id)) {
+  if (mrb_obj_iv_defined(mrb, mrb_obj_ptr(outer), id)) {
     mrb_value old = mrb_const_get(mrb, outer, id);
 
     if (!mrb_module_p(old)) {
@@ -498,7 +498,9 @@ mrb_vm_define_module(mrb_state *mrb, mrb_value outer, mrb_sym id)
     }
     return mrb_class_ptr(old);
   }
-  return define_module(mrb, id, mrb_class_ptr(outer));
+  struct RClass *m = mrb_module_new(mrb);
+  setup_class(mrb, mrb_class_ptr(outer), m, id);
+  return m;
 }
 
 /*
@@ -647,7 +649,7 @@ mrb_vm_define_class(mrb_state *mrb, mrb_value outer, mrb_value super, mrb_sym id
     s = NULL;
   }
   check_if_class_or_module(mrb, outer);
-  if (mrb_const_defined_at(mrb, outer, id)) {
+  if (mrb_obj_iv_defined(mrb, mrb_obj_ptr(outer), id)) {
     mrb_value old = mrb_const_get(mrb, outer, id);
 
     if (!mrb_class_p(old)) {
@@ -662,7 +664,8 @@ mrb_vm_define_class(mrb_state *mrb, mrb_value outer, mrb_value super, mrb_sym id
     }
     return c;
   }
-  c = define_class(mrb, id, s, mrb_class_ptr(outer));
+  c = mrb_class_new(mrb, s);
+  setup_class(mrb, mrb_class_ptr(outer), c, id);
   mrb_class_inherited(mrb, mrb_class_real(c->super), c);
 
   return c;
@@ -1967,6 +1970,7 @@ mrb_include_module(mrb_state *mrb, struct RClass *c, struct RClass *m)
   if (include_module_at(mrb, c, find_origin(c), m, 1) < 0) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "cyclic include detected");
   }
+  mrb_const_cache_clear(mrb);
   if (c->tt == MRB_TT_MODULE && (c->flags & MRB_FL_CLASS_IS_INHERITED)) {
     struct RClass *data[2];
     data[0] = c;
@@ -2036,6 +2040,7 @@ mrb_prepend_module(mrb_state *mrb, struct RClass *c, struct RClass *m)
   if (include_module_at(mrb, c, c, m, 0) < 0) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "cyclic prepend detected");
   }
+  mrb_const_cache_clear(mrb);
   if (c->tt == MRB_TT_MODULE &&
       (c->flags & (MRB_FL_CLASS_IS_INHERITED|MRB_FL_CLASS_IS_PREPENDED))) {
     struct RClass *data[2];
@@ -2621,9 +2626,16 @@ mrb_vm_find_method(mrb_state *mrb, struct RClass *c, struct RClass **cp, mrb_sym
   mrb_method_t m;
 #ifndef MRB_NO_METHOD_CACHE
   struct RClass *oc = c;
-  int h = mrb_int_hash_func(mrb, ((intptr_t)oc) ^ mid) & (MRB_METHOD_CACHE_SIZE-1);
-  struct mrb_cache_entry *mc = &mrb->cache[h];
+  int h = mrb_int_hash_func(mrb, ((intptr_t)oc >> 4) ^ mid) & (MRB_METHOD_CACHE_SIZE/2-1);
+  struct mrb_cache_entry *mc = &mrb->cache[h * 2];
 
+  /* check way 0 */
+  if (mc->c == c && mc->mid == mid) {
+    *cp = mc->c0;
+    return mc->m;
+  }
+  /* check way 1 */
+  mc++;
   if (mc->c == c && mc->mid == mid) {
     *cp = mc->c0;
     return mc->m;
@@ -2641,6 +2653,9 @@ mrb_vm_find_method(mrb_state *mrb, struct RClass *c, struct RClass **cp, mrb_sym
         *cp = c;
         m = create_method_value(mrb, flags, ptr);
 #ifndef MRB_NO_METHOD_CACHE
+        mc--;  /* back to way 0 */
+        if (mc->c != NULL && mc[1].c == NULL)
+          mc++;  /* way 1 is empty, use it */
         mc->c = oc;
         mc->c0 = c;
         mc->mid = mid;

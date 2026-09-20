@@ -113,6 +113,8 @@
 
 #include "mrbconf.h"
 
+typedef struct mrb_state mrb_state;
+
 #include <mruby/common.h>
 #include <mruby/value.h>
 #include <mruby/gc.h>
@@ -155,8 +157,6 @@ typedef uint8_t mrb_code;
 typedef uint32_t mrb_aspec;
 
 typedef struct mrb_irep mrb_irep;
-
-struct mrb_state;
 
 #ifndef MRB_FIXED_STATE_ATEXIT_STACK_SIZE
 #define MRB_FIXED_STATE_ATEXIT_STACK_SIZE 5
@@ -224,7 +224,7 @@ mrb_static_assert_powerof2(MRB_METHOD_CACHE_SIZE);
  * @param self The self object
  * @return [mrb_value] The function's return value
  */
-typedef mrb_value (*mrb_func_t)(struct mrb_state *mrb, mrb_value self);
+typedef mrb_value (*mrb_func_t)(mrb_state *mrb, mrb_value self);
 
 typedef struct {
   uint32_t flags;                       /* method flags (no symbol packed) */
@@ -243,9 +243,26 @@ struct mrb_cache_entry {
 };
 #endif
 
+#ifdef MRB_CONST_CACHE_SIZE
+# undef MRB_NO_CONST_CACHE
+mrb_static_assert_powerof2(MRB_CONST_CACHE_SIZE);
+#else
+/* default constant cache size: 64 */
+/* cache size needs to be power of 2 */
+# define MRB_CONST_CACHE_SIZE (1<<6)
+#endif
+
+#ifndef MRB_NO_CONST_CACHE
+struct mrb_const_cache_entry {
+  const struct mrb_irep *irep;
+  mrb_sym sym;
+  mrb_value value;
+};
+#endif
+
 struct mrb_jmpbuf;
 
-typedef void (*mrb_atexit_func)(struct mrb_state*);
+typedef void (*mrb_atexit_func)(mrb_state*);
 
 #ifdef MRB_USE_TASK_SCHEDULER
 struct mrb_task;
@@ -260,7 +277,7 @@ typedef struct mrb_task_state {
 } mrb_task_state;
 #endif
 
-typedef struct mrb_state {
+struct mrb_state {
   struct mrb_jmpbuf *jmp;
 
   struct mrb_context *c;
@@ -297,22 +314,28 @@ typedef struct mrb_state {
   struct mrb_cache_entry cache[MRB_METHOD_CACHE_SIZE];
 #endif
 
+#ifndef MRB_NO_CONST_CACHE
+  struct mrb_const_cache_entry const_cache[MRB_CONST_CACHE_SIZE];
+#endif
+
   mrb_sym symidx;
   const char **symtbl;
+  uint8_t *sym_flags;                     /* per-symbol flags (SYM_FL_*) */
   size_t symcapa;
   struct mrb_sym_hash_table *symhash;
   void *sym_pool;
+  mrb_sym dynamic_sym_count;              /* count of dynamic (GC-candidate) symbols */
 #ifndef MRB_USE_ALL_SYMBOLS
   char symbuf[8];                         /* buffer for small symbol names */
 #endif
 
 #ifdef MRB_USE_DEBUG_HOOK
-  void (*code_fetch_hook)(struct mrb_state* mrb, const struct mrb_irep *irep, const mrb_code *pc, mrb_value *regs);
-  void (*debug_op_hook)(struct mrb_state* mrb, const struct mrb_irep *irep, const mrb_code *pc, mrb_value *regs);
+  void (*code_fetch_hook)(mrb_state* mrb, const struct mrb_irep *irep, const mrb_code *pc, mrb_value *regs);
+  void (*debug_op_hook)(mrb_state* mrb, const struct mrb_irep *irep, const mrb_code *pc, mrb_value *regs);
 #endif
 
 #ifdef MRB_BYTECODE_DECODE_OPTION
-  mrb_code (*bytecode_decoder)(struct mrb_state* mrb, mrb_code code);
+  mrb_code (*bytecode_decoder)(mrb_state* mrb, mrb_code code);
 #endif
 
   struct RClass *eException_class;
@@ -339,7 +362,7 @@ typedef struct mrb_state {
 #ifdef MRB_USE_TASK_SCHEDULER
   mrb_task_state task;                    /* Task scheduler state */
 #endif
-} mrb_state;
+};
 
 /**
  * Defines a new class.
@@ -1283,6 +1306,11 @@ MRB_API void mrb_close(mrb_state *mrb);
 MRB_API void mrb_method_cache_clear(mrb_state *mrb);
 #else
 #define mrb_method_cache_clear(mrb) ((void)0)
+#endif
+#ifndef MRB_NO_CONST_CACHE
+void mrb_const_cache_clear(mrb_state *mrb);
+#else
+#define mrb_const_cache_clear(mrb) ((void)0)
 #endif
 
 /**

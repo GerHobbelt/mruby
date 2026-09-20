@@ -2081,6 +2081,154 @@ mrb_ary_delete(mrb_state *mrb, mrb_value self)
 
 #define SMALL_ARRAY_SORT_THRESHOLD 16
 
+/* Check if all elements in the array are integers (fast path candidate) */
+static mrb_bool
+ary_all_fixnum_p(const mrb_value *a, mrb_int n)
+{
+  for (mrb_int i = 0; i < n; i++) {
+    if (!mrb_integer_p(a[i])) return FALSE;
+  }
+  return TRUE;
+}
+
+/* Integer-specialized heapify: no sort_cmp overhead, direct comparison */
+static void
+heapify_fixnum(mrb_value *a, mrb_int index, mrb_int size)
+{
+  mrb_int val = mrb_integer(a[index]);
+
+  while (1) {
+    mrb_int child = 2 * index + 1;
+    if (child >= size) break;
+    if (child + 1 < size && mrb_integer(a[child + 1]) > mrb_integer(a[child])) {
+      child++;
+    }
+    if (mrb_integer(a[child]) <= val) break;
+    a[index] = a[child];
+    index = child;
+  }
+  SET_FIXNUM_VALUE(a[index], val);
+}
+
+/* Integer-specialized Floyd's bottom-up heap deletion */
+static void
+heap_delete_root_fixnum(mrb_value *a, mrb_int size)
+{
+  mrb_int last = mrb_integer(a[0]);
+
+  mrb_int hole = 0;
+  mrb_int child = 1;
+  while (child + 1 < size) {
+    if (mrb_integer(a[child + 1]) > mrb_integer(a[child])) {
+      child++;
+    }
+    a[hole] = a[child];
+    hole = child;
+    child = 2 * hole + 1;
+  }
+  if (child < size) {
+    a[hole] = a[child];
+    hole = child;
+  }
+
+  while (hole > 0) {
+    mrb_int parent = (hole - 1) / 2;
+    if (mrb_integer(a[parent]) >= last) break;
+    a[hole] = a[parent];
+    hole = parent;
+  }
+  SET_FIXNUM_VALUE(a[hole], last);
+}
+
+/* Integer-specialized insertion sort */
+static void
+insertion_sort_fixnum(mrb_value *a, mrb_int size)
+{
+  for (mrb_int i = 1; i < size; i++) {
+    mrb_int key = mrb_integer(a[i]);
+    mrb_int j = i - 1;
+    while (j >= 0 && mrb_integer(a[j]) > key) {
+      a[j + 1] = a[j];
+      j--;
+    }
+    SET_FIXNUM_VALUE(a[j + 1], key);
+  }
+}
+
+/* Check if all elements are plain String (not subclass) */
+static mrb_bool
+ary_all_string_p(mrb_state *mrb, const mrb_value *a, mrb_int n)
+{
+  for (mrb_int i = 0; i < n; i++) {
+    if (!mrb_string_p(a[i])) return FALSE;
+    if (mrb_obj_ptr(a[i])->c != mrb->string_class) return FALSE;
+  }
+  return TRUE;
+}
+
+/* String-specialized heapify using mrb_str_cmp directly */
+static void
+heapify_str(mrb_state *mrb, mrb_value *a, mrb_int index, mrb_int size)
+{
+  mrb_value val = a[index];
+
+  while (1) {
+    mrb_int child = 2 * index + 1;
+    if (child >= size) break;
+    if (child + 1 < size && mrb_str_cmp(mrb, a[child + 1], a[child]) > 0) {
+      child++;
+    }
+    if (mrb_str_cmp(mrb, a[child], val) <= 0) break;
+    a[index] = a[child];
+    index = child;
+  }
+  a[index] = val;
+}
+
+/* String-specialized Floyd's bottom-up heap deletion */
+static void
+heap_delete_root_str(mrb_state *mrb, mrb_value *a, mrb_int size)
+{
+  mrb_value last = a[0];
+
+  mrb_int hole = 0;
+  mrb_int child = 1;
+  while (child + 1 < size) {
+    if (mrb_str_cmp(mrb, a[child + 1], a[child]) > 0) {
+      child++;
+    }
+    a[hole] = a[child];
+    hole = child;
+    child = 2 * hole + 1;
+  }
+  if (child < size) {
+    a[hole] = a[child];
+    hole = child;
+  }
+
+  while (hole > 0) {
+    mrb_int parent = (hole - 1) / 2;
+    if (mrb_str_cmp(mrb, a[parent], last) >= 0) break;
+    a[hole] = a[parent];
+    hole = parent;
+  }
+  a[hole] = last;
+}
+
+/* String-specialized insertion sort */
+static void
+insertion_sort_str(mrb_state *mrb, mrb_value *a, mrb_int size)
+{
+  for (mrb_int i = 1; i < size; i++) {
+    mrb_value key = a[i];
+    mrb_int j = i - 1;
+    while (j >= 0 && mrb_str_cmp(mrb, a[j], key) > 0) {
+      a[j + 1] = a[j];
+      j--;
+    }
+    a[j + 1] = key;
+  }
+}
 
 static mrb_bool
 sort_cmp(mrb_state *mrb, mrb_value ary, mrb_value a_val, mrb_value b_val, mrb_value blk)
@@ -2137,35 +2285,68 @@ sort_cmp(mrb_state *mrb, mrb_value ary, mrb_value a_val, mrb_value b_val, mrb_va
   return cmp > 0;
 }
 
+/* Hole-style sift-down: save root, move larger children up, write once at end.
+   Reduces assignments from 3 per level (swap) to 1 per level (move). */
 static void
 heapify(mrb_state *mrb, mrb_value ary, mrb_value *a, mrb_int index, mrb_int size, mrb_value blk)
 {
-  /* Iterative heapify to avoid stack overflow on memory-constrained devices */
+  mrb_value val = a[index];  /* save root to hole */
+  mrb_gc_protect(mrb, val);
+
   while (1) {
-    mrb_int max = index;
-    mrb_int left_index = 2 * index + 1;
-    mrb_int right_index = left_index + 1;
+    mrb_int child = 2 * index + 1;
+    if (child >= size) break;
 
-    if (left_index < size && sort_cmp(mrb, ary, a[left_index], a[max], blk)) {
-      max = left_index;
+    /* pick the larger child */
+    if (child + 1 < size && sort_cmp(mrb, ary, a[child + 1], a[child], blk)) {
+      child++;
     }
-    if (right_index < size && sort_cmp(mrb, ary, a[right_index], a[max], blk)) {
-      max = right_index;
-    }
+    /* if hole value >= larger child, done */
+    if (!sort_cmp(mrb, ary, a[child], val, blk)) break;
 
-    if (max == index) {
-      /* Heap property satisfied, no more swaps needed */
-      break;
-    }
-
-    /* Swap elements and continue heapifying down the affected subtree */
-    mrb_value tmp = a[max];
-    a[max] = a[index];
-    a[index] = tmp;
-
-    /* Continue with the affected child subtree */
-    index = max;
+    a[index] = a[child];     /* move child up */
+    index = child;
   }
+  a[index] = val;             /* place saved value */
+}
+
+/* Floyd's bottom-up heap deletion: sift the hole down to a leaf without
+   comparing against the removed root, then sift up from the leaf position.
+   This reduces comparisons from ~2 log n to ~log n per extraction,
+   because most elements end up near the bottom of the heap anyway. */
+static void
+heap_delete_root(mrb_state *mrb, mrb_value ary, mrb_value *a, mrb_int size, mrb_value blk)
+{
+  /* a[0] already holds the value to be re-inserted (set by caller) */
+  mrb_value last = a[0];
+  mrb_gc_protect(mrb, last);
+
+  /* Phase 1: sift the hole down to a leaf (only child-child comparisons) */
+  mrb_int hole = 0;
+  mrb_int child = 1;
+  while (child + 1 < size) {
+    /* pick the larger child - 1 comparison per level */
+    if (sort_cmp(mrb, ary, a[child + 1], a[child], blk)) {
+      child++;
+    }
+    a[hole] = a[child];
+    hole = child;
+    child = 2 * hole + 1;
+  }
+  /* handle single child at bottom */
+  if (child < size) {
+    a[hole] = a[child];
+    hole = child;
+  }
+
+  /* Phase 2: sift up from hole to find correct position for last */
+  while (hole > 0) {
+    mrb_int parent = (hole - 1) / 2;
+    if (!sort_cmp(mrb, ary, last, a[parent], blk)) break;
+    a[hole] = a[parent];
+    hole = parent;
+  }
+  a[hole] = last;
 }
 
 static void
@@ -2210,21 +2391,61 @@ mrb_ary_sort_bang(mrb_state *mrb, mrb_value ary)
 
   mrb_value *a = RARRAY_PTR(ary);
 
-  /* Algorithm selection based on array size */
+  /* Integer fast path: no block and all elements are integers */
+  if (mrb_nil_p(blk) && ary_all_fixnum_p(a, n)) {
+    if (n <= SMALL_ARRAY_SORT_THRESHOLD) {
+      insertion_sort_fixnum(a, n);
+    }
+    else {
+      for (mrb_int i = n / 2 - 1; i >= 0; i--) {
+        heapify_fixnum(a, i, n);
+      }
+      for (mrb_int i = n - 1; i > 0; i--) {
+        mrb_value tmp = a[0];
+        a[0] = a[i];
+        a[i] = tmp;
+        heap_delete_root_fixnum(a, i);
+      }
+    }
+    return ary;
+  }
+
+  /* String fast path: no block and all elements are plain String */
+  if (mrb_nil_p(blk) && ary_all_string_p(mrb, a, n)) {
+    if (n <= SMALL_ARRAY_SORT_THRESHOLD) {
+      insertion_sort_str(mrb, a, n);
+    }
+    else {
+      for (mrb_int i = n / 2 - 1; i >= 0; i--) {
+        heapify_str(mrb, a, i, n);
+      }
+      for (mrb_int i = n - 1; i > 0; i--) {
+        mrb_value tmp = a[0];
+        a[0] = a[i];
+        a[i] = tmp;
+        heap_delete_root_str(mrb, a, i);
+      }
+    }
+    return ary;
+  }
+
+  /* General path */
   if (n <= SMALL_ARRAY_SORT_THRESHOLD) {
     /* Use insertion sort for small arrays */
     insertion_sort(mrb, ary, a, n, blk);
   }
   else {
-    /* Use heap sort for larger arrays */
+    /* Heap sort with Floyd's bottom-up deletion */
+    /* Phase 1: build max-heap (standard sift-down, hole style) */
     for (mrb_int i = n / 2 - 1; i >= 0; i--) {
       heapify(mrb, ary, a, i, n, blk);
     }
+    /* Phase 2: extract max elements using Floyd's method */
     for (mrb_int i = n - 1; i > 0; i--) {
-      mrb_value tmp = a[0];
-      a[0] = a[i];
-      a[i] = tmp;
-      heapify(mrb, ary, a, 0, i, blk);
+      mrb_value max = a[0];
+      a[0] = a[i];   /* temporary for GC safety */
+      a[i] = max;     /* max goes to final position */
+      heap_delete_root(mrb, ary, a, i, blk);
     }
   }
   return ary;

@@ -14,15 +14,12 @@
  */
 MRB_BEGIN_DECL
 
-
-struct mrb_state;
-
 #define MRB_EACH_OBJ_OK 0
 #define MRB_EACH_OBJ_BREAK 1
-typedef int (mrb_each_object_callback)(struct mrb_state *mrb, struct RBasic *obj, void *data);
-void mrb_objspace_each_objects(struct mrb_state *mrb, mrb_each_object_callback *callback, void *data);
+typedef int (mrb_each_object_callback)(mrb_state *mrb, struct RBasic *obj, void *data);
+void mrb_objspace_each_objects(mrb_state *mrb, mrb_each_object_callback *callback, void *data);
 size_t mrb_objspace_page_slot_size(void);
-MRB_API void mrb_free_context(struct mrb_state *mrb, struct mrb_context *c);
+MRB_API void mrb_free_context(mrb_state *mrb, struct mrb_context *c);
 
 #ifndef MRB_GC_ARENA_SIZE
 #define MRB_GC_ARENA_SIZE 100
@@ -48,7 +45,7 @@ typedef struct mrb_gc {
   mrb_bool gray_overflow:1;        /* gray stack overflowed; needs heap rescan */
   size_t live;                     /* count of live objects */
   size_t live_after_mark;          /* old generation objects */
-  size_t threshold;                /* threshold to start GC */
+  mrb_int gc_debt;                 /* <0:credit, >0:needs GC */
   size_t oldgen_threshold;         /* threshold to kick major GC */
   mrb_gc_state state;              /* current state of gc */
   int interval_ratio;
@@ -59,6 +56,9 @@ typedef struct mrb_gc {
   mrb_bool generational  :1;       /* generational GC mode */
   mrb_bool full          :1;       /* major GC mode */
   mrb_bool out_of_memory :1;       /* out-of-memory error occurred */
+  size_t step_limit;               /* 0=unlimited, >0=absolute step cap */
+  size_t malloc_increase;          /* malloc bytes since last GC cycle */
+  size_t malloc_threshold;         /* 0=disabled, >0=bytes to trigger GC */
 
 #ifdef MRB_GC_FIXED_ARENA
   struct RBasic *arena[MRB_GC_ARENA_SIZE]; /* GC protection array */
@@ -67,10 +67,16 @@ typedef struct mrb_gc {
   int arena_capa;                          /* size of protection array */
 #endif
   int arena_idx;
+
+#ifdef MRB_GC_STATS
+  uint32_t gc_total_count;                 /* total GC invocations */
+  uint32_t minor_gc_count;                 /* minor GC count */
+  uint32_t major_gc_count;                 /* major GC count */
+#endif
 } mrb_gc;
 
-MRB_API mrb_bool mrb_object_dead_p(struct mrb_state *mrb, struct RBasic *object);
-MRB_API int mrb_gc_add_region(struct mrb_state *mrb, void *start, size_t size);
+MRB_API mrb_bool mrb_object_dead_p(mrb_state *mrb, struct RBasic *object);
+MRB_API int mrb_gc_add_region(mrb_state *mrb, void *start, size_t size);
 
 #define MRB_GC_RED 7
 

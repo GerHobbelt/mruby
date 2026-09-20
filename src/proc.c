@@ -47,7 +47,7 @@ mrb_proc_new(mrb_state *mrb, const mrb_irep *irep)
   struct RProc *p;
   mrb_callinfo *ci = mrb->c->ci;
 
-  p = MRB_OBJ_ALLOC(mrb, MRB_TT_PROC, mrb->proc_class);
+  p = (struct RProc*)mrb_obj_alloc_core(mrb, MRB_TT_PROC, mrb->proc_class);
   if (ci) {
     struct RClass *tc = NULL;
 
@@ -76,7 +76,7 @@ mrb_env_new(mrb_state *mrb, struct mrb_context *c, mrb_callinfo *ci, int nstacks
   int n = ci->n;
   int nk = ci->nk;
 
-  e = MRB_OBJ_ALLOC(mrb, MRB_TT_ENV, NULL);
+  e = (struct REnv*)mrb_obj_alloc_core(mrb, MRB_TT_ENV, NULL);
   e->c = tc;
   MRB_ENV_SET_LEN(e, nstacks);
   bidx += (n == 15) ? 1 : n;
@@ -412,7 +412,18 @@ mrb_proc_arity(const struct RProc *p)
   int ma, op, ra, pa, arity;
 
   if (MRB_PROC_CFUNC_P(p)) {
-    /* TODO cfunc aspec not implemented yet */
+    uint32_t caspec_bits = p->flags & MRB_PROC_CASPEC_MASK;
+    if (caspec_bits != 0) {
+      aspec = mrb_proc_decompress_caspec(caspec_bits);
+      ma = MRB_ASPEC_REQ(aspec);
+      op = MRB_ASPEC_OPT(aspec);
+      ra = MRB_ASPEC_REST(aspec);
+      pa = MRB_ASPEC_POST(aspec);
+      return ra || op ? -(ma + pa + 1) : ma + pa;
+    }
+    if (MRB_PROC_NOARG_P(p)) {
+      return 0;
+    }
     return -1;
   }
 

@@ -224,6 +224,17 @@ mrb_realloc_simple(mrb_state *mrb, void *p,  size_t len)
     p2 = mrb_basic_alloc_func(p, len);
   }
 
+  if (p2 && len > 0) {
+    mrb->gc.malloc_increase += len;
+    if (mrb->gc.malloc_threshold > 0 &&
+        mrb->gc.malloc_increase >= mrb->gc.malloc_threshold &&
+        mrb->gc.state == MRB_GC_STATE_ROOT &&
+        !mrb->gc.disabled && !mrb->gc.iterating) {
+      mrb->gc.malloc_increase = 0;
+      mrb_incremental_gc(mrb);
+    }
+  }
+
   return p2;
 }
 
@@ -552,12 +563,47 @@ mrb_gc_unregister(mrb_state *mrb, mrb_value obj)
   ARY_SET_LEN(a, w);
 }
 
-MRB_API struct RBasic*
-mrb_obj_alloc(mrb_state *mrb, enum mrb_vtype ttype, struct RClass *cls)
+/* Core allocation without type validation.
+   Used internally by mrb_proc_new, mrb_env_new, etc. */
+struct RBasic*
+mrb_obj_alloc_core(mrb_state *mrb, enum mrb_vtype ttype, struct RClass *cls)
 {
   static const RVALUE RVALUE_zero = { { { NULL, MRB_TT_FALSE } } };
   mrb_gc *gc = &mrb->gc;
 
+#ifdef MRB_GC_STRESS
+  mrb_full_gc(mrb);
+#endif
+  gc->gc_debt++;
+  if (gc->gc_debt > 0) {
+    mrb_incremental_gc(mrb);
+  }
+  gc_arena_keep(mrb, gc);
+  if (gc->free_heaps == NULL) {
+    add_heap(mrb, gc);
+  }
+
+  RVALUE *p = gc->free_heaps->freelist;
+  gc->free_heaps->freelist = p->as.free.next;
+  if (gc->free_heaps->freelist == NULL) {
+    gc->free_heaps = gc->free_heaps->free_next;
+  }
+
+  gc->live++;
+  gc_protect(mrb, gc, &p->as.basic);
+  *p = RVALUE_zero;
+  p->as.basic.tt = ttype;
+  p->as.basic.c = cls;
+  if (ttype == MRB_TT_OBJECT) {
+    p->as.basic.flags |= MRB_FL_OBJ_SHAPED;
+  }
+  paint_partial_white(gc, &p->as.basic);
+  return &p->as.basic;
+}
+
+MRB_API struct RBasic*
+mrb_obj_alloc(mrb_state *mrb, enum mrb_vtype ttype, struct RClass *cls)
+{
   if (cls) {
     enum mrb_vtype tt;
 
@@ -583,34 +629,7 @@ mrb_obj_alloc(mrb_state *mrb, enum mrb_vtype ttype, struct RClass *cls)
   if (ttype <= MRB_TT_FREE) {
     mrb_raisef(mrb, E_TYPE_ERROR, "allocation failure of %C (type %d)", cls, (int)ttype);
   }
-
-#ifdef MRB_GC_STRESS
-  mrb_full_gc(mrb);
-#endif
-  if (gc->threshold < gc->live) {
-    mrb_incremental_gc(mrb);
-  }
-  gc_arena_keep(mrb, gc);
-  if (gc->free_heaps == NULL) {
-    add_heap(mrb, gc);
-  }
-
-  RVALUE *p = gc->free_heaps->freelist;
-  gc->free_heaps->freelist = p->as.free.next;
-  if (gc->free_heaps->freelist == NULL) {
-    gc->free_heaps = gc->free_heaps->free_next;
-  }
-
-  gc->live++;
-  gc_protect(mrb, gc, &p->as.basic);
-  *p = RVALUE_zero;
-  p->as.basic.tt = ttype;
-  p->as.basic.c = cls;
-  if (ttype == MRB_TT_OBJECT) {
-    p->as.basic.flags |= MRB_FL_OBJ_SHAPED;
-  }
-  paint_partial_white(gc, &p->as.basic);
-  return &p->as.basic;
+  return mrb_obj_alloc_core(mrb, ttype, cls);
 }
 
 static inline void
@@ -844,6 +863,31 @@ mrb_gc_mark(mrb_state *mrb, struct RBasic *obj)
   if (!is_white(obj)) return;
   if (is_red(obj)) return;
   mrb_assert((obj)->tt != MRB_TT_FREE);
+  switch (obj->tt) {
+  case MRB_TT_STRING:
+    /* most strings have no children; handle fshared inline */
+    paint_black(obj);
+    mrb_gc_mark(mrb, (struct RBasic*)obj->c);
+    if (RSTR_FSHARED_P(obj)) {
+      struct RString *s = (struct RString*)obj;
+      mrb_gc_mark(mrb, (struct RBasic*)s->as.heap.aux.fshared);
+    }
+    return;
+  case MRB_TT_INTEGER:
+  case MRB_TT_CPTR:
+#ifdef MRB_USE_BIGINT
+  case MRB_TT_BIGINT:
+#endif
+#ifdef MRB_USE_COMPLEX
+  case MRB_TT_COMPLEX:
+#endif
+    /* leaf types: no children besides class */
+    paint_black(obj);
+    mrb_gc_mark(mrb, (struct RBasic*)obj->c);
+    return;
+  default:
+    break;
+  }
   add_gray_list(&mrb->gc, obj);
 }
 
@@ -1286,13 +1330,16 @@ incremental_gc_step(mrb_state *mrb, mrb_gc *gc)
 {
   size_t limit = 0, result = 0;
   limit = (GC_STEP_SIZE/100) * gc->step_ratio;
+  if (gc->step_limit > 0 && limit > gc->step_limit) {
+    limit = gc->step_limit;
+  }
   while (result < limit) {
     result += incremental_gc(mrb, gc, limit);
     if (gc->state == MRB_GC_STATE_ROOT)
       break;
   }
 
-  gc->threshold = gc->live + GC_STEP_SIZE;
+  gc->gc_debt -= (mrb_int)result;
 }
 
 static void
@@ -1322,17 +1369,30 @@ mrb_incremental_gc(mrb_state *mrb)
   if (gc->disabled || gc->iterating) return;
 
   if (is_minor_gc(gc)) {
+#ifdef MRB_GC_STATS
+    gc->gc_total_count++;
+    gc->minor_gc_count++;
+#endif
     incremental_gc_finish(mrb, gc);
   }
   else {
+#ifdef MRB_GC_STATS
+    if (gc->state == MRB_GC_STATE_ROOT) {
+      gc->gc_total_count++;
+      gc->major_gc_count++;
+    }
+#endif
     incremental_gc_step(mrb, gc);
   }
 
   if (gc->state == MRB_GC_STATE_ROOT) {
+    gc->malloc_increase = 0;
     mrb_assert(gc->live >= gc->live_after_mark);
-    gc->threshold = (gc->live_after_mark/100) * gc->interval_ratio;
-    if (gc->threshold < GC_STEP_SIZE) {
-      gc->threshold = GC_STEP_SIZE;
+    {
+      mrb_int credit = (mrb_int)((gc->live_after_mark/100) * gc->interval_ratio)
+                     - (mrb_int)gc->live_after_mark;
+      if (credit < (mrb_int)GC_STEP_SIZE) credit = (mrb_int)GC_STEP_SIZE;
+      gc->gc_debt = -credit;
     }
 
     if (is_major_gc(gc)) {
@@ -1364,6 +1424,10 @@ mrb_full_gc(mrb_state *mrb)
   if (!mrb->c) return;
   if (gc->disabled || gc->iterating) return;
 
+#ifdef MRB_GC_STATS
+  gc->gc_total_count++;
+  gc->major_gc_count++;
+#endif
   if (is_generational(gc)) {
     /* clear all the old objects back to young */
     clear_all_old(mrb, gc);
@@ -1375,7 +1439,12 @@ mrb_full_gc(mrb_state *mrb)
   }
 
   incremental_gc_finish(mrb, gc);
-  gc->threshold = (gc->live_after_mark/100) * gc->interval_ratio;
+  {
+    mrb_int credit = (mrb_int)((gc->live_after_mark/100) * gc->interval_ratio)
+                   - (mrb_int)gc->live_after_mark;
+    if (credit < (mrb_int)GC_STEP_SIZE) credit = (mrb_int)GC_STEP_SIZE;
+    gc->gc_debt = -credit;
+  }
 
   if (is_generational(gc)) {
     gc->oldgen_threshold = gc->live_after_mark/100 * MAJOR_GC_INC_RATIO;
@@ -1573,6 +1642,44 @@ gc_step_ratio_set(mrb_state *mrb, mrb_value obj)
   return mrb_nil_value();
 }
 
+static mrb_value
+gc_step_limit_get(mrb_state *mrb, mrb_value obj)
+{
+  return mrb_int_value(mrb, (mrb_int)mrb->gc.step_limit);
+}
+
+static mrb_value
+gc_step_limit_set(mrb_state *mrb, mrb_value obj)
+{
+  mrb_int limit;
+
+  mrb_get_args(mrb, "i", &limit);
+  if (limit < 0) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "step_limit must be non-negative");
+  }
+  mrb->gc.step_limit = (size_t)limit;
+  return mrb_int_value(mrb, limit);
+}
+
+static mrb_value
+gc_malloc_threshold_get(mrb_state *mrb, mrb_value obj)
+{
+  return mrb_int_value(mrb, (mrb_int)mrb->gc.malloc_threshold);
+}
+
+static mrb_value
+gc_malloc_threshold_set(mrb_state *mrb, mrb_value obj)
+{
+  mrb_int threshold;
+
+  mrb_get_args(mrb, "i", &threshold);
+  if (threshold < 0) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "malloc_threshold must be non-negative");
+  }
+  mrb->gc.malloc_threshold = (size_t)threshold;
+  return mrb_int_value(mrb, threshold);
+}
+
 static void
 change_gen_gc_mode(mrb_state *mrb, mrb_gc *gc, mrb_bool enable)
 {
@@ -1680,6 +1787,41 @@ mrb_objspace_page_slot_size(void)
 }
 
 
+/*
+ *  call-seq:
+ *     GC.stat    -> Hash
+ *
+ *  Returns a Hash with GC statistics.
+ *  Keys: :live, :debt, :state, :generational, :full,
+ *        :step_limit, :malloc_increase, :malloc_threshold
+ *  With MRB_GC_STATS: :total, :minor, :major
+ *
+ */
+
+static mrb_value
+gc_stat(mrb_state *mrb, mrb_value self)
+{
+  mrb_gc *gc = &mrb->gc;
+  mrb_value hash = mrb_hash_new_capa(mrb, 8);
+
+  mrb_hash_set(mrb, hash, mrb_symbol_value(mrb_intern_lit(mrb, "live")), mrb_int_value(mrb, (mrb_int)gc->live));
+  mrb_hash_set(mrb, hash, mrb_symbol_value(mrb_intern_lit(mrb, "debt")), mrb_int_value(mrb, gc->gc_debt));
+  mrb_hash_set(mrb, hash, mrb_symbol_value(mrb_intern_lit(mrb, "state")), mrb_int_value(mrb, (mrb_int)gc->state));
+  mrb_hash_set(mrb, hash, mrb_symbol_value(mrb_intern_lit(mrb, "generational")), mrb_bool_value(gc->generational));
+  mrb_hash_set(mrb, hash, mrb_symbol_value(mrb_intern_lit(mrb, "full")), mrb_bool_value(gc->full));
+  mrb_hash_set(mrb, hash, mrb_symbol_value(mrb_intern_lit(mrb, "step_limit")), mrb_int_value(mrb, (mrb_int)gc->step_limit));
+  mrb_hash_set(mrb, hash, mrb_symbol_value(mrb_intern_lit(mrb, "malloc_increase")), mrb_int_value(mrb, (mrb_int)gc->malloc_increase));
+  mrb_hash_set(mrb, hash, mrb_symbol_value(mrb_intern_lit(mrb, "malloc_threshold")), mrb_int_value(mrb, (mrb_int)gc->malloc_threshold));
+
+#ifdef MRB_GC_STATS
+  mrb_hash_set(mrb, hash, mrb_symbol_value(mrb_intern_lit(mrb, "total")), mrb_int_value(mrb, (mrb_int)gc->gc_total_count));
+  mrb_hash_set(mrb, hash, mrb_symbol_value(mrb_intern_lit(mrb, "minor")), mrb_int_value(mrb, (mrb_int)gc->minor_gc_count));
+  mrb_hash_set(mrb, hash, mrb_symbol_value(mrb_intern_lit(mrb, "major")), mrb_int_value(mrb, (mrb_int)gc->major_gc_count));
+#endif
+
+  return hash;
+}
+
 void
 mrb_init_gc(mrb_state *mrb)
 {
@@ -1695,6 +1837,7 @@ mrb_init_gc(mrb_state *mrb)
 
   gc = mrb_define_module_id(mrb, MRB_SYM(GC));
 
+  mrb_define_class_method_id(mrb, gc, MRB_SYM(stat), gc_stat, MRB_ARGS_NONE());
   mrb_define_class_method_id(mrb, gc, MRB_SYM(start), gc_start, MRB_ARGS_NONE());
   mrb_define_class_method_id(mrb, gc, MRB_SYM(enable), gc_enable, MRB_ARGS_NONE());
   mrb_define_class_method_id(mrb, gc, MRB_SYM(disable), gc_disable, MRB_ARGS_NONE());
@@ -1702,6 +1845,10 @@ mrb_init_gc(mrb_state *mrb)
   mrb_define_class_method_id(mrb, gc, MRB_SYM_E(interval_ratio), gc_interval_ratio_set, MRB_ARGS_REQ(1));
   mrb_define_class_method_id(mrb, gc, MRB_SYM(step_ratio), gc_step_ratio_get, MRB_ARGS_NONE());
   mrb_define_class_method_id(mrb, gc, MRB_SYM_E(step_ratio), gc_step_ratio_set, MRB_ARGS_REQ(1));
+  mrb_define_class_method_id(mrb, gc, MRB_SYM(step_limit), gc_step_limit_get, MRB_ARGS_NONE());
+  mrb_define_class_method_id(mrb, gc, MRB_SYM_E(step_limit), gc_step_limit_set, MRB_ARGS_REQ(1));
+  mrb_define_class_method_id(mrb, gc, MRB_SYM(malloc_threshold), gc_malloc_threshold_get, MRB_ARGS_NONE());
+  mrb_define_class_method_id(mrb, gc, MRB_SYM_E(malloc_threshold), gc_malloc_threshold_set, MRB_ARGS_REQ(1));
   mrb_define_class_method_id(mrb, gc, MRB_SYM_E(generational_mode), gc_generational_mode_set, MRB_ARGS_REQ(1));
   mrb_define_class_method_id(mrb, gc, MRB_SYM(generational_mode), gc_generational_mode_get, MRB_ARGS_NONE());
 }
