@@ -134,6 +134,16 @@ static inline const char *get_pf_name(int family) {
 
 #define E_SOCKET_ERROR             mrb_class_get_id(mrb, MRB_SYM(SocketError))
 
+/* Raise a SystemCallError for the most recent socket-API failure.
+ * On Windows the HAL translates WSAGetLastError() into errno first;
+ * on POSIX errno is already set, so this is just mrb_sys_fail. */
+static mrb_noreturn void
+sock_sys_fail(mrb_state *mrb, const char *mesg)
+{
+  mrb_hal_socket_set_errno_from_last_error();
+  mrb_sys_fail(mrb, mesg);
+}
+
 struct gen_addrinfo_args {
   struct RClass *klass;
   struct addrinfo *addrinfo;
@@ -295,7 +305,7 @@ sa2addrlist(mrb_state *mrb, const struct sockaddr *sa, socklen_t salen)
   port = ntohs(port);
   mrb_value host = mrb_str_new_capa(mrb, NI_MAXHOST);
   if (getnameinfo(sa, salen, RSTRING_PTR(host), NI_MAXHOST, NULL, 0, NI_NUMERICHOST) == -1)
-    mrb_sys_fail(mrb, "getnameinfo");
+    sock_sys_fail(mrb, "getnameinfo");
   mrb_str_resize(mrb, host, strlen(RSTRING_PTR(host)));
 
   mrb_value ary = mrb_ary_new_capa(mrb, 4);
@@ -344,7 +354,7 @@ mrb_basicsocket_getpeereid(mrb_state *mrb, mrb_value self)
   uid_t euid;
   int s = socket_fd(mrb, self);
   if (getpeereid(s, &euid, &egid) != 0)
-    mrb_sys_fail(mrb, "getpeereid");
+    sock_sys_fail(mrb, "getpeereid");
 
   mrb_value ary = mrb_ary_new_capa(mrb, 2);
   mrb_ary_push(mrb, ary, mrb_fixnum_value((mrb_int)euid));
@@ -371,7 +381,7 @@ mrb_basicsocket_getpeername(mrb_state *mrb, mrb_value self)
   socklen_t salen = sizeof(ss);
 
   if (getpeername(socket_fd(mrb, self), (struct sockaddr*)&ss, &salen) != 0)
-    mrb_sys_fail(mrb, "getpeername");
+    sock_sys_fail(mrb, "getpeername");
 
   return mrb_str_new(mrb, (char*)&ss, salen);
 }
@@ -391,7 +401,7 @@ mrb_basicsocket_getsockname(mrb_state *mrb, mrb_value self)
   socklen_t salen = sizeof(ss);
 
   if (getsockname(socket_fd(mrb, self), (struct sockaddr*)&ss, &salen) != 0)
-    mrb_sys_fail(mrb, "getsockname");
+    sock_sys_fail(mrb, "getsockname");
 
   return mrb_str_new(mrb, (char*)&ss, salen);
 }
@@ -636,7 +646,7 @@ mrb_basicsocket_getsockopt(mrb_state *mrb, mrb_value self)
   socklen_t optlen = sizeof(opt);
 
   if (getsockopt(s, (int)level, (int)optname, opt, &optlen) == -1)
-    mrb_sys_fail(mrb, "getsockopt");
+    sock_sys_fail(mrb, "getsockopt");
   mrb_int family = socket_family(s);
   mrb_value data = mrb_str_new(mrb, opt, optlen);
   mrb_value args[4] = {mrb_fixnum_value(family), mrb_fixnum_value(level), mrb_fixnum_value(optname), data};
@@ -662,7 +672,7 @@ mrb_basicsocket_recv(mrb_state *mrb, mrb_value self)
   mrb_value buf = mrb_str_new_capa(mrb, maxlen);
   ssize_t n = recv(socket_fd(mrb, self), RSTRING_PTR(buf), (fsize_t)maxlen, (int)flags);
   if (n == -1)
-    mrb_sys_fail(mrb, "recv");
+    sock_sys_fail(mrb, "recv");
   mrb_str_resize(mrb, buf, (mrb_int)n);
   return buf;
 }
@@ -686,7 +696,7 @@ mrb_basicsocket_recvfrom(mrb_state *mrb, mrb_value self)
   mrb_value sa = mrb_str_new_capa(mrb, socklen);
   ssize_t n = recvfrom(socket_fd(mrb, self), RSTRING_PTR(buf), (fsize_t)maxlen, (int)flags, (struct sockaddr*)RSTRING_PTR(sa), &socklen);
   if (n == -1)
-    mrb_sys_fail(mrb, "recvfrom");
+    sock_sys_fail(mrb, "recvfrom");
   mrb_str_resize(mrb, buf, (mrb_int)n);
   mrb_str_resize(mrb, sa, (mrb_int)socklen);
 
@@ -721,7 +731,7 @@ mrb_basicsocket_send(mrb_state *mrb, mrb_value self)
     n = sendto(socket_fd(mrb, self), RSTRING_PTR(mesg), (fsize_t)RSTRING_LEN(mesg), (int)flags, (const struct sockaddr*)RSTRING_PTR(dest), (fsize_t)RSTRING_LEN(dest));
   }
   if (n == -1)
-    mrb_sys_fail(mrb, "send");
+    sock_sys_fail(mrb, "send");
   return mrb_fixnum_value((mrb_int)n);
 }
 
@@ -743,7 +753,7 @@ mrb_basicsocket_setnonblock(mrb_state *mrb, mrb_value self)
   int fd = socket_fd(mrb, self);
 
   if (mrb_hal_socket_set_nonblock(mrb, fd, nonblocking) == -1)
-    mrb_sys_fail(mrb, "set_nonblock");
+    sock_sys_fail(mrb, "set_nonblock");
 
   return mrb_nil_value();
 }
@@ -801,7 +811,7 @@ mrb_basicsocket_setsockopt(mrb_state *mrb, mrb_value self)
 
   int s = socket_fd(mrb, self);
   if (setsockopt(s, (int)level, (int)optname, RSTRING_PTR(optval), (socklen_t)RSTRING_LEN(optval)) == -1)
-    mrb_sys_fail(mrb, "setsockopt");
+    sock_sys_fail(mrb, "setsockopt");
   return mrb_fixnum_value(0);
 }
 
@@ -822,7 +832,7 @@ mrb_basicsocket_shutdown(mrb_state *mrb, mrb_value self)
 
   mrb_get_args(mrb, "|i", &how);
   if (shutdown(socket_fd(mrb, self), (int)how) != 0)
-    mrb_sys_fail(mrb, "shutdown");
+    sock_sys_fail(mrb, "shutdown");
   return mrb_fixnum_value(0);
 }
 
@@ -935,7 +945,7 @@ mrb_ipsocket_recvfrom(mrb_state *mrb, mrb_value self)
   ssize_t n = recvfrom(fd, RSTRING_PTR(buf), (fsize_t)maxlen, (int)flags,
                        (struct sockaddr*)&ss, &socklen);
   if (n == -1) {
-    mrb_sys_fail(mrb, "recvfrom");
+    sock_sys_fail(mrb, "recvfrom");
   }
   mrb_str_resize(mrb, buf, (mrb_int)n);
 
@@ -965,9 +975,39 @@ mrb_socket_gethostname(mrb_state *mrb, mrb_value cls)
   mrb_value buf = mrb_str_new_capa(mrb, (mrb_int)bufsize);
 
   if (gethostname(RSTRING_PTR(buf), (fsize_t)bufsize) != 0)
-    mrb_sys_fail(mrb, "gethostname");
+    sock_sys_fail(mrb, "gethostname");
   mrb_str_resize(mrb, buf, (mrb_int)strlen(RSTRING_PTR(buf)));
   return buf;
+}
+
+/*
+ * call-seq:
+ *   Socket.ip_address_list -> array
+ *
+ * Returns an array of `Addrinfo` objects representing all local IP addresses
+ * on every network interface (both IPv4 and IPv6).  Loopback and link-local
+ * addresses are included; the caller is responsible for filtering.
+ *
+ *   Socket.ip_address_list
+ *   #=> [#<Addrinfo: 127.0.0.1>, #<Addrinfo: ::1>, #<Addrinfo: 192.0.2.1>, ...]
+ *
+ * Backed by `getifaddrs(3)` on POSIX and `GetAdaptersAddresses` on Windows.
+ */
+static mrb_value
+mrb_socket_ip_address_list(mrb_state *mrb, mrb_value klass)
+{
+  (void)klass;
+  mrb_value sas = mrb_hal_socket_ip_address_list(mrb);
+  struct RClass *ainfo = mrb_class_get_id(mrb, MRB_SYM(Addrinfo));
+  mrb_value result = mrb_ary_new_capa(mrb, RARRAY_LEN(sas));
+  int arena_idx = mrb_gc_arena_save(mrb);
+  for (mrb_int i = 0; i < RARRAY_LEN(sas); i++) {
+    mrb_value sa = RARRAY_PTR(sas)[i];
+    mrb_value addr = mrb_obj_new(mrb, ainfo, 1, &sa);
+    mrb_ary_push(mrb, result, addr);
+    mrb_gc_arena_restore(mrb, arena_idx);
+  }
+  return result;
 }
 
 /*
@@ -985,7 +1025,7 @@ mrb_socket_accept(mrb_state *mrb, mrb_value klass)
   mrb_get_args(mrb, "i", &s0);
   int s1 = (int)accept(s0, NULL, NULL);
   if (s1 == -1) {
-    mrb_sys_fail(mrb, "accept");
+    sock_sys_fail(mrb, "accept");
   }
   return mrb_fixnum_value(s1);
 }
@@ -1003,7 +1043,7 @@ mrb_socket_accept2(mrb_state *mrb, mrb_value klass)
 
   int s1 = (int)accept(s0, (struct sockaddr*)RSTRING_PTR(sastr), &socklen);
   if (s1 == -1) {
-    mrb_sys_fail(mrb, "accept");
+    sock_sys_fail(mrb, "accept");
   }
 
   mrb_str_resize(mrb, sastr, socklen);
@@ -1026,7 +1066,7 @@ mrb_socket_bind(mrb_state *mrb, mrb_value klass)
 
   mrb_get_args(mrb, "iS", &s, &sastr);
   if (bind((int)s, (struct sockaddr*)RSTRING_PTR(sastr), (socklen_t)RSTRING_LEN(sastr)) == -1) {
-    mrb_sys_fail(mrb, "bind");
+    sock_sys_fail(mrb, "bind");
   }
   return mrb_nil_value();
 }
@@ -1045,7 +1085,7 @@ mrb_socket_connect(mrb_state *mrb, mrb_value klass)
 
   mrb_get_args(mrb, "iS", &s, &sastr);
   if (connect((int)s, (struct sockaddr*)RSTRING_PTR(sastr), (socklen_t)RSTRING_LEN(sastr)) == -1) {
-    mrb_sys_fail(mrb, "connect");
+    sock_sys_fail(mrb, "connect");
   }
   return mrb_nil_value();
 }
@@ -1063,7 +1103,7 @@ mrb_socket_listen(mrb_state *mrb, mrb_value klass)
 
   mrb_get_args(mrb, "ii", &s, &backlog);
   if (listen((int)s, (int)backlog) == -1) {
-    mrb_sys_fail(mrb, "listen");
+    sock_sys_fail(mrb, "listen");
   }
   return mrb_nil_value();
 }
@@ -1119,7 +1159,7 @@ mrb_socket_socketpair(mrb_state *mrb, mrb_value klass)
   mrb_get_args(mrb, "iii", &domain, &type, &protocol);
 
   if (mrb_hal_socket_socketpair(mrb, (int)domain, (int)type, (int)protocol, sv) == -1) {
-    mrb_sys_fail(mrb, "socketpair");
+    sock_sys_fail(mrb, "socketpair");
   }
 
   mrb_value ary = mrb_ary_new_capa(mrb, 2);
@@ -1145,7 +1185,7 @@ mrb_socket_socket(mrb_state *mrb, mrb_value klass)
 
   int s = (int)socket((int)domain, (int)type, (int)protocol);
   if (s == -1)
-    mrb_sys_fail(mrb, "socket");
+    sock_sys_fail(mrb, "socket");
   return mrb_fixnum_value(s);
 }
 
@@ -1220,7 +1260,7 @@ mrb_win32_basicsocket_sysread(mrb_state *mrb, mrb_value self)
       }
       break;
     case SOCKET_ERROR: /* Error */
-      mrb_sys_fail(mrb, "recv");
+      sock_sys_fail(mrb, "recv");
       break;
     default:
       if (RSTRING_LEN(buf) != ret) {
@@ -1263,7 +1303,7 @@ mrb_win32_basicsocket_syswrite(mrb_state *mrb, mrb_value self)
 
   int n = send(sd, RSTRING_PTR(str), (int)RSTRING_LEN(str), 0);
   if (n == SOCKET_ERROR)
-    mrb_sys_fail(mrb, "send");
+    sock_sys_fail(mrb, "send");
   return mrb_int_value(mrb, n);
 }
 
@@ -1342,6 +1382,7 @@ mrb_mruby_socket_gem_init(mrb_state* mrb)
   mrb_define_class_method_id(mrb, sock, MRB_SYM(_sockaddr_family), mrb_socket_sockaddr_family, MRB_ARGS_REQ(1));
   mrb_define_class_method_id(mrb, sock, MRB_SYM(_socket), mrb_socket_socket, MRB_ARGS_REQ(3));
   mrb_define_class_method_id(mrb, sock, MRB_SYM(gethostname), mrb_socket_gethostname, MRB_ARGS_NONE());
+  mrb_define_class_method_id(mrb, sock, MRB_SYM(ip_address_list), mrb_socket_ip_address_list, MRB_ARGS_NONE());
   mrb_define_class_method_id(mrb, sock, MRB_SYM(sockaddr_un), mrb_socket_sockaddr_un, MRB_ARGS_REQ(1));
   mrb_define_class_method_id(mrb, sock, MRB_SYM(socketpair), mrb_socket_socketpair, MRB_ARGS_REQ(3));
 

@@ -15,6 +15,9 @@ repos:
       - id: check-hooks-apply
         name: run check-hooks-apply
         description: check hooks apply to the repository
+      - id: check-useless-excludes
+        name: run check-useless-excludes
+        description: clean up unnecessary exclusion patterns
   - repo: local
     hooks:
       - id: prettier
@@ -25,6 +28,15 @@ repos:
         language: node
         additional_dependencies: ["prettier@3.7.4"]
         pass_filenames: false
+        stages: [manual]
+      - id: check-makefile-indentation
+        name: check Makefiles are indented with tabs
+        description: ensures that Makefiles are indented with tabs
+        entry: ./scripts/check_makefiles_for_tabs.sh
+        language: system
+        files: "(?i)^makefile$"
+        pass_filenames: true # <-- Crucial change: pass filenames to the script
+        types: [file] # Ensure only regular files are passed, not directories
         stages: [manual]
       - id: check-zip-file-is-not-committed
         name: disallow zip files

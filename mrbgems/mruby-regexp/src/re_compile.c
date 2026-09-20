@@ -50,6 +50,8 @@ compile_error(re_compiler *c, const char *msg)
   c->code = NULL;
   mrb_free(c->mrb, c->classes);
   c->classes = NULL;
+  mrb_free(c->mrb, c->named_captures);
+  c->named_captures = NULL;
   if (c->stripped) mrb_free(c->mrb, c->stripped);
   c->stripped = NULL;
 
@@ -118,9 +120,20 @@ next_char(re_compiler *c)
   return (uint8_t)*c->p++;
 }
 
+/* Class IDs are stored in re_inst.a (uint8_t), so at most 256 distinct
+   character classes can be encoded.  Without this cap, class_capa
+   (uint16_t) overflows on doubling past 32768 (8 -> 16 -> ... -> 32768
+   -> 0), mrb_realloc with size 0 returns NULL, and the next memset
+   crashes; even before that, the (uint8_t)id cast at emit sites would
+   silently alias different classes. */
+#define RE_MAX_CLASSES 256
+
 static uint16_t
 add_class(re_compiler *c)
 {
+  if (c->num_classes >= RE_MAX_CLASSES) {
+    compile_error(c, "too many character classes");
+  }
   if (c->num_classes >= c->class_capa) {
     c->class_capa = c->class_capa ? c->class_capa * 2 : 8;
     c->classes = (re_charclass*)mrb_realloc(c->mrb, c->classes, sizeof(re_charclass) * c->class_capa);
@@ -264,6 +277,11 @@ compile_charclass(re_compiler *c)
   emit(c, negated ? RE_NCLASS : RE_CLASS, (uint8_t)id, 0);
 }
 
+/* Maximum value for {n}/{n,m} quantifiers. Each unit becomes (min-1) +
+   (max-min) emitted copies of the inner atom; the cap keeps both the
+   parse free of integer overflow and the bytecode size sane. */
+#define RE_MAX_REPEAT 32768
+
 /* Parse {n}, {n,}, {n,m} quantifier. Returns min,max via pointers. */
 static mrb_bool
 parse_quantifier(re_compiler *c, int *min_out, int *max_out)
@@ -273,6 +291,7 @@ parse_quantifier(re_compiler *c, int *min_out, int *max_out)
 
   while (peek(c) >= '0' && peek(c) <= '9') {
     min = min * 10 + (next_char(c) - '0');
+    if (min > RE_MAX_REPEAT) compile_error(c, "quantifier too large");
   }
   if (peek(c) == ',') {
     next_char(c);
@@ -280,6 +299,7 @@ parse_quantifier(re_compiler *c, int *min_out, int *max_out)
       max = 0;
       while (peek(c) >= '0' && peek(c) <= '9') {
         max = max * 10 + (next_char(c) - '0');
+        if (max > RE_MAX_REPEAT) compile_error(c, "quantifier too large");
       }
     }
     /* else max = -1 (unlimited) */

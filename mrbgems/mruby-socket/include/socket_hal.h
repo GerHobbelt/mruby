@@ -29,6 +29,16 @@ void mrb_hal_socket_init(mrb_state *mrb);
 void mrb_hal_socket_final(mrb_state *mrb);
 
 /*
+ * Error Handling
+ */
+
+/* Translate the most recent socket-API error into a POSIX errno value and
+ * store it in errno. On Windows, this reads WSAGetLastError() and maps it;
+ * on POSIX, this is a no-op (errno is already set by the failed call).
+ * Call this immediately after a socket-API failure, before mrb_sys_fail. */
+void mrb_hal_socket_set_errno_from_last_error(void);
+
+/*
  * Socket Control Operations
  */
 
@@ -75,6 +85,15 @@ int mrb_hal_socket_socketpair(mrb_state *mrb, int domain, int type, int protocol
 /* Get Unix socket path from sockaddr
  * Returns: Unix socket path string, or raises exception if not supported */
 mrb_value mrb_hal_socket_unix_path(mrb_state *mrb, const char *sockaddr, size_t socklen);
+
+/* Enumerate local IP addresses for all network interfaces.
+ * Returns an Array of String values, each a binary sockaddr_in (AF_INET) or
+ * sockaddr_in6 (AF_INET6) ready to be passed to Addrinfo.new.  Loopback,
+ * link-local, and other interface-local addresses are included; the caller
+ * is responsible for filtering if needed.
+ * Raises a SystemCallError on failure of the underlying platform call
+ * (getifaddrs / GetAdaptersAddresses). */
+mrb_value mrb_hal_socket_ip_address_list(mrb_state *mrb);
 
 #ifdef __cplusplus
 }

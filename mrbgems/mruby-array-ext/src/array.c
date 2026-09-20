@@ -32,10 +32,8 @@ typedef khash_t(ary_set) ary_set_t;
 /* Combination state structure for repeated_combination optimization */
 struct mrb_combination_state {
   mrb_int *indices;
-  mrb_int n;
-  mrb_int array_size;
-  mrb_bool permutation;
-  mrb_bool finished;
+  mrb_int n, k; /* nPk, nCk */
+  int mode;
 };
 
 static void
@@ -1533,6 +1531,13 @@ ary_deconstruct(mrb_state *mrb, mrb_value ary)
   return ary;
 }
 
+enum {
+  comb_finished             = 0,
+  comb_repeated_permutation = 1,
+  comb_repeated_combination = 2,
+  comb_permutation          = 3,
+  comb_combination          = 4
+};
 
 /*
  *  Internal method to initialize combination state.
@@ -1541,18 +1546,42 @@ ary_deconstruct(mrb_state *mrb, mrb_value ary)
 static mrb_value
 ary_combination_init(mrb_state *mrb, mrb_value self)
 {
-  mrb_int n;
-  mrb_bool permutation;
+  mrb_int k;
+  mrb_sym mode_sym;
 
-  mrb_get_args(mrb, "ib", &n, &permutation);
+  mrb_get_args(mrb, "ni", &mode_sym, &k);
 #if MRB_INT_MAX > SIZE_MAX
-  if (n > SIZE_MAX) {
+  if (k > SIZE_MAX) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "number too large");
   }
 #endif
 
-  if (n < 1 || RARRAY_LEN(self) < 1) {
+  if (k < 1 || RARRAY_LEN(self) < 1) {
     return mrb_nil_value();
+  }
+
+  int mode;
+  switch (mode_sym) {
+  case MRB_SYM(repeated_permutation):
+    mode = comb_repeated_permutation;
+    break;
+  case MRB_SYM(repeated_combination):
+    mode = comb_repeated_combination;
+    break;
+  case MRB_SYM(permutation):
+    if (k > RARRAY_LEN(self)) {
+      return mrb_nil_value();
+    }
+    mode = comb_permutation;
+    break;
+  case MRB_SYM(combination):
+    if (k > RARRAY_LEN(self)) {
+      return mrb_nil_value();
+    }
+    mode = comb_combination;
+    break;
+  default:
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "wrong mode");
   }
 
   struct RData *d;
@@ -1560,13 +1589,29 @@ ary_combination_init(mrb_state *mrb, mrb_value self)
   Data_Make_Struct(mrb, mrb->object_class, struct mrb_combination_state,
                    &mrb_combination_state_type, state, d);
 
-  state->n = n;
-  state->array_size = RARRAY_LEN(self);
-  state->permutation = permutation;
-  state->finished = FALSE;
-  state->indices = (mrb_int*)mrb_calloc(mrb, n, sizeof(mrb_int));
+  state->k = k;
+  state->n = RARRAY_LEN(self);
+  state->mode = mode;
+  state->indices = (mrb_int*)mrb_calloc(mrb, k, sizeof(mrb_int));
+
+  if (mode == comb_permutation || mode == comb_combination) {
+    for (mrb_int i = 0; i < k; i++) {
+      state->indices[i] = i;
+    }
+  }
 
   return mrb_obj_value(d);
+}
+
+static void
+adjust_next_permutation_index(struct mrb_combination_state *state, mrb_int i)
+{
+  for (mrb_int j = i - 1; j >= 0; j--) {
+    if (state->indices[i] == state->indices[j]) {
+      state->indices[i]++;
+      j = i;
+    }
+  }
 }
 
 /*
@@ -1580,47 +1625,79 @@ ary_combination_next(mrb_state *mrb, mrb_value self)
   mrb_get_args(mrb, "d", &state, &mrb_combination_state_type);
 
   /* Check if iteration is complete */
-  if (state->finished) return mrb_nil_value();
+  if (state->mode == comb_finished) return mrb_nil_value();
 
   /* Validate array hasn't been modified during iteration */
-  if (RARRAY_LEN(self) != state->array_size) {
+  if (RARRAY_LEN(self) != state->n) {
     mrb_raise(mrb, E_RUNTIME_ERROR, "array modified during iteration");
   }
 
   /* Validate current indices are still in bounds */
-  for (mrb_int i = 0; i < state->n; i++) {
-    if (state->indices[i] >= state->array_size) {
-      state->finished = TRUE;
+  for (mrb_int i = 0; i < state->k; i++) {
+    if (state->indices[i] >= state->n) {
+      state->mode = comb_finished;
       return mrb_nil_value();
     }
   }
 
   /* Build current combination */
-  mrb_value result = mrb_ary_new_capa(mrb, state->n);
+  mrb_value result = mrb_ary_new_capa(mrb, state->k);
   const mrb_value *p = RARRAY_PTR(self);
-  for (mrb_int i = 0; i < state->n; i++) {
+  for (mrb_int i = 0; i < state->k; i++) {
     mrb_ary_push(mrb, result, p[state->indices[i]]);
   }
 
-  mrb_int pos = state->n - 1;
-
-  while (pos >= 0) {
-    state->indices[pos]++;
-    if (state->indices[pos] < state->array_size) break;
-    pos--;
-  }
-
-  if (pos < 0) {
-    state->finished = TRUE;
-  }
-  else {
-    /* Reset dependent indices */
-    mrb_int reset = state->permutation ? 0 : state->indices[pos];
-    for (pos++; pos < state->n; pos++) {
-      state->indices[pos] = reset;
+  switch (state->mode) {
+  case comb_repeated_permutation:
+  case comb_repeated_combination:
+    for (mrb_int i = state->k - 1; i >= 0; i--) {
+      state->indices[i]++;
+      if (state->indices[i] < state->n) {
+        /* Reset dependent indices */
+        mrb_int reset = (state->mode == comb_repeated_permutation) ? 0 : state->indices[i];
+        for (i++; i < state->k; i++) {
+          state->indices[i] = reset;
+        }
+        return result;
+      }
     }
+    break;
+  case comb_permutation:
+    for (mrb_int i = state->k - 1; i >= 0; i--) {
+      state->indices[i]++;
+
+      // adjust so that it does not overlap with the leading index
+      adjust_next_permutation_index(state, i);
+
+      if (state->indices[i] < state->n) {
+        // adjust all trailing indexes to complete the function
+        for (i++; i < state->k; i++) {
+          state->indices[i] = 0;
+          adjust_next_permutation_index(state, i);
+        }
+        return result;
+      }
+    }
+    break;
+  case comb_combination:
+    for (mrb_int i = state->k - 1; i >= 0; i--) {
+      state->indices[i]++;
+
+      if (state->indices[i] <= state->n - state->k + i) {
+        // replace each overflowed indices with an index incremented by 1 from the previous one
+        for (i++; i < state->k; i++) {
+          state->indices[i] = state->indices[i - 1] + 1;
+        }
+        return result;
+      }
+    }
+    break;
+  default: // it probably won’t happen, but just in case
+    result = mrb_nil_value();
+    break;
   }
 
+  state->mode = comb_finished;
   return result;
 }
 
