@@ -34,6 +34,19 @@ assert('super', '11.3.4') do
   assert_equal [1,2,3], bar.bar(1,2,3)
 end
 
+assert('super forwards the caller\'s block from inside a block') do
+  # `super` reads the block from the frame of the method it belongs to.  From
+  # inside a block that frame is reached through an env, and the level the
+  # instruction carries counts the envs above this frame's own, one fewer
+  # than the scopes the compiler walked to find the method.
+  base = Class.new { def m; block_given? ? yield(:b) : :noblk; end }
+  sub = Class.new(base) { def m; r = nil; [1].each { r = super }; r; end }
+  assert_equal [:blk, :b], sub.new.m { |v| [:blk, v] }
+
+  deep = Class.new(base) { def m; r = nil; [1].each { [2].each { r = super } }; r; end }
+  assert_equal [:blk, :b], deep.new.m { |v| [:blk, v] }
+end
+
 assert('yield', '11.3.5') do
 # it's syntax error now
 #  assert_raise LocalJumpError do
@@ -2271,4 +2284,54 @@ assert('local variable operator-assignment with a non-numeric receiver') do
   # propagates rather than being swallowed
   obj3 = Class.new { def +(n); raise ArgumentError, n.to_s; end }.new
   assert_raise_with_message(ArgumentError, "7") { obj3 += 7 }
+end
+
+assert('pattern matching - the case value survives a failed clause') do
+  # The move that puts the case value in a register of its own is not the
+  # last read of the value: every `in` clause reads that register again.
+  # Folding the move into the first clause's own move left the register the
+  # later clauses read never written.
+  f = ->(x) {
+    case x
+    in {zz: 1} then :zz
+    in {a: 1} then :a
+    else :none
+    end
+  }
+  assert_equal :a, f.call({a: 1})
+  assert_equal :zz, f.call({zz: 1})
+  assert_equal :none, f.call({b: 1})
+
+  g = ->(x) {
+    case x
+    in [1, 2] then :two
+    in [1] then :one
+    else :none
+    end
+  }
+  assert_equal :two, g.call([1, 2])
+  assert_equal :one, g.call([1])
+  assert_equal :none, g.call([3])
+
+  # a third clause reads it as well
+  h = ->(x) {
+    case x
+    in {zz: 1} then :zz
+    in {yy: 1} then :yy
+    in {a: 1} then :a
+    else :none
+    end
+  }
+  assert_equal :a, h.call({a: 1})
+  assert_equal :none, h.call({b: 1})
+
+  # the one-line forms read it again for a later alternative
+  i = ->(x) { x in {a: 1} | {b: 2} }
+  assert_true i.call({b: 2})
+  assert_true i.call({a: 1})
+  assert_false i.call({c: 3})
+
+  j = ->(x) { x => {a: 1} | {b: 2}; :ok }
+  assert_equal :ok, j.call({b: 2})
+  assert_raise(NoMatchingPatternError) { j.call({c: 3}) }
 end

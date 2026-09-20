@@ -110,6 +110,8 @@ struct mrb_backtrace_location {
 
 /* gc */
 size_t mrb_gc_mark_mt(mrb_state*, struct RClass*);
+int mrb_equal_in_c(mrb_state*, mrb_value, mrb_value);
+void mrb_gc_each_live_object(mrb_state*, int (*)(mrb_state*, struct RBasic*, void*), void*);
 void mrb_gc_free_mt(mrb_state*, struct RClass*);
 
 /* hash */
@@ -761,6 +763,7 @@ mrb_shape_lookup(mrb_state *mrb, mrb_iv_shape *shape, mrb_sym sym)
 #define MRB_CI_MODFUNC_P(ci) MRB_FLAG_CHECK((ci)->vis, 3)
 #define MRB_CI_SET_MODFUNC(ci) MRB_FLAG_ON((ci)->vis, 3)
 #define MRB_CI_CLEAR_MODFUNC(ci) MRB_FLAG_OFF((ci)->vis, 3)
+void mrb_vm_ci_inherit_visibility(mrb_state *mrb, const struct RProc *p);
 mrb_int mrb_ci_bidx(mrb_callinfo *ci);
 mrb_int mrb_ci_nregs(mrb_callinfo *ci);
 mrb_value mrb_exec_irep(mrb_state *mrb, mrb_value self, const struct RProc *p);

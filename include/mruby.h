@@ -311,7 +311,8 @@ typedef void (*mrb_atexit_func)(mrb_state*);
 
 /**
  * Slots of `mrb_state.idx_class`, one per builtin the inline index opcodes
- * (`OP_GETIDX`, `OP_GETIDX0`, `OP_SETIDX`) reimplement in C.
+ * (`OP_GETIDX`, `OP_GETIDX0`, `OP_SETIDX`) reimplement in C, plus one for
+ * `String#+`, which `OP_ADD` guards the same way.
  */
 enum mrb_idx_op_slot {
   MRB_IDX_OP_ARY_AREF,          /* Array#[]  */
@@ -320,6 +321,7 @@ enum mrb_idx_op_slot {
   MRB_IDX_OP_ARY_ASET,          /* Array#[]= */
   MRB_IDX_OP_HASH_ASET,         /* Hash#[]=  */
   MRB_IDX_OP_STR_ASET,          /* String#[]= */
+  MRB_IDX_OP_STR_ADD,           /* String#+  */
   MRB_IDX_OP_SLOT_COUNT
 };
 
@@ -345,8 +347,16 @@ enum mrb_bop {
 #define MRB_BOP_INTEGER(op) (1u << (op))                  /* Integer#op */
 #define MRB_BOP_FLOAT(op)   (1u << (MRB_BOP_COUNT + (op))) /* Float#op   */
 #define MRB_BOP_NUMERIC(op) (MRB_BOP_INTEGER(op) | MRB_BOP_FLOAT(op))
-#define MRB_BOP_SYMBOL_EQ   (1u << (2 * MRB_BOP_COUNT))    /* Symbol#==  */
-#define MRB_BOP_SLOT_COUNT  (2 * MRB_BOP_COUNT + 1)
+#define MRB_BOP_SYMBOL_EQ_SLOT (2 * MRB_BOP_COUNT)         /* Symbol#==  */
+#define MRB_BOP_SYMBOL_EQ   (1u << MRB_BOP_SYMBOL_EQ_SLOT)
+#define MRB_BOP_SLOT_COUNT  (MRB_BOP_SYMBOL_EQ_SLOT + 1)
+/* `nil`, `true` and `false` are immediate as well, so `OP_EQ` reads no class
+   of theirs, but their classes are ordinary heap ones whose own `==` is
+   recorded by `MRB_FL_CLASS_EQ_DEFINED`.  This bit carries that flag of the
+   three into the mask the opcode already tests.  It is not a slot: nothing
+   records a builtin for it and nothing rechecks it, since nothing clears the
+   flag it mirrors. */
+#define MRB_BOP_NIL_TRUE_FALSE_EQ (1u << MRB_BOP_SLOT_COUNT)
 
 #ifdef MRB_USE_TASK_SCHEDULER
 struct mrb_task;
@@ -477,7 +487,8 @@ struct mrb_state {
   uint16_t atexit_stack_len;
 
   /* The inline index opcodes answer `[]` and `[]=` from C for a receiver whose
-     class is exactly Array, Hash or String, which would bypass a redefinition
+     class is exactly Array, Hash or String, and `OP_ADD` answers `+` for one
+     whose class is exactly String, which would bypass a redefinition
      installed on those classes themselves.  Each slot holds the core class
      while the name still resolves to the builtin recorded in `idx_builtin`,
      and NULL once it does not, so the class-pointer test the opcodes already
@@ -494,7 +505,9 @@ struct mrb_state {
      slot to disarm; each (class, operator) pair owns a bit here instead, clear
      while the operator still resolves to the builtin recorded in
      `bop_builtin` and set once it does not.  Bit numbers are the `MRB_BOP_*`
-     macros, which also index `bop_builtin`. */
+     macros, which also index `bop_builtin`; the one bit above them,
+     `MRB_BOP_NIL_TRUE_FALSE_EQ`, mirrors a class flag instead of a builtin
+     and indexes nothing. */
   uint32_t bop_redefined;
   mrb_method_t bop_builtin[MRB_BOP_SLOT_COUNT];
 
@@ -992,7 +1005,12 @@ MRB_API mrb_value mrb_obj_dup(mrb_state *mrb, mrb_value obj);
 
 /**
  * Returns true if obj responds to the given method. If the method was defined for that
- * class it returns true, it returns false otherwise.
+ * class, and this build implements it, it returns true; it returns false otherwise.
+ *
+ * Visibility is not weighed: a private or protected method answers true here,
+ * where `Kernel#respond_to?` asked without `include_private` answers false. A
+ * method that stands for a feature this build does not have answers false, as
+ * it does there.
  *
  *      Example:
  *      # Ruby style

@@ -184,14 +184,17 @@ assert('Calling the same method as the variable name') do
   assert_equal("Hit!") { fuga = "Miss!"; eval("-> { hoge.fuga }").call }
 end
 
-assert('Access numbered parameter from eval') do
+assert('a numbered parameter is not a name an eval string can use') do
+  # A numbered parameter belongs to the block that spells it, and a string is
+  # compiled with no block of its own, so the name is a method call there.
   hoge = Object.new
   def hoge.fuga(a, &b)
     b.call(a)
   end
-  assert_equal(6) {
-    hoge.fuga(3) { _1 + eval("_1") }
-  }
+  assert_equal(3) { hoge.fuga(3) { _1 } }
+  assert_raise(NameError) { hoge.fuga(3) { _1 + eval("_1") } }
+  assert_raise(NameError) { hoge.fuga(3) { eval("_1") } }
+  assert_raise(NameError) { hoge.fuga(3) { |a| eval("_1") } }
 end
 
 assert('Module#class_eval with string') do
@@ -249,6 +252,97 @@ assert 'method visibility with eval' do
   assert_equal "GOOD!" do
     c.new.good!
   end
+end
+
+assert 'a `def` in an eval string takes the visibility around the call' do
+  class Test4EvalVisibility
+    private
+    eval("def from_string; end")
+    protected
+    eval("def protected_from_string; end")
+    public
+    eval("def public_from_string; :ok; end")
+  end
+
+  o = Test4EvalVisibility.new
+  assert_raise(NoMethodError) { o.from_string }
+  assert_raise(NoMethodError) { o.protected_from_string }
+  assert_include Test4EvalVisibility.protected_instance_methods(false), :protected_from_string
+  assert_equal :ok, o.public_from_string
+end
+
+assert 'the visibility an eval string starts at is the one its whole scope is at' do
+  # The scope reaches the string through the env it shares with the caller, so
+  # a block between the two, and a second eval inside the first, are steps on
+  # the way to the `private` rather than scopes of their own.
+  class Test4EvalVisibilityNested
+    private
+    [1].each { eval("def from_block; end") }
+    eval("eval('def from_nested_string; end')")
+  end
+
+  o = Test4EvalVisibilityNested.new
+  assert_raise(NoMethodError) { o.from_block }
+  assert_raise(NoMethodError) { o.from_nested_string }
+end
+
+assert 'a `def` in an eval string follows a `module_function` around the call' do
+  module Test4EvalVisibilityModuleFunction
+    module_function
+    eval("def from_string; :ok; end")
+  end
+
+  assert_equal :ok, Test4EvalVisibilityModuleFunction.from_string
+  assert_include Test4EvalVisibilityModuleFunction.private_instance_methods(false), :from_string
+end
+
+assert 'eval with a binding takes the visibility where the binding was made' do
+  class Test4EvalVisibilityPublicScope
+    SCOPE = binding
+  end
+  class Test4EvalVisibilityPrivateScope
+    private
+    SCOPE = binding
+  end
+
+  # the binding names the scope the string runs in, so the visibility comes
+  # from there and not from the private scope the `eval` is called in
+  class Test4EvalVisibilityBindingCaller
+    private
+    eval("def from_public_scope; :ok; end", Test4EvalVisibilityPublicScope::SCOPE)
+    eval("def from_private_scope; end", Test4EvalVisibilityPrivateScope::SCOPE)
+  end
+
+  assert_equal :ok, Test4EvalVisibilityPublicScope.new.from_public_scope
+  assert_raise(NoMethodError) { Test4EvalVisibilityPrivateScope.new.from_private_scope }
+end
+
+assert 'a visibility written in a string given a binding stays with the scope' do
+  # A binding names a scope where a plain eval string copies one, so what the
+  # string writes reaches the scope itself and every other binding on it.
+  class Test4EvalVisibilityBindingWrite
+    FIRST = binding
+    SECOND = binding
+    eval("private", FIRST)
+    def written_after; end
+  end
+  eval("def from_the_other_binding; end", Test4EvalVisibilityBindingWrite::SECOND)
+
+  o = Test4EvalVisibilityBindingWrite.new
+  assert_raise(NoMethodError) { o.written_after }
+  assert_raise(NoMethodError) { o.from_the_other_binding }
+end
+
+assert 'a string given to class_eval starts public wherever it is called' do
+  # `class_eval` gives the string the receiver for a scope rather than the
+  # caller's, and a scope of one's own starts at the default.
+  class Test4EvalVisibilityClassEvalCaller
+    private
+    TARGET = Class.new
+    TARGET.class_eval("def from_string; :ok; end")
+  end
+
+  assert_equal :ok, Test4EvalVisibilityClassEvalCaller::TARGET.new.from_string
 end
 
 assert('alias and undef reject a dynamic symbol') do
@@ -339,4 +433,145 @@ assert('a string class_eval still runs inside the caller\'s scope') do
   # defines on the receiver.
   c.method(:class_eval).call("def from_c_caller; end")
   assert_true c.method_defined?(:from_c_caller)
+end
+
+assert('a string given to eval is named for the method that called eval') do
+  # The string runs on a frame of its own, pushed on top of the C frame of
+  # `eval`, and that frame used to carry `eval` as its method name: a `super`
+  # in the string looked for the superclass method of `eval` itself, and
+  # `defined?(super)` answered `"super"` in a method that has no superclass
+  # method to call.
+  base = Class.new do
+    def m(x); [:base, x]; end
+    def has_super(x); end
+  end
+  sub = Class.new(base) do
+    def m(x); eval("super(x + 10)"); end
+    def has_super(x); eval("defined?(super)"); end
+    def no_super; eval("defined?(super)"); end
+    def named; eval("__method__"); end
+  end
+  o = sub.new
+
+  assert_equal [:base, 11], o.m(1)
+  assert_equal 'super', o.has_super(1)
+  assert_nil o.no_super
+  assert_equal :named, o.named
+
+  # Outside a method there is no name to carry, and `eval`'s own must not
+  # stand in for one.
+  assert_nil eval("__method__")
+  assert_nil binding.eval("__method__")
+  assert_raise(NoMethodError) { eval("super") }
+end
+
+assert('`super` and `yield` in a string given to eval belong to the caller') do
+  # The string's own scope chain holds no method scope, so the argument
+  # layout that a bare `super` forwards and that `yield` finds the block by
+  # comes from the method on the proc chain the compile context carries.
+  base = Class.new do
+    def m(x); [:base, x]; end
+    def blk; block_given? ? yield(:b) : :noblk; end
+  end
+  sub = Class.new(base) do
+    def m(x); eval("super"); end
+    def blk; eval("super"); end
+    def y; eval("yield 21"); end
+    def y_nested; eval("[1].map { yield 2 }"); end
+    def y_args(a, b = 1, *r, c, d: 4, &e); eval("yield a"); end
+  end
+  o = sub.new
+
+  assert_equal [:base, 1], o.m(1)
+  assert_equal [:blk, :b], o.blk { |v| [:blk, v] }
+  assert_equal 42, o.y { |v| v * 2 }
+  assert_equal [4], o.y_nested { |v| v * 2 }
+  assert_equal 35, o.y_args(7, 8) { |v| v * 5 }
+
+  # Outside a method there is still no block to reach.
+  assert_raise(SyntaxError) { eval("yield") }
+end
+
+assert('`return` in a string given to eval leaves the calling method') do
+  # `OP_RETURN` returns to the string's own frame, whose caller is the C
+  # function `eval`, so the value became `eval`'s and the method carried on.
+  # A `return` here leaves the method the way one from a block does.
+  k = Class.new do
+    def ret; eval("return :from_string"); :after_eval; end
+    def ret_nested; eval("eval('return :from_nested')"); :after_eval; end
+    def ret_def; eval("def inner; return :inner; end"); inner; end
+    def ret_lambda; eval("-> { return :lambda }.call"); end
+  end
+  o = k.new
+
+  assert_equal :from_string, o.ret
+  assert_equal :from_nested, o.ret_nested
+  assert_equal :inner, o.ret_def
+  assert_equal :lambda, o.ret_lambda
+end
+
+assert('a string given to eval in a `define_method` block sees the closure') do
+  # `define_method` marks the block it installs a scope, the way `def` marks a
+  # method body, but the block keeps the closure it was made with: what a
+  # direct reference reaches from inside it, `eval` reaches too.
+  class TestEvalDefineMethod
+    x = 10
+    define_method(:direct) { x }
+    define_method(:read) { eval("x") }
+    define_method(:own) { |a| b = 1; eval("[a, b, x]") }
+    define_method(:nested) { [1].map { eval("x") } }
+    define_method(:by_lambda, lambda { eval("x") })
+    define_method(:write) { eval("x = 20") }
+
+    class << self
+      y = 30
+      define_method(:sclass_read) { eval("y") }
+    end
+  end
+
+  # A scope with no locals of its own is still a scope the block closes over,
+  # and the walk that builds the parser's scope list has to end at it all the
+  # same: it is the shape a binding's local-variable space takes too.
+  class TestEvalEmptyScope
+    1.times do
+      z = 40
+      define_method(:from_block) { eval("z") }
+    end
+  end
+
+  k = TestEvalDefineMethod
+  o = k.new
+
+  assert_equal 10, o.direct
+  assert_equal 10, o.read
+  assert_equal [5, 1, 10], o.own(5)
+  assert_equal [10], o.nested
+  assert_equal 10, o.by_lambda
+  assert_equal 30, k.sclass_read
+  assert_equal 40, TestEvalEmptyScope.new.from_block
+
+  # The store reaches the captured local itself, so the direct reference and
+  # the next instance both see it.
+  assert_equal 20, o.write
+  assert_equal 20, o.direct
+  assert_equal 20, k.new.read
+end
+
+assert('a string given to eval in a `def` body has no scope around it') do
+  # A method body carries no closure, so a local of the scope it was written
+  # in is not a name it can reach: it is a method call there.
+  class TestEvalDefScope
+    x = 10
+    def hidden; eval("x"); end
+    def self.hidden_singleton; eval("x"); end
+
+    class << self
+      y = 30
+      def hidden_sclass; eval("y"); end
+    end
+  end
+
+  assert_raise(NameError) { TestEvalDefScope.new.hidden }
+  assert_raise(NameError) { TestEvalDefScope.hidden_singleton }
+  assert_raise(NameError) { TestEvalDefScope.hidden_sclass }
 end

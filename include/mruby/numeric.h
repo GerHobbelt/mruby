@@ -47,6 +47,18 @@ MRB_API mrb_value mrb_num_mul(mrb_state *mrb, mrb_value x, mrb_value y);
 MRB_API mrb_value mrb_uint64_value(mrb_state *mrb, uint64_t v);
 MRB_API mrb_value mrb_int64_value(mrb_state *mrb, int64_t v);
 
+/* The same boundary read from the other side: the C integer an Integer holds.
+   A value inside the width answers itself however it is stored, a Fixnum and
+   a Bignum alike, and one outside it raises RangeError, so what went through
+   the calls above comes back through these.  A Float or a Rational is taken
+   as mrb_ensure_integer_type() takes it, and what has no integer to give
+   raises TypeError.
+
+   Spelled `as` because that is what this direction is called here, as in
+   mrb_as_int(), mrb_as_float() and mrb_bint_as_int64(). */
+MRB_API uint64_t mrb_as_uint64(mrb_state *mrb, mrb_value x);
+MRB_API int64_t mrb_as_int64(mrb_state *mrb, mrb_value x);
+
 /* The same, spelled for the C types a library counts in, whose own width
    varies by platform: a size_t is 32 bits where the time_t beside it is 64.
    A caller passes what it holds and does not have to know which of the two
@@ -60,6 +72,27 @@ MRB_API mrb_value mrb_int64_value(mrb_state *mrb, int64_t v);
    this takes: they differ in width wherever mrb_int is 32 bits. */
 #define mrb_value_from_size_t(mrb, v)   mrb_uint64_value((mrb), (uint64_t)(v))
 #define mrb_value_from_ssize_t(mrb, v)  mrb_int64_value((mrb), (int64_t)(v))
+
+#ifdef MRB_USE_BIGINT
+/* An Integer as the bytes a wire format spells, most significant first, with
+   the sign kept apart from them: what CBOR's bignum tags and ASN.1's INTEGER
+   are written in.  This is not the order the limbs sit in, which is whatever
+   this machine stores an integer in and is what mrb_bint_new_bytes() reads.
+
+   mrb_integer_to_bytes() answers the bytes the magnitude needs, and writes
+   them only when `buf` is not NULL and `len` is at least that, so asking with
+   NULL is how a caller learns what to allocate.  `sign` takes -1, 0 or 1, and
+   may be NULL.  Zero needs no bytes and answers 0.
+
+   mrb_integer_from_bytes() reads them back.  Leading zero bytes are allowed
+   and drop out, a `sign` of 0 answers 0 whatever the bytes say, and the
+   answer is a Fixnum where the value fits one.
+
+   Declared where the conversions above are, but carried by mruby-bigint: a
+   build without it has no Integer these are for. */
+MRB_API size_t mrb_integer_to_bytes(mrb_state *mrb, mrb_value x, uint8_t *buf, size_t len, int *sign);
+MRB_API mrb_value mrb_integer_from_bytes(mrb_state *mrb, const uint8_t *bytes, size_t len, int sign);
+#endif
 
 MRB_API mrb_value mrb_integer_to_str(mrb_state *mrb, mrb_value x, mrb_int base);
 MRB_API char *mrb_int_to_cstr(char *buf, size_t len, mrb_int n, mrb_int base);

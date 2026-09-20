@@ -91,95 +91,6 @@
 #define MRC_ARGS_NONE()     ((mrc_aspec)0)
 
 
-#define MRC_INT_OVERFLOW_MASK ((mrc_uint)1 << (MRC_INT_BIT - 1))
-
-static inline mrc_bool
-mrc_int_add_overflow(mrc_int a, mrc_int b, mrc_int *c)
-{
-  mrc_uint x = (mrc_uint)a;
-  mrc_uint y = (mrc_uint)b;
-  mrc_uint z = (mrc_uint)(x + y);
-  *c = (mrc_int)z;
-  return !!(((x ^ z) & (y ^ z)) & MRC_INT_OVERFLOW_MASK);
-}
-
-static inline mrc_bool
-mrc_int_sub_overflow(mrc_int a, mrc_int b, mrc_int *c)
-{
-  mrc_uint x = (mrc_uint)a;
-  mrc_uint y = (mrc_uint)b;
-  mrc_uint z = (mrc_uint)(x - y);
-  *c = (mrc_int)z;
-  return !!(((x ^ z) & (~y ^ z)) & MRC_INT_OVERFLOW_MASK);
-}
-
-static inline mrc_bool
-mrc_int_mul_overflow(mrc_int a, mrc_int b, mrc_int *c)
-{
-#ifdef MRC_INT32
-  int64_t n = (int64_t)a * b;
-  *c = (mrc_int)n;
-  return n > MRC_INT_MAX || n < MRC_INT_MIN;
-#else /* MRC_INT64 */
-  if (a > 0 && b > 0 && a > MRC_INT_MAX / b) return TRUE;
-  if (a < 0 && b > 0 && a < MRC_INT_MIN / b) return TRUE;
-  if (a > 0 && b < 0 && b < MRC_INT_MIN / a) return TRUE;
-  if (a < 0 && b < 0 && (a <= MRC_INT_MIN || b <= MRC_INT_MIN || -a > MRC_INT_MAX / -b))
-    return TRUE;
-  *c = a * b;
-  return FALSE;
-#endif
-}
-
-static mrc_int
-mrc_div_int(mrc_int x, mrc_int y)
-{
-  mrc_int div = x / y;
-
-  if ((x ^ y) < 0 && x != div * y) {
-    div -= 1;
-  }
-  return div;
-}
-
-#define NUMERIC_SHIFT_WIDTH_MAX (MRC_INT_BIT-1)
-
-static mrc_bool
-mrc_num_shift(mrc_int val, mrc_int width, mrc_int *num)
-{
-  if (width < 0) {              /* rshift */
-    if (width == MRC_INT_MIN || -width >= NUMERIC_SHIFT_WIDTH_MAX) {
-      if (val < 0) {
-        *num = -1;
-      }
-      else {
-        *num = 0;
-      }
-    }
-    else {
-      *num = val >> -width;
-    }
-  }
-  else if (val > 0) {
-    if ((width > NUMERIC_SHIFT_WIDTH_MAX) ||
-        (val   > (MRC_INT_MAX >> width))) {
-      return FALSE;
-    }
-    *num = val << width;
-  }
-  else {
-    if ((width > NUMERIC_SHIFT_WIDTH_MAX) ||
-        (val   < (MRC_INT_MIN >> width))) {
-      return FALSE;
-    }
-    if (width == NUMERIC_SHIFT_WIDTH_MAX)
-      *num = MRC_INT_MIN;
-    else
-      *num = val * ((mrc_int)1 << width);
-  }
-  return TRUE;
-}
-
 #ifdef MRC_ENDIAN_BIG
 # define MRC_ENDIAN_LOHI(a,b) a b
 #else
@@ -1031,19 +942,6 @@ gen_move(mrc_codegen_scope *s, uint16_t dst, uint16_t src, int nopeep)
         struct mrc_insn_data data0 = mrc_decode_insn(mrc_prev_pc(s, data.addr));
         if (data0.insn != OP_MOVE || data0.a != data.a || data0.b != dst) goto normal;
         s->pc = addr_pc(s, data0.addr);
-        if (addr_pc(s, data0.addr) != s->lastlabel) {
-          /* constant folding */
-          struct mrc_insn_data data1 = mrc_decode_insn(mrc_prev_pc(s, data0.addr));
-          mrc_int n;
-          if (data1.a == dst && get_int_operand(s, &data1, &n)) {
-            if ((data.insn == OP_ADDI && !mrc_int_add_overflow(n, data.b, &n)) ||
-                (data.insn == OP_SUBI && !mrc_int_sub_overflow(n, data.b, &n))) {
-              s->pc = addr_pc(s, data1.addr);
-              gen_int(s, dst, n);
-              return;
-            }
-          }
-        }
         /* ADDILV/SUBILV fusion: MOVE temp local; ADDI/SUBI temp imm; MOVE local temp */
         /* -> ADDILV/SUBILV local temp imm (temp is working space for method fallback) */
         genop_3(s, data.insn == OP_ADDI ? OP_ADDILV : OP_SUBILV, dst, data.a, data.b);
@@ -1070,11 +968,6 @@ lv_idx(mrc_codegen_scope *s, mrc_sym id)
   return 0;
 }
 
-
-#define MRC_PROC_CFUNC_FL 128
-#define MRC_PROC_CFUNC_P(p) (((p)->flags & MRC_PROC_CFUNC_FL) != 0)
-#define MRC_PROC_SCOPE 2048
-#define MRC_PROC_SCOPE_P(p) (((p)->flags & MRC_PROC_SCOPE) != 0)
 
 static int
 search_upvar(mrc_codegen_scope *s, mrc_sym id, int *idx)
@@ -1112,7 +1005,7 @@ search_upvar(mrc_codegen_scope *s, mrc_sym id, int *idx)
           }
         }
       }
-      if (MRC_PROC_SCOPE_P(u)) break;
+      if (MRC_PROC_LVAR_BOUNDARY_P(u)) break;
       u = u->upper;
       lv++;
     }
@@ -1354,58 +1247,15 @@ gen_addsub(mrc_codegen_scope *s, uint8_t op, uint16_t dst)
       /* not integer immediate */
       goto normal;
     }
-    struct mrc_insn_data data0 = mrc_decode_insn(mrc_prev_pc(s, data.addr));
-    mrc_int n0;
-    if (addr_pc(s, data.addr) == s->lastlabel || !get_int_operand(s, &data0, &n0)) {
-      /* Fold to OP_ADDI/OP_SUBI only for non-negative 8-bit n; flipping op
-         for negative n would change the method sent on user override (#2557). */
-      if (n < 0 || n > UINT8_MAX) goto normal;
-      rewind_pc(s);
-      if (n == 0) return;
-      if (op == OP_ADD) genop_2(s, OP_ADDI, dst, (uint16_t)n);
-      else genop_2(s, OP_SUBI, dst, (uint16_t)n);
-      return;
-    }
-    if (op == OP_ADD) {
-      if (mrc_int_add_overflow(n0, n, &n)) goto normal;
-    }
-    else { /* OP_SUB */
-      if (mrc_int_sub_overflow(n0, n, &n)) goto normal;
-    }
-    s->pc = addr_pc(s, data0.addr);
-    gen_int(s, dst, n);
-  }
-}
-
-static void
-gen_muldiv(mrc_codegen_scope *s, uint8_t op, uint16_t dst)
-{
-  if (no_peephole(s)) {
-  normal:
-    genop_1(s, op, dst);
-    return;
-  }
-  else {
-    struct mrc_insn_data data = mrc_last_insn(s);
-    mrc_int n, n0;
-    if (addr_pc(s, data.addr) == s->lastlabel || !get_int_operand(s, &data, &n)) {
-      /* not integer immediate */
-      goto normal;
-    }
-    struct mrc_insn_data data0 = mrc_decode_insn(mrc_prev_pc(s, data.addr));
-    if (!get_int_operand(s, &data0, &n0)) {
-      goto normal;
-    }
-    if (op == OP_MUL) {
-      if (mrc_int_mul_overflow(n0, n, &n)) goto normal;
-    }
-    else { /* OP_DIV */
-      if (n == 0) goto normal;
-      if (n0 == MRC_INT_MIN && n == -1) goto normal;
-      n = mrc_div_int(n0, n);
-    }
-    s->pc = addr_pc(s, data0.addr);
-    gen_int(s, dst, n);
+    /* Fold to OP_ADDI/OP_SUBI only for non-negative 8-bit n; flipping op
+       for negative n would change the method sent on user override (#2557).
+       Two literals are not folded to their sum for the same reason: the
+       operator is a method of the receiver, and only the opcode can tell
+       whether it is still the builtin. */
+    if (n < 0 || n > UINT8_MAX) goto normal;
+    rewind_pc(s);
+    if (op == OP_ADD) genop_2(s, OP_ADDI, dst, (uint16_t)n);
+    else genop_2(s, OP_SUBI, dst, (uint16_t)n);
   }
 }
 
@@ -1424,10 +1274,9 @@ gen_uniop(mrc_codegen_scope *s, mrc_sym sym, uint16_t dst)
     if (n == MRC_INT_MIN) return FALSE;
     n = -n;
   }
-  else if (sym == MRC_OPSYM_2(neg)) {
-    n = ~n;
-  }
   else {
+    /* `~1` is a method call in CRuby too, and folding it would bypass a
+       redefined `Integer#~` */
     return FALSE;
   }
   s->pc = addr_pc(s, data.addr);
@@ -1454,50 +1303,7 @@ gen_binop(mrc_codegen_scope *s, mrc_sym op, uint16_t dst)
     return TRUE;
   }
   else {
-    struct mrc_insn_data data = mrc_last_insn(s);
-    mrc_int n, n0;
-    if (addr_pc(s, data.addr) == s->lastlabel || !get_int_operand(s, &data, &n)) {
-      /* not integer immediate */
-      return FALSE;
-    }
-    struct mrc_insn_data data0 = mrc_decode_insn(mrc_prev_pc(s, data.addr));
-    if (!get_int_operand(s, &data0, &n0)) {
-      return FALSE;
-    }
-    if (op == MRC_OPSYM_2(lshift)) {
-      if (!mrc_num_shift(n0, n, &n)) return FALSE;
-    }
-    else if (op == MRC_OPSYM_2(rshift)) {
-      if (n == MRC_INT_MIN) return FALSE;
-      if (!mrc_num_shift(n0, -n, &n)) return FALSE;
-    }
-    else if (op == MRC_OPSYM_2(mod) && n != 0) {
-      if (n0 == MRC_INT_MIN && n == -1) {
-        n = 0;
-      }
-      else {
-        mrc_int n1 = n0 % n;
-        if ((n0 < 0) != (n < 0) && n1 != 0) {
-          n1 += n;
-        }
-        n = n1;
-      }
-    }
-    else if (op == MRC_OPSYM_2(and)) {
-      n = n0 & n;
-    }
-    else if (op == MRC_OPSYM_2(or)) {
-      n = n0 | n;
-    }
-    else if (op == MRC_OPSYM_2(xor)) {
-      n = n0 ^ n;
-    }
-    else {
-      return FALSE;
-    }
-    s->pc = addr_pc(s, data0.addr);
-    gen_int(s, dst, n);
-    return TRUE;
+    return FALSE;
   }
 }
 
@@ -1770,9 +1576,80 @@ gen_blkmove(mrc_codegen_scope *s, uint16_t ainfo, int lv)
     gen_move(s, cursp(), off, 0);
   }
   else {
-    genop_3(s, OP_GETUPVAR, cursp(), off, lv);
+    /* `lv` counts the scopes between here and the method, while `OP_GETUPVAR`
+       counts the envs above this frame's own, and the method's env is the
+       first of those: one level fewer. */
+    genop_3(s, OP_GETUPVAR, cursp(), off, lv-1);
   }
   push();
+}
+
+/* Whether a `return` here leaves a method that is not part of this compile
+   unit.  A string compiled for `eval` holds no method scope of its own, and
+   `return` in it leaves the method that encloses the `eval` call, which is
+   the frame the proc chain reaches and the one `OP_RETURN_BLK` unwinds to. */
+static mrc_bool
+return_leaves_upper_p(mrc_codegen_scope *s)
+{
+#if defined(MRC_TARGET_MRUBY)
+  if (!s->c->upper) return FALSE;
+  for (mrc_codegen_scope *s2 = s; s2; s2 = s2->prev) {
+    if (s2->mscope) return FALSE;
+  }
+  return TRUE;
+#else
+  (void)s;
+  return FALSE;
+#endif
+}
+
+/* Find the method scope that a `super`, a `zsuper` or a `yield` belongs to.
+   Answers its `ainfo`, the argument layout that the forwarded arguments and
+   the block are read by, and sets `lvp` to the number of levels between it
+   and `s`.  Answers -1 when there is no method scope to find. */
+static int
+search_mscope(mrc_codegen_scope *s, int *lvp)
+{
+  mrc_codegen_scope *s2 = s;
+  int lv = 0;
+
+  while (!s2->mscope) {
+    lv++;
+    s2 = s2->prev;
+    if (!s2) break;
+  }
+  *lvp = lv;
+  if (s2) return (int)s2->ainfo;
+
+#if defined(MRC_TARGET_MRUBY)
+  /* A string compiled for `eval` has a scope chain of its own, and the method
+     that encloses the `eval` call is not on it: it is on the proc chain the
+     context carries.  The walk above ended on the scope `generate_code()`
+     wraps a compile unit in, which is one level more than the string's own
+     scope and stands for no frame, so `c->upper` is the proc the level count
+     has now reached.  Restate the `OP_ENTER` that the method scope emitted
+     for itself as the `ainfo` it would have answered. */
+  const struct RProc *u = s->c->upper;
+
+  (*lvp)--;
+
+  while (u && !MRC_PROC_CFUNC_P(u)) {
+    if (MRC_PROC_SCOPE_P(u)) {
+      const struct mrc_irep *ir = (const struct mrc_irep *)u->body.irep;
+      if (!ir || ir->ilen == 0 || ir->iseq[0] != OP_ENTER) break;
+      uint32_t a = PEEK_W(ir->iseq + 1);
+      uint32_t ma = MRC_ASPEC_REQ(a) + MRC_ASPEC_OPT(a);
+      return (int)(((ma & 0x3f) << 7)
+                   | (MRC_ASPEC_REST(a) << 6)
+                   | ((MRC_ASPEC_POST(a) & 0x1f) << 1)
+                   | ((MRC_ASPEC_KEY(a) || MRC_ASPEC_KDICT(a)) ? 1 : 0));
+    }
+    u = u->upper;
+    (*lvp)++;
+  }
+#endif
+
+  return -1;
 }
 
 static void
@@ -2009,8 +1886,12 @@ gen_forward_arg(mrc_codegen_scope *s, mrc_sym sym, int val)
   }
 }
 
+/* The first `upto` of the arguments, which is all of them for gen_values()
+   below.  An attribute write asks for one fewer: the last of its arguments
+   is the value being assigned, which it has to hold on to rather than let
+   into the array a splat gathers the rest into. */
 static int
-gen_values(mrc_codegen_scope *s, mrc_node *tree, int val, int limit)
+gen_values_upto(mrc_codegen_scope *s, mrc_node *tree, int val, int limit, size_t upto)
 {
   if (tree == NULL) return 0;   /* no arguments (e.g. empty index `a[]`) */
   CAST(arguments);
@@ -2024,7 +1905,7 @@ gen_values(mrc_codegen_scope *s, mrc_node *tree, int val, int limit)
   if (cursp() >= slimit) slimit = INT16_MAX;
 
   if (!val) {
-    for (size_t i = 0; i < cast->arguments.size; i++) {
+    for (size_t i = 0; i < upto; i++) {
       t = (mrc_node *)cast->arguments.nodes[i];
       codegen(s, t, NOVAL);
       n++;
@@ -2032,7 +1913,7 @@ gen_values(mrc_codegen_scope *s, mrc_node *tree, int val, int limit)
     return n;
   }
 
-  for (size_t i = 0; i < cast->arguments.size; i++) {
+  for (size_t i = 0; i < upto; i++) {
     t = (mrc_node *)cast->arguments.nodes[i];
     if (nint(t) == PM_KEYWORD_HASH_NODE) break;
     int is_splat = nint(t) == PM_SPLAT_NODE;
@@ -2108,6 +1989,14 @@ gen_values(mrc_codegen_scope *s, mrc_node *tree, int val, int limit)
     return -1;
   }
   return n;
+}
+
+static int
+gen_values(mrc_codegen_scope *s, mrc_node *tree, int val, int limit)
+{
+  if (tree == NULL) return 0;
+  CAST(arguments);
+  return gen_values_upto(s, tree, val, limit, cast->arguments.size);
 }
 
 static void
@@ -2224,7 +2113,24 @@ gen_assignment(mrc_codegen_scope *s, mrc_node *tree, mrc_node *rhs, int sp, int 
     {
       CAST(index_target);
       codegen(s, cast->receiver, VAL);
-      int n = gen_values(s, (mrc_node *)cast->arguments, VAL, 14);
+      /* 13 rather than 14: the value to assign is an argument too, and a
+         count that reaches CALL_MAXARGS is the mark for arguments gathered
+         in an array rather than a count of them. */
+      int n = gen_values(s, (mrc_node *)cast->arguments, VAL, 13);
+      if (n < 0) {
+        /* More indices than a count carries: gen_values() gathered them into
+           an array at cursp(), and the value joins them there. */
+        push();
+        genop_2(s, OP_MOVE, cursp(), sp);
+        push();          /* the value, which is also the block slot the send
+                            reads after the array */
+        pop();
+        pop();
+        genop_2(s, OP_ARYPUSH, cursp(), 1);
+        pop();
+        genop_3(s, OP_SEND, cursp(), new_sym(s, MRC_OPSYM_2(aset)), CALL_MAXARGS);
+        break;
+      }
       /* the value to assign lives in sp (set by the caller for multiple
          assignment); cursp()-n*2+1 would point at an index register */
       genop_2(s, OP_MOVE, cursp(), sp);
@@ -2418,48 +2324,6 @@ gen_hash(mrc_codegen_scope *s, mrc_node *tree, int val, int limit)
   return len;
 }
 
-#if defined(MRC_TARGET_MRUBY)
-static mrc_bool
-mrc_mruby_numbered_parameter_upvar(mrc_codegen_scope *s, mrc_sym id, int *lv, int *idx)
-{
-  if (id == PM_CONSTANT_ID_UNSET || id > s->c->p->constant_pool.size) {
-    return FALSE;
-  }
-
-  pm_constant_t *constant = pm_constant_pool_id_to_constant(&s->c->p->constant_pool, id);
-  if (constant->length != 2 || constant->start[0] != '_' ||
-      constant->start[1] < '1' || constant->start[1] > '9') {
-    return FALSE;
-  }
-
-  mrc_sym intern = mrb_intern(s->c->mrb, (const char *)constant->start, constant->length);
-  const struct RProc *u = s->c->upper;
-  *lv = 0;
-  while (u && !MRC_PROC_CFUNC_P(u)) {
-    const struct mrc_irep *ir = (const struct mrc_irep *)u->body.irep;
-    uint_fast16_t n = ir->nlocals;
-    const mrc_sym *v = ir->lv;
-    int number = constant->start[1] - '0';
-    if (v) {
-      for (int i = 1; n > 1; n--, v++, i++) {
-        if (*v == intern) {
-          *idx = i;
-          return TRUE;
-        }
-      }
-    }
-    else if (number < ir->nlocals) {
-      *idx = number;
-      return TRUE;
-    }
-    if (MRC_PROC_SCOPE_P(u)) break;
-    u = u->upper;
-    (*lv)++;
-  }
-  return FALSE;
-}
-#endif
-
 /* Attribute assignment (`recv.attr = v`, `recv[i] = v`) as an expression.
    Prism bundles the RHS as the last positional argument of the call node.
    The whole expression must evaluate to that RHS, not to the setter's
@@ -2506,18 +2370,37 @@ gen_call_assign(mrc_codegen_scope *s, mrc_node *tree, int val, int safe, int rec
     skip = genjmp2_0(s, OP_JMPNIL, cursp(), val);
   }
 
-  /* positional arguments, the last of which is the RHS */
+  /* The indices, then the RHS, which is the last of the arguments and is
+     generated apart from them: a splat among the indices gathers them into
+     an array, and the RHS has to be held back from it until it has been
+     copied to the result slot.  13 leaves room for the RHS under
+     CALL_MAXARGS, which is the mark for arguments gathered in an array
+     rather than a count of them. */
   CAST3(arguments, cast->arguments, arguments);
-  if (arguments) {
-    for (size_t i = 0; i < arguments->arguments.size; i++) {
-      codegen(s, (mrc_node *)arguments->arguments.nodes[i], VAL);
-      n++;
+  int gathered = 0;
+  if (arguments && 0 < arguments->arguments.size) {
+    size_t last = arguments->arguments.size - 1;
+    n = gen_values_upto(s, (mrc_node *)arguments, VAL, 13, last);
+    if (n < 0) {                /* the indices are in an array at cursp() */
+      gathered = 1;
+      push();
     }
+    codegen(s, (mrc_node *)arguments->arguments.nodes[last], VAL);
+    if (!gathered) n++;
   }
   if (val) {
     /* nopeep: keep the RHS in its argument slot for the SEND, while also
        copying it to the reserved result slot */
     gen_move(s, top, cursp()-1, 1);   /* preserve the RHS as the result */
+  }
+
+  if (gathered) {
+    /* the RHS joins the indices in their array, which is the one argument */
+    pop();
+    pop();
+    genop_2(s, OP_ARYPUSH, cursp(), 1);
+    push();
+    n = CALL_MAXARGS;
   }
 
   push(); pop();
@@ -2553,8 +2436,9 @@ attr_assign_simple_args(pm_call_node_t *cast)
   if (arguments->arguments.size == 0) return FALSE;
   for (size_t i = 0; i < arguments->arguments.size; i++) {
     int t = nint((mrc_node *)arguments->arguments.nodes[i]);
-    if (t == PM_SPLAT_NODE || t == PM_KEYWORD_HASH_NODE ||
-        t == PM_FORWARDING_ARGUMENTS_NODE) {
+    /* A splat is gathered by gen_values_upto(); keywords and forwarding are
+       not what an index assignment can be written with. */
+    if (t == PM_KEYWORD_HASH_NODE || t == PM_FORWARDING_ARGUMENTS_NODE) {
       return FALSE;
     }
   }
@@ -2574,19 +2458,6 @@ gen_call(mrc_codegen_scope *s, mrc_node *tree, int val, int safe, int recv_ready
   }
   int skip = 0, n = 0, nk = 0, noop = no_optimize(s), noself = 0, blk = 0;
   int sp_save = recv_ready ? cursp()-1 : cursp();
-
-#if defined(MRC_TARGET_MRUBY)
-  if (cast->receiver == NULL && cast->arguments == NULL && cast->block == NULL) {
-    int lv, idx;
-    if (mrc_mruby_numbered_parameter_upvar(s, sym, &lv, &idx)) {
-      if (val) {
-        genop_3(s, OP_GETUPVAR, cursp(), idx, lv);
-        push();
-      }
-      return;
-    }
-  }
-#endif
 
   if (recv_ready) {
     /* the receiver has been evaluated already and sits at cursp()-1 */
@@ -2646,10 +2517,10 @@ gen_call(mrc_codegen_scope *s, mrc_node *tree, int val, int safe, int recv_ready
     gen_addsub(s, OP_SUB, cursp());
   }
   else if (!noop && sym == MRC_OPSYM_2(mul) && n == 1)  {
-    gen_muldiv(s, OP_MUL, cursp());
+    genop_1(s, OP_MUL, cursp());
   }
   else if (!noop && sym == MRC_OPSYM_2(div) && n == 1)  {
-    gen_muldiv(s, OP_DIV, cursp());
+    genop_1(s, OP_DIV, cursp());
   }
   else if (!noop && sym == MRC_OPSYM_2(lt) && n == 1)  {
     genop_1(s, OP_LT, cursp());
@@ -2670,10 +2541,10 @@ gen_call(mrc_codegen_scope *s, mrc_node *tree, int val, int safe, int recv_ready
     genop_1(s, OP_SETIDX, cursp());
   }
   else if (!noop && n == 0 && gen_uniop(s, sym, cursp())) {
-    /* constant folding succeeded */
+    /* a literal absorbed its sign */
   }
   else if (!noop && n == 1 && gen_binop(s, sym, cursp())) {
-    /* constant folding succeeded */
+    /* an index opcode was emitted */
   }
   else if (noself) {
     if (!blk && n == 0 && nk == 0) {
@@ -2742,6 +2613,13 @@ static void
 codegen_pattern(mrc_codegen_scope *s, mrc_node *pattern, int target, uint32_t *fail_pos, int known_array_len)
 {
   uint32_t tmp;
+
+  /* A pattern reads `target` more than once: it asks whether the value answers
+     the deconstruction hook before sending it, and a later alternative or a
+     later `in` clause reads it again.  The instruction that produced the value
+     is therefore not the last use the peephole would take this pattern's first
+     read for, so label the point before generating any of the pattern. */
+  new_label(s);
 
   /* Handle guard clause wrapper (PM_IF_NODE wrapping the actual pattern) */
   if (nint(pattern) == PM_IF_NODE) {
@@ -6365,16 +6243,11 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
     case PM_SUPER_NODE:
     {
       CAST(super);
-      mrc_codegen_scope *s2 = s;
-      int lv = 0;
+      int lv;
+      int ainfo = search_mscope(s, &lv);
       int n = 0, nk = 0, st = 0;
 
       push();
-      while (!s2->mscope) {
-        lv++;
-        s2 = s2->prev;
-        if (!s2) break;
-      }
       CAST3(arguments, cast->arguments, arguments);
       if (arguments) {
         st = n = gen_values(s, (mrc_node *)arguments, VAL, 14);
@@ -6396,7 +6269,7 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
         if (cast->block) {
           codegen(s, (mrc_node *)cast->block, VAL);
         }
-        else if (s2) gen_blkmove(s, s2->ainfo, lv);
+        else if (ainfo >= 0) gen_blkmove(s, (uint16_t)ainfo, lv);
         else {
           genop_1(s, OP_LOADNIL, cursp());
           push();
@@ -6407,7 +6280,7 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
         if (cast->block) {
           codegen(s, (mrc_node *)cast->block, VAL);
         }
-        else if (s2) gen_blkmove(s, s2->ainfo, lv);
+        else if (ainfo >= 0) gen_blkmove(s, (uint16_t)ainfo, lv);
         else {
           genop_1(s, OP_LOADNIL, cursp());
           push();
@@ -6422,21 +6295,12 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
     case PM_FORWARDING_SUPER_NODE:
     {
       CAST(forwarding_super);
-      mrc_codegen_scope *s2 = s;
-      int lv = 0;
-      uint16_t ainfo = 0;
+      int lv;
+      int ainfo = search_mscope(s, &lv);
       int n = CALL_MAXARGS;
       int sp = cursp();
 
       push();        /* room for receiver */
-      while (!s2->mscope) {
-        lv++;
-        s2 = s2->prev;
-        if (!s2) break;
-      }
-      if (s2 && s2->ainfo > 0) {
-        ainfo = s2->ainfo;
-      }
       if (ainfo > 0) {
         genop_2S(s, OP_ARGARY, cursp(), (ainfo<<4)|(lv & 0xf));
         push(); push(); push();   /* ARGARY pushes 3 values at most */
@@ -6457,13 +6321,13 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
         if (cast->block) {
           codegen(s, (mrc_node *)cast->block, VAL);
         }
-        else if (s2) {
+        else if (ainfo >= 0) {
           gen_blkmove(s, 0, lv);
         }
         else {
-          /* The walk above found no method scope, so `lv` counts past the
-             outermost one and there is no block to forward: a `super` here
-             raises rather than call anything. PM_SUPER_NODE says the same. */
+          /* There is no method scope to belong to, so there is no block to
+             forward: a `super` here raises rather than call anything.
+             PM_SUPER_NODE says the same. */
           genop_1(s, OP_LOADNIL, cursp());
           push();
         }
@@ -6483,7 +6347,7 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
       else {
         genop_1(s, OP_LOADNIL, cursp());
       }
-      if (s->loop) {
+      if (s->loop || return_leaves_upper_p(s)) {
         gen_return(s, OP_RETURN_BLK, cursp());
       }
       else {
@@ -6495,18 +6359,10 @@ codegen(mrc_codegen_scope *s, mrc_node *tree, int val)
     case PM_YIELD_NODE:
     {
       CAST(yield);
-      mrc_codegen_scope *s2 = s;
-      int lv = 0, ainfo = -1;
+      int lv;
+      int ainfo = search_mscope(s, &lv);
       int n = 0, nk = 0, st = 0;
 
-      while (!s2->mscope) {
-        lv++;
-        s2 = s2->prev;
-        if (!s2) break;
-      }
-      if (s2) {
-        ainfo = (int)s2->ainfo;
-      }
       if (ainfo < 0) codegen_error(s, "invalid yield (SyntaxError)");
       push();
       CAST3(arguments, cast->arguments, arguments);
