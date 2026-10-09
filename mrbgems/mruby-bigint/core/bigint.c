@@ -562,7 +562,11 @@ mpz_add_int(mpz_ctx_t *ctx, mpz_t *x, mrb_int n)
   if (carry != 0) {
     mpz_realloc(ctx, x, x->sz + 1);
     x->p[x->sz-1] = (mp_limb)carry;
-    x->sn = 1;
+    /* the magnitude grew; keep the sign the caller set (the routine "ignores
+       sign of x"). Forcing it positive here turned a magnitude-growing step on
+       a negative value positive, so mrb_bint_sub_n()/add_n() gave the wrong
+       sign whenever the carry crossed a limb, e.g. -(2**64-1) - 1. */
+    if (x->sn == 0) x->sn = 1;
   }
   trim(x);
 }
@@ -1260,10 +1264,54 @@ mpn_neg(mp_limb *rp, const mp_limb *ap, size_t n)
 {
   mp_limb carry = 1;
   for (size_t i = 0; i < n; i++) {
-    mp_dbl_limb sum = (mp_dbl_limb)(~ap[i]) + carry;
+    /* ~ promotes a limb narrower than int, and the complement of the
+       promoted value carries ones above the limb into the sum */
+    mp_dbl_limb sum = (mp_dbl_limb)(mp_limb)~ap[i] + carry;
     rp[i] = LOW(sum);
     carry = HIGH(sum);
   }
+}
+
+/* Evaluate x0 + 2*x1 + 4*x2 into rp[0..n); returns trimmed length (>= 1) */
+static size_t
+mpn_toom3_eval2(mp_limb *rp, size_t n,
+                const mp_limb *x0, size_t x0_len,
+                const mp_limb *x1, size_t x1_len,
+                const mp_limb *x2, size_t x2_len)
+{
+  mpn_zero(rp, n);
+  mpn_copyi(rp, x0, x0_len);
+  /* Add 2*x1 */
+  if (x1_len > 0) {
+    mp_limb carry = 0;
+    for (size_t i = 0; i < x1_len; i++) {
+      mp_dbl_limb val = (mp_dbl_limb)rp[i] + ((mp_dbl_limb)x1[i] << 1) + carry;
+      rp[i] = LOW(val);
+      carry = HIGH(val);
+    }
+    for (size_t i = x1_len; carry && i < n; i++) {
+      mp_dbl_limb val = (mp_dbl_limb)rp[i] + carry;
+      rp[i] = LOW(val);
+      carry = HIGH(val);
+    }
+  }
+  /* Add 4*x2 */
+  if (x2_len > 0) {
+    mp_limb carry = 0;
+    for (size_t i = 0; i < x2_len; i++) {
+      mp_dbl_limb val = (mp_dbl_limb)rp[i] + ((mp_dbl_limb)x2[i] << 2) + carry;
+      rp[i] = LOW(val);
+      carry = HIGH(val);
+    }
+    for (size_t i = x2_len; carry && i < n; i++) {
+      mp_dbl_limb val = (mp_dbl_limb)rp[i] + carry;
+      rp[i] = LOW(val);
+      carry = HIGH(val);
+    }
+  }
+  size_t len = n;
+  while (len > 0 && rp[len-1] == 0) len--;
+  return len ? len : 1;
 }
 
 /* Pool-aware Toom-3 multiplication */
@@ -1391,75 +1439,9 @@ mpz_mul_toom3(mpz_ctx_t *ctx, mp_limb *result,
   if (vm1_y_len == 0) vm1_y_len = 1;
 
   /* v2 = x0 + 2*x1 + 4*x2 */
-  {
-    mpn_zero(v2_x, eval_len);
-    mpn_copyi(v2_x, x0, x0_len);
-    /* Add 2*x1 */
-    if (x1_len > 0) {
-      mp_limb carry = 0;
-      for (size_t i = 0; i < x1_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + ((mp_dbl_limb)x1[i] << 1) + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-      for (size_t i = x1_len; carry && i < eval_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-    }
-    /* Add 4*x2 */
-    if (x2_len > 0) {
-      mp_limb carry = 0;
-      for (size_t i = 0; i < x2_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + ((mp_dbl_limb)x2[i] << 2) + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-      for (size_t i = x2_len; carry && i < eval_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-    }
-  }
-  size_t v2_x_len = eval_len;
-  while (v2_x_len > 0 && v2_x[v2_x_len-1] == 0) v2_x_len--;
-  if (v2_x_len == 0) v2_x_len = 1;
+  size_t v2_x_len = mpn_toom3_eval2(v2_x, eval_len, x0, x0_len, x1, x1_len, x2, x2_len);
 
-  {
-    mpn_zero(v2_y, eval_len);
-    mpn_copyi(v2_y, y0, y0_len);
-    if (y1_len > 0) {
-      mp_limb carry = 0;
-      for (size_t i = 0; i < y1_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_y[i] + ((mp_dbl_limb)y1[i] << 1) + carry;
-        v2_y[i] = LOW(val);
-        carry = HIGH(val);
-      }
-      for (size_t i = y1_len; carry && i < eval_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_y[i] + carry;
-        v2_y[i] = LOW(val);
-        carry = HIGH(val);
-      }
-    }
-    if (y2_len > 0) {
-      mp_limb carry = 0;
-      for (size_t i = 0; i < y2_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_y[i] + ((mp_dbl_limb)y2[i] << 2) + carry;
-        v2_y[i] = LOW(val);
-        carry = HIGH(val);
-      }
-      for (size_t i = y2_len; carry && i < eval_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_y[i] + carry;
-        v2_y[i] = LOW(val);
-        carry = HIGH(val);
-      }
-    }
-  }
-  size_t v2_y_len = eval_len;
-  while (v2_y_len > 0 && v2_y[v2_y_len-1] == 0) v2_y_len--;
-  if (v2_y_len == 0) v2_y_len = 1;
+  size_t v2_y_len = mpn_toom3_eval2(v2_y, eval_len, y0, y0_len, y1, y1_len, y2, y2_len);
 
   /*
    * Pointwise multiplication (5 recursive calls)
@@ -1732,39 +1714,7 @@ mpz_sqr_toom3(mpz_ctx_t *ctx, mp_limb *result,
   if (vm1_x_len == 0) vm1_x_len = 1;
 
   /* v2 = x0 + 2*x1 + 4*x2 */
-  {
-    mpn_zero(v2_x, eval_len);
-    mpn_copyi(v2_x, x0, x0_len);
-    if (x1_len > 0) {
-      mp_limb carry = 0;
-      for (size_t i = 0; i < x1_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + ((mp_dbl_limb)x1[i] << 1) + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-      for (size_t i = x1_len; carry && i < eval_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-    }
-    if (x2_len > 0) {
-      mp_limb carry = 0;
-      for (size_t i = 0; i < x2_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + ((mp_dbl_limb)x2[i] << 2) + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-      for (size_t i = x2_len; carry && i < eval_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-    }
-  }
-  size_t v2_x_len = eval_len;
-  while (v2_x_len > 0 && v2_x[v2_x_len-1] == 0) v2_x_len--;
-  if (v2_x_len == 0) v2_x_len = 1;
+  size_t v2_x_len = mpn_toom3_eval2(v2_x, eval_len, x0, x0_len, x1, x1_len, x2, x2_len);
 
   /*
    * Pointwise squaring (5 recursive calls)

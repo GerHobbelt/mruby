@@ -2169,6 +2169,27 @@ prepare_exec_strcat_post_func(mrb_state *mrb, mrb_value self)
   return mrb_str_cat_str(mrb, args[0], str);
 }
 
+/* The frame prepare_exec_strcat() pushes, kept at file scope as the static
+   procs of class.c are. Before C++20 the cfunc proc cannot be built by a
+   designated initializer, so there MRB_MAKE_STATIC_PROC_FROM_FUNC() is a
+   call and the object is initialized when the program starts; inside the
+   function it would be initialized on the first call instead, behind a
+   guard every later call has to pass. */
+MRB_PRESYM_DEFINE_VAR_AND_INITER(prepare_exec_strcat_syms, 1, MRB_SYM(to_s))
+static const mrb_code prepare_exec_strcat_iseq[] = {
+  OP_MOVE,    3, 2,     // OP_MOVE      R3  R2
+  OP_SEND,    3, 0, 0,  // OP_SEND      R3  :to_s  n=0|nk=0
+  OP_CALL,              // OP_CALL      R0            ; tailcall to prepare_exec_strcat_post_func()
+  OP_RETURN,  0         // OP_RETURN    R0            ; unreachable
+};
+static const mrb_irep prepare_exec_strcat_irep = MRB_MAKE_STATIC_IREP(4, 5, prepare_exec_strcat_iseq, prepare_exec_strcat_syms);
+/* Both become an mrb_value, whose word-boxed form keeps the type tag in the
+   low bits of the pointer; the alignment a static object is given otherwise
+   is the compiler's to choose (see the static procs in proc.c and class.c,
+   aligned the same way). */
+mrb_alignas(8) static const struct RProc prepare_exec_strcat_proc = MRB_MAKE_STATIC_PROC_FROM_IREP(prepare_exec_strcat_irep);
+mrb_alignas(8) static const struct RProc prepare_exec_strcat_post_proc = MRB_MAKE_STATIC_PROC_FROM_FUNC(prepare_exec_strcat_post_func);
+
 static mrb_bool
 prepare_exec_strcat(mrb_state *mrb, uint32_t a)
 {
@@ -2189,21 +2210,6 @@ prepare_exec_strcat(mrb_state *mrb, uint32_t a)
    *                      |                         when #to_s answers no string
    *                      `--- calls #to_s and then tailcalls prepare_exec_strcat_post_func()
    */
-
-  MRB_PRESYM_DEFINE_VAR_AND_INITER(prepare_exec_strcat_syms, 1, MRB_SYM(to_s))
-  static const mrb_code prepare_exec_strcat_iseq[] = {
-    OP_MOVE,    3, 2,     // OP_MOVE      R3  R2
-    OP_SEND,    3, 0, 0,  // OP_SEND      R3  :to_s  n=0|nk=0
-    OP_CALL,              // OP_CALL      R0            ; tailcall to prepare_exec_strcat_post_func()
-    OP_RETURN,  0         // OP_RETURN    R0            ; unreachable
-  };
-  static const mrb_irep prepare_exec_strcat_irep = MRB_MAKE_STATIC_IREP(4, 5, prepare_exec_strcat_iseq, prepare_exec_strcat_syms);
-  /* Both become an mrb_value, whose word-boxed form keeps the type tag in
-     the low bits of the pointer; the alignment a static object is given
-     otherwise is the compiler's to choose (see the static procs in proc.c
-     and class.c, aligned the same way). */
-  mrb_alignas(8) static const struct RProc prepare_exec_strcat_proc = MRB_MAKE_STATIC_PROC_FROM_IREP(prepare_exec_strcat_irep);
-  mrb_alignas(8) static const struct RProc prepare_exec_strcat_post_proc = MRB_MAKE_STATIC_PROC_FROM_FUNC(prepare_exec_strcat_post_func);
 
   MRB_PRESYM_INIT_SYMBOLS(mrb, prepare_exec_strcat_syms);
 
@@ -4795,9 +4801,6 @@ RETRY_TRY_BLOCK:
       case MRB_TT_STRING:
       case MRB_TT_SYMBOL:
       case MRB_TT_INTEGER:
-      case MRB_TT_CLASS:
-      case MRB_TT_MODULE:
-      case MRB_TT_SCLASS:
       case MRB_TT_FALSE:
       case MRB_TT_TRUE:
 #ifdef MRB_USE_BIGINT
@@ -4806,10 +4809,10 @@ RETRY_TRY_BLOCK:
 #ifndef MRB_NO_FLOAT
       case MRB_TT_FLOAT:
 #endif
-        /* What mrb_obj_as_string() spells out in C, with no method to send:
-           a frame for these would cost a call per interpolated value. A
-           redefined to_s on them is not read here, which is what the C path
-           answers for every built-in it knows. */
+        /* The values mrb_obj_as_string() spells out in C, with no method
+           to send: a frame for these would cost a call per interpolated
+           value, and an override on their classes is not read there either.
+           Everything else, a class included, answers for itself below. */
         mrb_str_concat(mrb, regs[a], regs[a+1]);
         ci = mrb->c->ci; // just in case
         break;
