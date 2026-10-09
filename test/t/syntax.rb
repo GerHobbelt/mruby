@@ -3220,3 +3220,27 @@ assert('super reaches a private or protected operator') do
     o == 1
   end
 end
+
+assert('case/in - an alternation after a pattern that compiles to a plain jump') do
+  # The left side of `|` may compile to a plain jump into the fail chain
+  # rather than a JMPNOT, and the rewrite of a JMPNOT into a JMPIF told the
+  # two apart by reading the byte before the operand. For the jump that byte
+  # is the operand of the instruction before it, here the jump closing the
+  # clause before, whose link was then rewritten and followed off the end of
+  # the code. The shape is the reported one: three clauses, the last an
+  # alternation whose left side compiled that way when this was reported.
+  assert_raise(NoMatchingPatternError) do
+    case object_id;in Integer();in[*,su,*],{},as then in({})|{}then end
+  end
+end
+
+assert('case/in - a pattern in parentheses') do
+  # Parentheses group a pattern, as around an alternation that is one element
+  # of an array pattern. Left unread, every such pattern failed to match.
+  assert_equal :y, (case 1; in (1) then :y end)
+  assert_equal :y, (case [1, 2]; in ([Integer, *]) then :y end)
+  assert_equal 2, (case [1, 2]; in [(1 | 2), (Integer => x)] then x end)
+  assert_equal :y, (case 3; in (1) | (2) then :n; in ((3)) then :y end)
+  assert_equal :y, (case({a: 1}); in ({a: Integer}) then :y end)
+  assert_equal :else, (case 5; in (1) then :n else :else end)
+end
