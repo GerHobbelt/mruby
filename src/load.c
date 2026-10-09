@@ -90,7 +90,11 @@ prescan_pool_syms(const uint8_t *src, const uint8_t *end, uint16_t *plenp, uint1
       src += bin_to_uint8(src) + 2;
       break;
     case IREP_TT_FLOAT:
+#ifndef MRB_NO_FLOAT
       src += sizeof(double);
+#else
+      src += MRB_DUMP_FLOAT_SIZE;
+#endif
       break;
     case IREP_TT_STR:
       if (src + sizeof(uint16_t) > end) return FALSE;
@@ -253,7 +257,10 @@ read_irep_record_1(mrb_state *mrb, const uint8_t *bin, const uint8_t *end, size_
         }
         break;
       case IREP_TT_INT64:
-#ifdef MRB_INT64
+        /* Read whatever mrb_int is: an mrbc whose integers are 64 bits wide
+           writes one for a literal past 32 bits, and where mrb_int is
+           narrower the VM decides what the value becomes when it is loaded
+           (OP_LOADL), as it does for an IREP_TT_BIGINT entry. */
         {
           if (src + sizeof(uint32_t)*2 > end) return FALSE;
           uint64_t i64 = bin_to_uint32(src);
@@ -265,9 +272,6 @@ read_irep_record_1(mrb_state *mrb, const uint8_t *bin, const uint8_t *end, size_
           pool[i].u.i64 = (int64_t)i64;
         }
         break;
-#else
-        return FALSE;
-#endif
 
       case IREP_TT_BIGINT:
         pool_data_len = bin_to_uint8(src) + 2; /* pool data length */
@@ -288,10 +292,18 @@ read_irep_record_1(mrb_state *mrb, const uint8_t *bin, const uint8_t *end, size_
         pool[i].tt = tt;
         pool[i].u.f = str_to_double(mrb, (const char*)src);
         src += sizeof(double);
-        break;
 #else
-        return FALSE;           /* MRB_NO_FLOAT */
+        /* Without Float there is no value to make, but the rest of the
+           irep may never need one: keep the bytes as they came, so that
+           OP_LOADL refuses only the literal that runs and dump.c writes
+           the entry back unchanged. The pool union holds 64 bits
+           everywhere. */
+        if (src + MRB_DUMP_FLOAT_SIZE > end) return FALSE;
+        pool[i].tt = tt;
+        memcpy(&pool[i].u.i64, src, MRB_DUMP_FLOAT_SIZE);
+        src += MRB_DUMP_FLOAT_SIZE;
 #endif
+        break;
 
       case IREP_TT_STR:
         pool_data_len = bin_to_uint16(src); /* pool data length */

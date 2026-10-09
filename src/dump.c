@@ -146,7 +146,6 @@ get_pool_block_size(mrb_state *mrb, const mrb_irep *irep)
 
     switch (irep->pool[pool_no].tt) {
     case IREP_TT_INT64:
-#if defined(MRB_64BIT) || defined(MRB_INT64)
       {
         int64_t i = irep->pool[pool_no].u.i64;
 
@@ -156,9 +155,6 @@ get_pool_block_size(mrb_state *mrb, const mrb_irep *irep)
           size += 4;
       }
       break;
-#else
-      /* fall through */
-#endif
     case IREP_TT_INT32:
       size += 4;                /* 32 bits = 4 bytes */
       break;
@@ -173,9 +169,9 @@ get_pool_block_size(mrb_state *mrb, const mrb_irep *irep)
 
     case IREP_TT_FLOAT:
 #ifndef MRB_NO_FLOAT
-      {
-        size += sizeof(double);
-      }
+      size += sizeof(double);
+#else
+      size += MRB_DUMP_FLOAT_SIZE;
 #endif
       break;
 
@@ -220,7 +216,8 @@ write_pool_block(mrb_state *mrb, const mrb_irep *irep, uint8_t *buf)
 
     switch (irep->pool[pool_no].tt) {
     case IREP_TT_INT64:
-#if defined(MRB_64BIT) || defined(MRB_INT64)
+      /* load.c keeps an entry like this whatever mrb_int is, so a 32-bit
+         target that loaded one writes it back as it came */
       {
         int64_t i = irep->pool[pool_no].u.i64;
         if (i < INT32_MIN || INT32_MAX < i) {
@@ -229,12 +226,13 @@ write_pool_block(mrb_state *mrb, const mrb_irep *irep, uint8_t *buf)
           cur += uint32_to_bin((uint32_t)((i    ) & 0xffffffff), cur); /* i64 lo */
         }
         else {
+          /* from the 64-bit value itself: the union's i32 is its low half
+             only where the machine stores the low half first */
           cur += uint8_to_bin(IREP_TT_INT32, cur); /* data type */
-          cur += uint32_to_bin(irep->pool[pool_no].u.i32, cur); /* i32 */
+          cur += uint32_to_bin((uint32_t)i, cur); /* i32 */
         }
       }
       break;
-#endif
     case IREP_TT_INT32:
       cur += uint8_to_bin(IREP_TT_INT32, cur); /* data type */
       cur += uint32_to_bin(irep->pool[pool_no].u.i32, cur); /* i32 */
@@ -250,12 +248,12 @@ write_pool_block(mrb_state *mrb, const mrb_irep *irep, uint8_t *buf)
     case IREP_TT_FLOAT:
       cur += uint8_to_bin(IREP_TT_FLOAT, cur); /* data type */
 #ifndef MRB_NO_FLOAT
-      {
-        dump_float(mrb, cur,irep->pool[pool_no].u.f);
-        cur += sizeof(double);
-      }
+      dump_float(mrb, cur, irep->pool[pool_no].u.f);
+      cur += sizeof(double);
 #else
-      cur += uint16_to_bin(0, cur); /* zero length */
+      /* the bytes load.c kept, as they came */
+      memcpy(cur, &irep->pool[pool_no].u.i64, MRB_DUMP_FLOAT_SIZE);
+      cur += MRB_DUMP_FLOAT_SIZE;
 #endif
       break;
 

@@ -112,7 +112,7 @@ skip_to_prefix(const mrb_regexp_pattern *pat, const char *sp, const char *str_en
 
 /* Check if a byte is in the first-byte bitmap */
 #define FIRST_BYTE_OK(pat, ch) \
-  ((ch) >= 128 || ((pat)->first_bytes[(ch) >> 3] & (1 << ((ch) & 7))))
+  ((pat)->first_bytes[(ch) >> 3] & (1 << ((ch) & 7)))
 
 /*
  * Skip to the next position a match could start at, per the first-byte set.
@@ -123,10 +123,9 @@ skip_to_prefix(const mrb_regexp_pattern *pat, const char *sp, const char *str_en
  * A set of up to three bytes is scanned with one bounded memchr per member,
  * each next call bounded by the nearest find so far, so every byte is read at
  * most first_byte_count times and by memchr rather than one test at a time. A
- * wider set walks the bitmap as before. The bitmap walk also stops at any
- * byte above 127, which the memchr scan runs past: the set being usable at
- * all means no match starts on a non-ASCII byte (see first_set_walk()), so
- * those stops were never candidates, only where the walk gave up.
+ * wider set walks the bitmap. Either can stop on a member byte inside a
+ * character, which the search's interior test refuses as it refuses any
+ * position there; see class_first_bytes().
  */
 static const char*
 skip_to_first_byte(const mrb_regexp_pattern *pat, const char *sp, const char *str_end)
@@ -270,6 +269,13 @@ typedef struct {
    every pattern short of the ones written to nest. */
 #define RE_PEND_INLINE 16
 
+/* Capture ints the state holds for the pool and for the best match without
+   asking the allocator: two allocations a search is otherwise, and a scan or
+   a split searches once per match. The pool of a short pattern with few
+   groups fits, which is what those run; a larger one starts on the heap. */
+#define RE_POOL_INLINE 128
+#define RE_RESULT_INLINE 32
+
 /* All Pike VM state */
 typedef struct {
   mrb_state *mrb;
@@ -297,6 +303,8 @@ typedef struct {
   uint32_t pend_top;      /* entries in use, the newest at the top */
   uint32_t pend_capa;
   re_pending pend_inline[RE_PEND_INLINE];
+  int pool_inline[RE_POOL_INLINE];
+  int result_inline[RE_RESULT_INLINE];
 } pike_state;
 
 /* Hand out a capture slot, growing the pool where it has none left. TRUE is
@@ -311,19 +319,34 @@ typedef struct {
    allocator here jumps past the epilogue that frees the pool and releases
    the cache, and by this point the search holds all of both. */
 static mrb_bool
+pool_grow(pike_state *s)
+{
+  int new_capa = s->pool_capa * 2;
+  size_t size = sizeof(int) * new_capa * s->ncap;
+  int *p;
+  if (s->cap_pool == s->pool_inline) {
+    /* The pool leaves the state for the heap, taking what it holds. */
+    p = (int*)mrb_malloc_simple(s->mrb, size);
+    if (p) memcpy(p, s->pool_inline, sizeof(int) * s->pool_capa * s->ncap);
+  }
+  else {
+    p = (int*)mrb_realloc_simple(s->mrb, s->cap_pool, size);
+  }
+  if (!p) {
+    s->nomem = TRUE;
+    return FALSE;
+  }
+  s->cap_pool = p;
+  s->pool_capa = new_capa;
+  return TRUE;
+}
+
+/* The growth is a call of its own so that this, which runs for every slot a
+   step hands out, stays small enough to be taken inline. */
+static inline mrb_bool
 pool_alloc(pike_state *s, int *slot)
 {
-  if (s->pool_next >= s->pool_capa) {
-    int new_capa = s->pool_capa * 2;
-    int *p = (int*)mrb_realloc_simple(s->mrb, s->cap_pool,
-                                      sizeof(int) * new_capa * s->ncap);
-    if (!p) {
-      s->nomem = TRUE;
-      return FALSE;
-    }
-    s->cap_pool = p;
-    s->pool_capa = new_capa;
-  }
+  if (s->pool_next >= s->pool_capa && !pool_grow(s)) return FALSE;
   *slot = s->pool_next++;
   return TRUE;
 }
@@ -674,18 +697,15 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
   size_t vsize = sizeof(uint32_t) * ((size_t)pat->code_len + 1);
   s.pool_next = 0;
   s.result_caps = NULL;
-  if (match_only) {
-    s.pool_capa = 1;
-    s.cap_pool = (int*)mrb_malloc_simple(mrb, sizeof(int) * ncap);
-    if (!s.cap_pool) s.nomem = TRUE;
+  s.pool_capa = match_only ? 1 : list_capa * 2;
+  if ((size_t)s.pool_capa * ncap <= RE_POOL_INLINE) s.cap_pool = s.pool_inline;
+  else s.cap_pool = (int*)mrb_malloc_simple(mrb, sizeof(int) * s.pool_capa * ncap);
+  if (!match_only) {
+    if (ncap <= RE_RESULT_INLINE) s.result_caps = s.result_inline;
+    else s.result_caps = (int*)mrb_malloc_simple(mrb, sizeof(int) * ncap);
   }
-  else {
-    s.pool_capa = list_capa * 2;
-    s.cap_pool = (int*)mrb_malloc_simple(mrb, sizeof(int) * s.pool_capa * ncap);
-    s.result_caps = (int*)mrb_malloc_simple(mrb, sizeof(int) * ncap);
-    if (!s.cap_pool || !s.result_caps) s.nomem = TRUE;
-    else memset(s.result_caps, -1, sizeof(int) * ncap);
-  }
+  if (!s.cap_pool || (!match_only && !s.result_caps)) s.nomem = TRUE;
+  else if (s.result_caps) memset(s.result_caps, -1, sizeof(int) * ncap);
 
   re_threadlist curr, next;
   s.visited = NULL;
@@ -941,8 +961,8 @@ pike_vm(mrb_state *mrb, const mrb_regexp_pattern *pat,
     mrb_free(mrb, next.threads);
     mrb_free(mrb, s.visited);
   }
-  mrb_free(mrb, s.cap_pool);
-  if (s.result_caps) mrb_free(mrb, s.result_caps);
+  if (s.cap_pool != s.pool_inline) mrb_free(mrb, s.cap_pool);
+  if (s.result_caps != s.result_inline) mrb_free(mrb, s.result_caps);
   if (s.pend != s.pend_inline) mrb_free(mrb, s.pend);
 
   return ret;

@@ -3381,13 +3381,19 @@ RETRY_TRY_BLOCK:
         VM_SET_INT_VALUE(regs[a], (mrb_int)irep->pool[b].u.i64);
         break;
 #else
-#if defined(MRB_64BIT)
         if (INT32_MIN <= irep->pool[b].u.i64 && irep->pool[b].u.i64 <= INT32_MAX) {
           VM_SET_INT_VALUE(regs[a], (mrb_int)irep->pool[b].u.i64);
           break;
         }
-#endif
+#ifdef MRB_USE_BIGINT
+        /* a literal past mrb_int, written by an mrbc whose integers are
+           64 bits wide: the Integer it names, as IREP_TT_BIGINT gives */
+        regs[a] = mrb_bint_new_int64(mrb, irep->pool[b].u.i64);
+        mrb_gc_arena_restore(mrb, ai);
+        break;
+#else
         goto L_INT_OVERFLOW;
+#endif
 #endif
       case IREP_TT_BIGINT:
 #ifdef MRB_USE_BIGINT
@@ -3400,10 +3406,14 @@ RETRY_TRY_BLOCK:
 #else
         goto L_INT_OVERFLOW;
 #endif
-#ifndef MRB_NO_FLOAT
       case IREP_TT_FLOAT:
+#ifndef MRB_NO_FLOAT
         VM_SET_FLOAT_VALUE(regs[a], irep->pool[b].u.f);
         break;
+#else
+        /* a float literal in bytecode an mrbc with Float wrote: what does
+           not reach it runs, and this is where it cannot go on */
+        RAISE_LIT(mrb, E_NOTIMP_ERROR, "floating-point numbers are not supported");
 #endif
       default:
         /* should not happen (tt:string) */

@@ -172,19 +172,19 @@ codedump(mrb_state *mrb, const mrb_irep *irep, FILE *out)
 
     CASE(OP_LOADL, BB):
       switch (irep->pool[b].tt) {
-#ifndef MRB_NO_FLOAT
       case IREP_TT_FLOAT:
+#ifndef MRB_NO_FLOAT
         fprintf(out, "LOADL\t\tR%d\tL[%d]\t; %f", a, b, (double)irep->pool[b].u.f);
-        break;
+#else
+        fprintf(out, "LOADL\t\tR%d\tL[%d]\t; (float)", a, b);
 #endif
+        break;
       case IREP_TT_INT32:
         fprintf(out, "LOADL\t\tR%d\tL[%d]\t; %" PRId32, a, b, irep->pool[b].u.i32);
         break;
-#ifdef MRB_64BIT
       case IREP_TT_INT64:
         fprintf(out, "LOADL\t\tR%d\tL[%d]\t; %" PRId64, a, b, irep->pool[b].u.i64);
         break;
-#endif
       default:
         fprintf(out, "LOADL\t\tR%d\tL[%d]", a, b);
         break;
