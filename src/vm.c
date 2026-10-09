@@ -2151,6 +2151,88 @@ mrb_yield_cont(mrb_state *mrb, mrb_value b, mrb_value self, mrb_int argc, const 
   return exec_irep(mrb, self, p);
 }
 
+static mrb_value
+prepare_exec_strcat_post_func(mrb_state *mrb, mrb_value self)
+{
+  if (mrb_get_argc(mrb) != 3) mrb_argnum_error(mrb, mrb_get_argc(mrb), 3, 3);
+
+  const mrb_value *args = mrb_get_argv(mrb);
+  mrb_value str = args[2];
+  mrb_check_type(mrb, args[0], MRB_TT_STRING);
+  /* A to_s that answers something other than a String is not taken at its
+     word: the object gets the default representation instead, the way
+     mrb_type_convert() answers a conversion to String and CRuby's
+     rb_obj_as_string() answers one. The receiver is still on the stack to
+     build it from, which is what the register below the one to_s was sent
+     to is kept for. */
+  if (!mrb_string_p(str)) str = mrb_any_to_s(mrb, args[1]);
+  return mrb_str_cat_str(mrb, args[0], str);
+}
+
+static mrb_bool
+prepare_exec_strcat(mrb_state *mrb, uint32_t a)
+{
+  /*
+   *  call stack:
+   *    called:   [..., base]
+   *    returned: [..., base, strcat (, #to_s)]
+   *                            ^         ^--- called from strcat
+   *                            `--- invisible method-id
+   *
+   *  data stack:
+   *    called:   [..., string, any-object]
+   *
+   *    returned: [..., strcat_proc, string, any-object, any-object, implicit-block]
+   *                      ^                    ^           ^           ^--- nil
+   *                      |                    |           `--- receiver for #to_s, replaced by what it answers
+   *                      |                    `--- the same object, kept for the default representation
+   *                      |                         when #to_s answers no string
+   *                      `--- calls #to_s and then tailcalls prepare_exec_strcat_post_func()
+   */
+
+  MRB_PRESYM_DEFINE_VAR_AND_INITER(prepare_exec_strcat_syms, 1, MRB_SYM(to_s))
+  static const mrb_code prepare_exec_strcat_iseq[] = {
+    OP_MOVE,    3, 2,     // OP_MOVE      R3  R2
+    OP_SEND,    3, 0, 0,  // OP_SEND      R3  :to_s  n=0|nk=0
+    OP_CALL,              // OP_CALL      R0            ; tailcall to prepare_exec_strcat_post_func()
+    OP_RETURN,  0         // OP_RETURN    R0            ; unreachable
+  };
+  static const mrb_irep prepare_exec_strcat_irep = MRB_MAKE_STATIC_IREP(4, 5, prepare_exec_strcat_iseq, prepare_exec_strcat_syms);
+  /* Both become an mrb_value, whose word-boxed form keeps the type tag in
+     the low bits of the pointer; the alignment a static object is given
+     otherwise is the compiler's to choose (see the static procs in proc.c
+     and class.c, aligned the same way). */
+  mrb_alignas(8) static const struct RProc prepare_exec_strcat_proc = MRB_MAKE_STATIC_PROC_FROM_IREP(prepare_exec_strcat_irep);
+  mrb_alignas(8) static const struct RProc prepare_exec_strcat_post_proc = MRB_MAKE_STATIC_PROC_FROM_FUNC(prepare_exec_strcat_post_func);
+
+  MRB_PRESYM_INIT_SYMBOLS(mrb, prepare_exec_strcat_syms);
+
+  mrb_callinfo *ci = mrb->c->ci;
+  const struct RProc *strcat_proc = &prepare_exec_strcat_proc;
+#ifdef MRB_USE_REFINEMENTS
+  struct RArray *refscope = mrb_vm_refinements(mrb, ci);
+  if (refscope) {
+    struct RProc *refined_strcat_proc = (struct RProc*)mrb_obj_alloc_core(mrb, MRB_TT_PROC, mrb->proc_class);
+    refined_strcat_proc->body.irep = &prepare_exec_strcat_irep;
+    mrb_proc_set_refscope(mrb, refined_strcat_proc, refscope);
+    strcat_proc = refined_strcat_proc;
+  }
+#endif // MRB_USE_REFINEMENTS
+
+  ci = cipush(mrb, a, CINFO_DIRECT, mrb->object_class, NULL, NULL, 0, 3);
+  stack_extend(mrb, 5); // before expansion, ensure that the two objects are protected on the data stack
+  ci->stack[4] = mrb_nil_value();
+  ci->stack[3] = ci->stack[1];
+  ci->stack[2] = ci->stack[1];
+  ci->stack[1] = ci->stack[0];
+  ci->stack[0] = mrb_obj_value((void*)&prepare_exec_strcat_post_proc);
+  ci->cci = CINFO_NONE;
+  ci->proc = strcat_proc;
+  ci->pc = prepare_exec_strcat_iseq;
+
+  return TRUE;
+}
+
 #define RBREAK_TAG_FOREACH(f) \
   f(RBREAK_TAG_BREAK, 0) \
   f(RBREAK_TAG_JUMP, 1) \
@@ -4709,8 +4791,34 @@ RETRY_TRY_BLOCK:
 
     CASE(OP_STRCAT, B) {
       mrb_ensure_string_type(mrb, regs[a]);
-      mrb_str_concat(mrb, regs[a], regs[a+1]);
-      ci = mrb->c->ci;
+      switch (mrb_type(regs[a+1])) {
+      case MRB_TT_STRING:
+      case MRB_TT_SYMBOL:
+      case MRB_TT_INTEGER:
+      case MRB_TT_CLASS:
+      case MRB_TT_MODULE:
+      case MRB_TT_SCLASS:
+      case MRB_TT_FALSE:
+      case MRB_TT_TRUE:
+#ifdef MRB_USE_BIGINT
+      case MRB_TT_BIGINT:
+#endif
+#ifndef MRB_NO_FLOAT
+      case MRB_TT_FLOAT:
+#endif
+        /* What mrb_obj_as_string() spells out in C, with no method to send:
+           a frame for these would cost a call per interpolated value. A
+           redefined to_s on them is not read here, which is what the C path
+           answers for every built-in it knows. */
+        mrb_str_concat(mrb, regs[a], regs[a+1]);
+        ci = mrb->c->ci; // just in case
+        break;
+      default:
+        prepare_exec_strcat(mrb, a);
+        ci = mrb->c->ci;
+        irep = ci->proc->body.irep;
+        break;
+      }
       NEXT;
     }
 

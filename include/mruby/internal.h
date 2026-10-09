@@ -56,6 +56,12 @@ void mrb_class_name_class(mrb_state*, struct RClass*, struct RClass*, mrb_sym);
 mrb_bool mrb_const_name_p(mrb_state*, const char*, mrb_int);
 mrb_value mrb_class_find_path(mrb_state*, struct RClass*);
 mrb_value mrb_mod_to_s(mrb_state *, mrb_value);
+mrb_value mrb_nil_to_s(mrb_state *, mrb_value);
+mrb_value mrb_true_to_s(mrb_state *, mrb_value);
+mrb_value mrb_false_to_s(mrb_state *, mrb_value);
+#ifndef MRB_NO_FLOAT
+mrb_value mrb_flo_to_s(mrb_state *, mrb_value);
+#endif
 void mrb_method_added(mrb_state *mrb, struct RClass *c, mrb_sym mid);
 mrb_noreturn void mrb_method_missing(mrb_state *mrb, mrb_sym name, mrb_value self, mrb_value args);
 mrb_method_t mrb_vm_find_method(mrb_state *mrb, struct RClass *c, struct RClass **cp, mrb_sym mid);
@@ -141,6 +147,12 @@ uint32_t mrb_obj_hash_code(mrb_state *mrb, mrb_value key);
 /* irep */
 struct mrb_insn_data mrb_decode_insn(const mrb_code *pc);
 #ifdef MRUBY_IREP_H
+#define MRB_MAKE_STATIC_IREP(nlocals, nregs, iseq, syms) { \
+  nlocals, nregs, 0, MRB_IREP_STATIC, \
+  iseq, NULL, syms, NULL, NULL, NULL, \
+  sizeof(iseq), 0, sizeof((syms)) / sizeof((syms)[0]), 0, 0, \
+}
+
 void mrb_irep_free(mrb_state*, struct mrb_irep*);
 
 static inline const struct mrb_irep_catch_handler *
@@ -263,6 +275,23 @@ mrb_value mrb_vm_svar_get(mrb_state *mrb, enum mrb_svar_index key);
 void mrb_vm_svar_set(mrb_state *mrb, enum mrb_svar_index key, mrb_value v);
 
 #ifdef MRUBY_PROC_H
+#define MRB_MAKE_STATIC_PROC_FROM_IREP(irep) { \
+  NULL, MRB_TT_PROC, MRB_GC_RED, MRB_OBJ_IS_FROZEN, MRB_PROC_SCOPE | MRB_PROC_STRICT | MRB_PROC_ORPHAN, \
+  { &irep }, NULL, { NULL } \
+}
+
+/* The parameter is not spelled `func`: a macro parameter is replaced in the
+   member designator too, so that name would rewrite `.func` into `..` the
+   argument. Naming the member is what this needs, rather than writing a
+   function pointer through the union's first member, which is an object
+   pointer: C gives that conversion no meaning, and a target whose function
+   pointers are wider than its object pointers (the small cores mruby is
+   built for among them) would lose half of it. */
+#define MRB_MAKE_STATIC_PROC_FROM_FUNC(cfunc) { \
+  NULL, MRB_TT_PROC, MRB_GC_RED, MRB_OBJ_IS_FROZEN, MRB_PROC_CFUNC_FL | MRB_PROC_ORPHAN, \
+  { .func = cfunc }, NULL, { NULL } \
+}
+
 /* A closed env may carry one slot past its locals: the special-variable
  * container of the scope the env escapes from, which mrb_env_detach()
  * moves there and svar_owner() reads back, or, for a scope that holds no
