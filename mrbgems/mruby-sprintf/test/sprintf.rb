@@ -29,6 +29,23 @@ assert('String#% with the 0 flag and a sign') do
   assert_equal "-1.500  ", "%-08.3f" % -1.5
 end
 
+assert('String#% with the 0 flag and a leading 9') do
+  skip unless Object.const_defined?(:Float)
+  assert_equal "009.5", "%05.1f" % 9.5
+  assert_equal "-009.5", "%06.1f" % -9.5
+  assert_equal "+009.5", "%+06.1f" % 9.5
+  assert_equal "009.50e+00", "%010.2e" % 9.5
+  assert_equal "0099.5", "%06g" % 99.5
+end
+
+assert('String#% %#g of zero keeps the decimal point') do
+  skip unless Object.const_defined?(:Float)
+  assert_equal "0.", "%#.0g" % 0.0
+  assert_equal "0.", "%#.1g" % 0.0
+  assert_equal "  -0.", "%#5.1g" % -0.0
+  assert_equal "0.0", "%#.2g" % 0.0
+end
+
 assert('String#% with inf') do
   skip unless Object.const_defined?(:Float)
   inf = Float::INFINITY
@@ -130,6 +147,16 @@ assert("String#% %o keeps other leading digits of a negative big integer") do
     skip 'requires mruby-bigint'
   end
   assert_equal("..767777777777777777777777777777770", "%o" % (-big - 8))
+end
+
+assert("String#% %o keeps the sign digits of a big integer's two's complement") do
+  begin
+    big = 3 << 62
+  rescue RangeError
+    skip 'requires mruby-bigint'
+  end
+  assert_equal("..76400000000000000000000", "%o" % -big)
+  assert_equal("..7777776400000000000000000000", "%.30o" % -big)
 end
 
 assert("String#% %d of a big integer with a sign") do
