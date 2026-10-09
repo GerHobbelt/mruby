@@ -674,7 +674,8 @@ retry:
 
           /* Determine base and signedness from lookup table */
           base = spec.base;
-          if (spec.subtype == 1) { /* signed formats: d, i, u */
+          /* d, i and u are signed; the other bases are too with a + or space flag */
+          if (base == 10 || (flags & (FPLUS|FSPACE))) {
             sign = 1;
           }
 
@@ -700,7 +701,7 @@ retry:
           case MRB_TT_BIGINT:
             {
               mrb_int n = (mrb_bint_cmp(mrb, val, mrb_fixnum_value(0)));
-              mrb_bool need_dots = ((flags & FPLUS) == 0) && (base == 16 || base == 8 || base == 2) && n < 0;
+              mrb_bool need_dots = !sign && n < 0;
               if (need_dots) {
                 val = mrb_bint_2comp(mrb, val);
                 dots = 1;
@@ -709,6 +710,23 @@ retry:
               mrb_value str = mrb_bint_to_s(mrb, val, base);
               s = RSTRING_PTR(str);
               len = (int)RSTRING_LEN(str);
+              /* the top octal digit holds the sign bits left over by the limbs */
+              if (dots && base == 8 && (*s == '1' || *s == '3')) {
+                s++; len--;
+              }
+              /* emit the sign through sc, as for mrb_int, so the 0 flag pads after it */
+              if (*s == '-') {
+                sc = '-';
+                s++; len--; width--;
+              }
+              else if (sign && (flags & FPLUS)) {
+                sc = '+';
+                width--;
+              }
+              else if (sign && (flags & FSPACE)) {
+                sc = ' ';
+                width--;
+              }
             }
             goto str_skip;
 #endif
@@ -768,12 +786,12 @@ retry:
         }
 
         if (dots) {
-          if (base == 8 && (*s == '1' || *s == '3')) {
-            s++; len--;
-          }
           while (*s == fc) {
             s++; len--;
           }
+          /* the ".." and the leading fc count toward width and precision */
+          prec -= 3;
+          width -= 3;
         }
           /* Convert to uppercase for X, B formats */
           if (spec.subtype == 1) { /* uppercase formats: X, B */
@@ -800,7 +818,7 @@ retry:
             prefix = NULL;
           }
         }
-        else if (len == 1 && *s == '0') {
+        else if (!dots && len == 1 && *s == '0') {
           prefix = NULL;
         }
 
@@ -817,7 +835,7 @@ retry:
         }
         else {
           if (prec < len) {
-            if (!prefix && prec == 0 && len == 1 && *s == '0') len = 0;
+            if (!dots && !prefix && prec == 0 && len == 1 && *s == '0') len = 0;
             prec = len;
           }
           width -= prec;
@@ -835,23 +853,18 @@ retry:
           PUSH(prefix, plen);
         }
         if (dots) {
-          prec -= 2;
-          width -= 2;
           PUSH("..", 2);
-          if (*s != fc) {
-            FILL(fc, 1);
-            prec--; width--;
-          }
+          FILL(fc, 1);
         }
 
         if (prec > len) {
           CHECK(prec - len);
-          if ((flags & (FMINUS|FPREC)) != FMINUS) {
+          if (dots) {
+            FILL(fc, prec - len);
+          }
+          else if ((flags & (FMINUS|FPREC)) != FMINUS) {
             char c = '0';
             FILL(c, prec - len);
-          }
-          else if (v < 0) {
-            FILL(fc, prec - len);
           }
         }
           PUSH(s, len);
